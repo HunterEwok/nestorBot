@@ -84,12 +84,12 @@ class FakeLLM:
 
 @pytest.fixture
 def make_env(pool):
-    def make(llm=None, admins=(), **cfg):
+    def make(llm=None, admins=(), web=None, **cfg):
         bot, llm = FakeBot(admins), llm or FakeLLM()
         settings = Settings(bot_token="42:TEST", database_url="", allowed_chat_ids=frozenset({CHAT_ID}))
         collector = Collector(settings, pool)
         collector.answerer = Answerer(bot, pool, llm, BotIdentity(BOT_ID, "ewok_nestor_bot", ("нестор", "бот")),
-                                      lambda m: collector.store(m, is_edit=False), AnswerConfig(**cfg))
+                                      lambda m: collector.store(m, is_edit=False), AnswerConfig(**cfg), web_llm=web)
         dp = Dispatcher()
         dp.include_router(collector.router())
 
@@ -138,6 +138,41 @@ async def test_failed_archiving_of_own_answer_is_not_an_error(make_env, conn):
     await feed(update("message", message(1, "нестор, привет")))
     assert [s["text"] for s in bot.sent] == ["Ответ модели"]  # no apology after a delivered answer
     assert await conn.fetchval("SELECT status FROM bot_requests") == "ok"
+
+
+async def test_web_question_goes_to_web_profile_without_archive(make_env, conn):
+    web = FakeLLM("В Таллине +12, источник: https://weather.example")
+    bot, llm, feed = make_env(FakeLLM(prompts.WEB_MARKER), web=web)
+    await feed(update("message", message(1, "секретный план Пети", uid=222)))
+    await feed(update("message", message(2, "нестор, какая погода в Таллине?", uid=111)))
+
+    assert [s["text"] for s in bot.sent] == ["В Таллине +12, источник: https://weather.example"]
+    assert "секретный план" in llm.calls[0][-1]["content"]  # the archive model saw the chat ...
+    sent_to_web = "\n".join(m["content"] for m in web.calls[0])
+    assert "какая погода в Таллине?" in sent_to_web
+    assert "секретный план" not in sent_to_web and "User" not in sent_to_web and "ticket" not in sent_to_web
+    req = await conn.fetchrow("SELECT * FROM bot_requests")
+    assert (req["scenario"], req["status"], req["input_tokens"], req["output_tokens"]) == ("web", "ok", 2000, 400)
+
+
+async def test_web_follow_up_carries_only_web_turns(make_env):
+    web = FakeLLM("Какой город?")
+    bot, llm, feed = make_env(FakeLLM(prompts.WEB_MARKER), web=web)
+    await feed(update("message", message(1, "нестор, какая погода?")))
+    answer = {"message_id": bot.sent[0]["message_id"], "date": 1_790_000_000,
+              "chat": {"id": CHAT_ID, "type": "supergroup"}, "from": {"id": BOT_ID, "is_bot": True, "first_name": "Н"},
+              "text": "Какой город?"}
+    await feed(update("message", message(2, "Таллин", reply_to_message=answer)))
+    assert [(m["role"], m["content"]) for m in web.calls[1][1:3]] == [("user", "какая погода?"),
+                                                                      ("assistant", "Какой город?")]
+    assert "Таллин" in web.calls[1][-1]["content"]
+
+
+async def test_web_question_without_web_profile_is_refused(make_env, conn):
+    bot, llm, feed = make_env(FakeLLM(prompts.WEB_MARKER))
+    await feed(update("message", message(1, "нестор, курс евро?")))
+    assert [s["text"] for s in bot.sent] == [prompts.NO_WEB]
+    assert await conn.fetchval("SELECT scenario FROM bot_requests") == "web"
 
 
 async def test_reply_to_answer_continues_conversation(make_env, conn):

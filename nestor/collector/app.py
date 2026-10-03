@@ -199,7 +199,13 @@ async def make_answerer(settings: Settings, bot: Bot, pool: asyncpg.Pool, collec
     cfg = AnswerConfig(rate_limit=settings.rate_limit, rate_window_min=settings.rate_window_min,
                        daily_token_limit=settings.daily_token_limit, tz=ZoneInfo(settings.timezone))
     llm = HermesClient(settings.hermes_url, settings.hermes_api_key, settings.hermes_model, timeout=cfg.timeout_s)
-    return Answerer(bot, pool, llm, identity, lambda msg: collector.store(msg, is_edit=False), cfg)
+    web = None
+    if settings.hermes_web_url:
+        web = HermesClient(settings.hermes_web_url, settings.hermes_web_api_key, settings.hermes_model,
+                           timeout=cfg.timeout_s)
+    else:
+        log.warning("HERMES_WEB_URL is not set: questions that need the internet get a refusal")
+    return Answerer(bot, pool, llm, identity, lambda msg: collector.store(msg, is_edit=False), cfg, web_llm=web)
 
 
 async def run(settings: Settings) -> None:

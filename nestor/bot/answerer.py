@@ -18,7 +18,7 @@ from aiogram.types import LinkPreviewOptions, Message, ReactionTypeEmoji, ReplyP
 
 from ..collector.app import dump
 from . import context, prompts
-from .llm import LLM
+from .llm import LLM, Completion
 from .triggers import BotIdentity, Invocation, detect
 
 log = logging.getLogger("nestor.answerer")
@@ -67,8 +67,10 @@ SaveOutgoing = Callable[[dict], Awaitable[object]]
 
 class Answerer:
     def __init__(self, bot: Bot, pool: asyncpg.Pool, llm: LLM, me: BotIdentity,
-                 save_outgoing: SaveOutgoing, cfg: AnswerConfig = AnswerConfig()):
+                 save_outgoing: SaveOutgoing, cfg: AnswerConfig = AnswerConfig(), web_llm: LLM | None = None):
         self.bot, self.pool, self.llm, self.me, self.cfg = bot, pool, llm, me, cfg
+        # Profile with web search and no archive tools; it only ever sees the asker's own words.
+        self.web_llm = web_llm
         self.save_outgoing = save_outgoing
         self._queues: dict[int, asyncio.Queue[Job]] = {}
         self._workers: dict[int, asyncio.Task] = {}
@@ -233,6 +235,8 @@ class Answerer:
                     ticket, msg["chat"]["id"], _topic(msg),
                     datetime.now(timezone.utc) + timedelta(seconds=self.cfg.timeout_s + 30))
             completion = await self._complete_with_progress(msg, prompt)
+            if prompts.WEB_MARKER in completion.text:
+                completion = await self._answer_from_web(job, completion)
             sent = []
             for part in split_text(completion.text or "Мне нечего ответить по этим данным."):
                 sent.append(await self._reply(msg, part))
@@ -256,8 +260,39 @@ class Answerer:
                                     "latency_ms": fields["latency_ms"], "input_tokens": fields.get("input_tokens"),
                                     "output_tokens": fields.get("output_tokens")})
 
-    async def _complete_with_progress(self, msg: dict, prompt: list[dict]):
-        task = asyncio.ensure_future(self.llm.complete(prompt))
+    async def _answer_from_web(self, job: Job, routed: Completion) -> Completion:
+        """The archive model asked for the internet. The web profile gets the asker's question and
+        earlier web turns of this conversation only: no archive text can reach a search engine."""
+        job.scenario = "web"
+        if self.web_llm is None or not job.question.strip():
+            text = prompts.NO_WEB if self.web_llm is None else prompts.EMPTY_WEB_QUESTION
+            return Completion(text, routed.model, routed.input_tokens, routed.output_tokens)
+        async with self.pool.acquire() as conn:
+            history = await self._web_history(conn, job)
+        now = datetime.now(self.cfg.tz).strftime("%Y-%m-%d %H:%M")
+        prompt = [{"role": "system", "content": prompts.WEB_SYSTEM}, *history,
+                  {"role": "user", "content": f"Сейчас {now} ({self.cfg.tz.key}). Вопрос: {job.question}"}]
+        web = await self._complete_with_progress(job.msg, prompt, self.web_llm)
+        return Completion(web.text, web.model, _add(routed.input_tokens, web.input_tokens),
+                          _add(routed.output_tokens, web.output_tokens))
+
+    async def _web_history(self, conn, job: Job) -> list[dict]:
+        """Earlier turns of a reply chain, as long as they were web answers too."""
+        history: list[dict] = []
+        if job.inv.replied_to_bot is None:
+            return history
+        parent = await conn.fetchrow(
+            "SELECT question, answer, scenario, parent_id FROM bot_requests "
+            "WHERE chat_id = $1 AND $2 = ANY(answer_msg_ids)", job.msg["chat"]["id"], job.inv.replied_to_bot)
+        while parent and parent["scenario"] == "web" and parent["question"] and len(history) < 6:
+            history[:0] = [{"role": "user", "content": parent["question"]},
+                           {"role": "assistant", "content": parent["answer"] or ""}]
+            parent = await conn.fetchrow("SELECT question, answer, scenario, parent_id FROM bot_requests "
+                                         "WHERE id = $1", parent["parent_id"]) if parent["parent_id"] else None
+        return history
+
+    async def _complete_with_progress(self, msg: dict, prompt: list[dict], llm: LLM | None = None):
+        task = asyncio.ensure_future((llm or self.llm).complete(prompt))
         try:
             return await asyncio.wait_for(asyncio.shield(task), self.cfg.progress_after_s)
         except asyncio.TimeoutError:
@@ -324,7 +359,7 @@ class Answerer:
         question = job.question or ("Оцени тезисы в сообщении, на которое ответили." if target else "Что скажешь?")
         user = (f"Чат «{title}», сейчас {now} ({tz.key}). Запрос от {who}: {question}\n"
                 f"Сценарий: {job.scenario}\n\n" + "\n\n".join(blocks))
-        return [{"role": "system", "content": prompts.SYSTEM.format(ticket=ticket)}, *history,
+        return [{"role": "system", "content": prompts.SYSTEM.format(ticket=ticket, web_marker=prompts.WEB_MARKER)}, *history,
                 {"role": "user", "content": user}], parent_id
 
     # ---- Telegram side ----
@@ -360,6 +395,10 @@ class Answerer:
                                                     message_thread_id=_topic(msg))
                 except TelegramAPIError:
                     pass
+
+
+def _add(a: int | None, b: int | None) -> int | None:
+    return None if a is None and b is None else (a or 0) + (b or 0)
 
 
 def _topic(msg: dict) -> int | None:

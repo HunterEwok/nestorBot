@@ -16,6 +16,9 @@ class Settings:
     hermes_url: str | None = None
     hermes_api_key: str = ""
     hermes_model: str = "hermes-agent"
+    # Separate Hermes profile with web search and NO archive access. Empty: no internet.
+    hermes_web_url: str | None = None
+    hermes_web_api_key: str = ""
     bot_keywords: tuple[str, ...] = ("нестор", "бот")
     rate_limit: int = 5
     rate_window_min: int = 10
@@ -38,6 +41,8 @@ def load_settings() -> Settings:
             hermes_url=os.environ.get("HERMES_URL") or None,
             hermes_api_key=os.environ.get("HERMES_API_KEY", ""),
             hermes_model=os.environ.get("HERMES_MODEL", "hermes-agent"),
+            hermes_web_url=os.environ.get("HERMES_WEB_URL") or None,
+            hermes_web_api_key=os.environ.get("HERMES_WEB_API_KEY", ""),
             bot_keywords=tuple(w.strip().lower() for w in os.environ.get("BOT_KEYWORDS", "нестор,бот").split(",")
                                if w.strip()),
             rate_limit=int(os.environ.get("RATE_LIMIT_PER_USER", 5)),
