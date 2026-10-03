@@ -45,7 +45,7 @@
    HERMES_SMART_URL=http://127.0.0.1:8642/p/smart/v1
    HERMES_SMART_API_KEY=<API_SERVER_KEY профиля smart>
    ```
-   Модель задана в `smart/config.yaml`: `claude-opus-5-5`, вдвое дешевле `claude-sonnet-5-5`.
+   Модель задана в `smart/config.yaml`: `claude-opus-5-5`. Модель `claude-sonnet-5-5` вдвое дешевле, для песен и цитат её обычно хватает.
 
 ## Проверка (после установки и после каждого обновления Hermes)
 
