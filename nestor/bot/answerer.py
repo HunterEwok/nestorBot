@@ -16,6 +16,7 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import LinkPreviewOptions, Message, ReactionTypeEmoji, ReplyParameters
 
+from ..collector.app import dump
 from . import context, prompts
 from .llm import LLM
 from .triggers import BotIdentity, Invocation, detect
@@ -339,8 +340,13 @@ class Answerer:
             log.warning("send failed", extra={"chat_id": msg["chat"]["id"], "error": type(e).__name__})
             return None
         if save and isinstance(sent, Message):
-            # Telegram never sends the bot its own messages; archive them ourselves.
-            await self.save_outgoing(sent.model_dump(mode="json", exclude_none=True, by_alias=True))
+            # Telegram never sends the bot its own messages; archive them ourselves. The text is
+            # already delivered, so a failure here is logged, never answered with an apology.
+            try:
+                await self.save_outgoing(dump(sent))
+            except Exception as e:  # noqa: BLE001
+                log.warning("archiving own message failed", extra={
+                    "chat_id": msg["chat"]["id"], "message_id": sent.message_id, "error": type(e).__name__})
         return sent
 
     async def _react(self, msg: dict, emoji: str | None) -> None:

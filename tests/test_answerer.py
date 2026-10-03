@@ -41,6 +41,8 @@ class FakeBot(BaseFakeBot):
             "chat": {"id": chat_id, "type": "supergroup", "title": "Test group"},
             "from": {"id": BOT_ID, "is_bot": True, "first_name": "Нестор", "username": "ewok_nestor_bot"},
             "text": text,
+            # Telegram echoes the options back when the text has a link; aiogram adds Default(...) placeholders.
+            **({"link_preview_options": {"is_disabled": True}} if "https://" in text else {}),
         })
 
     async def set_message_reaction(self, chat_id, message_id, reaction=None, **kw):
@@ -94,6 +96,7 @@ def make_env(pool):
         async def feed(raw):
             await dp.feed_update(bot, Update.model_validate(raw, context={"bot": bot}))
             await collector.answerer.drain()
+        feed.answerer = collector.answerer
         return bot, llm, feed
     return make
 
@@ -115,6 +118,26 @@ async def test_keyword_invocation_answers_and_archives(make_env, conn):
     assert req["answer_msg_ids"] == [bot.sent[0]["message_id"]]
     stored = await conn.fetchrow("SELECT user_id, text FROM messages WHERE message_id = $1", bot.sent[0]["message_id"])
     assert (stored["user_id"], stored["text"]) == (BOT_ID, "Ответ модели")
+
+
+async def test_answer_with_link_is_archived_without_apology(make_env, conn):
+    answer = "Это было в #1 (https://t.me/c/1234567890/1)."
+    bot, llm, feed = make_env(FakeLLM(answer))
+    await feed(update("message", message(1, "нестор, где это было?")))
+    assert [s["text"] for s in bot.sent] == [answer]
+    assert await conn.fetchval("SELECT text FROM messages WHERE message_id = $1", bot.sent[0]["message_id"]) == answer
+    assert await conn.fetchval("SELECT status FROM bot_requests") == "ok"
+
+
+async def test_failed_archiving_of_own_answer_is_not_an_error(make_env, conn):
+    bot, llm, feed = make_env()
+
+    async def broken(msg):
+        raise ValueError("unexpected Bot API shape")
+    feed.answerer.save_outgoing = broken
+    await feed(update("message", message(1, "нестор, привет")))
+    assert [s["text"] for s in bot.sent] == ["Ответ модели"]  # no apology after a delivered answer
+    assert await conn.fetchval("SELECT status FROM bot_requests") == "ok"
 
 
 async def test_reply_to_answer_continues_conversation(make_env, conn):

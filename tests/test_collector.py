@@ -56,6 +56,15 @@ async def test_edit_through_dispatcher(dispatcher, conn):
     assert await conn.fetchval("SELECT old_text FROM message_edits") == "было"
 
 
+async def test_message_with_link_preview_options_is_stored(dispatcher, conn):
+    # aiogram fills unset LinkPreviewOptions fields with Default(...) placeholders that are not JSON.
+    bot = FakeBot()
+    msg = message(1, "смотри https://example.com", link_preview_options={"is_disabled": True})
+    await feed(dispatcher, bot, update("message", msg))
+    raw = await conn.fetchval("SELECT raw->'link_preview_options' FROM messages")
+    assert raw is not None and "prefer_small_media" not in raw
+
+
 async def test_foreign_group_is_left_and_not_stored(dispatcher, conn):
     bot = FakeBot()
     await feed(dispatcher, bot, update("message", message(1, "чужое", chat_id=FOREIGN_CHAT)))
