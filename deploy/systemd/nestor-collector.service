@@ -1,8 +1,10 @@
 [Unit]
 Description=nestor collector: archives allowed Telegram groups to PostgreSQL
-After=network-online.target postgresql.service
+# PostgreSQL runs on another machine; if it is unreachable at boot, migrate fails
+# and systemd keeps restarting until it is back (no start limit below).
+After=network-online.target
 Wants=network-online.target
-Requires=postgresql.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -13,8 +15,8 @@ EnvironmentFile=/opt/nestor/.env
 ExecStartPre=/opt/nestor/.venv/bin/python -m nestor.migrate
 ExecStart=/opt/nestor/.venv/bin/python -m nestor.collector
 Restart=always
-RestartSec=5
-# Logs go to journald (JSON, no message text); keep 14 days via journald.conf MaxRetentionSec=14d.
+RestartSec=10
+# Logs go to journald (JSON, no message text); retention: deploy/journald/nestor.conf.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

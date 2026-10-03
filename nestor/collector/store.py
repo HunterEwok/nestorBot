@@ -23,7 +23,18 @@ async def init_connection(conn: asyncpg.Connection) -> None:
 
 
 async def create_pool(dsn: str) -> asyncpg.Pool:
-    return await asyncpg.create_pool(dsn, min_size=1, max_size=4, init=init_connection)
+    # The database lives on another machine (over VPN or TLS): connections can die
+    # silently, so a hung query must time out and land in the collector's retry loop,
+    # and idle connections are recycled rather than trusted.
+    return await asyncpg.create_pool(
+        dsn,
+        min_size=1,
+        max_size=4,
+        init=init_connection,
+        timeout=10,                              # connect
+        command_timeout=30,                      # per query
+        max_inactive_connection_lifetime=60,
+    )
 
 
 async def upsert_chat(conn: asyncpg.Connection, chat: ChatRow, migrated_from: int | None = None) -> bool:

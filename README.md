@@ -31,22 +31,40 @@
 
 Сессии роли по умолчанию read-only. Полнотекстовый поиск: `tsv @@ plainto_tsquery('russian', ...)`.
 
-## Установка на Raspberry Pi
+## Установка
 
-1. PostgreSQL 16 с данными на USB SSD; положить `deploy/postgres/nestor.conf` в `/etc/postgresql/16/main/conf.d/`.
-2. В BotFather: Bot Settings → Group Privacy → Turn off. После этого удалить бота из группы и добавить заново.
-3. ```sh
+Сборщик работает на Raspberry Pi (система на microSD), PostgreSQL на отдельной машине с SSD. Pi ходит к базе через VPN (Tailscale или WireGuard, рекомендуется) или напрямую через интернет по TLS.
+
+### Сервер базы
+
+1. PostgreSQL 16, данные на SSD. Положить `deploy/postgres/nestor.conf` в `/etc/postgresql/16/main/conf.d/` и поправить адрес в `listen_addresses`.
+2. Добавить строки из `deploy/postgres/pg_hba.example` в `pg_hba.conf` (адрес Pi), перезапустить PostgreSQL.
+3. Создать роли и базу. Запускать можно откуда угодно, где есть этот репозиторий и доступ суперпользователем к серверу:
+   ```sh
+   PG_ADMIN_URL='postgresql://postgres:...@db-host/postgres' COLLECTOR_PASSWORD=... READER_PASSWORD=... \
+       python -m nestor.bootstrap
+   ```
+
+### Raspberry Pi
+
+1. В BotFather: Bot Settings → Group Privacy → Turn off. После этого удалить бота из группы и добавить заново.
+2. ```sh
    sudo useradd --system --home /opt/nestor nestor
    sudo git clone https://github.com/HunterEwok/nestorBot /opt/nestor && sudo chown -R nestor: /opt/nestor
    sudo -u nestor python3 -m venv /opt/nestor/.venv      # 3.11 из Raspberry Pi OS подходит
    sudo -u nestor /opt/nestor/.venv/bin/pip install -e /opt/nestor
-   sudo -u postgres env PG_ADMIN_URL='postgresql:///postgres?host=/var/run/postgresql' \
-        COLLECTOR_PASSWORD=... READER_PASSWORD=... /opt/nestor/.venv/bin/python -m nestor.bootstrap
-   cp .env.example /opt/nestor/.env && chmod 600 /opt/nestor/.env   # заполнить, PG_ADMIN_URL и пароли bootstrap оттуда убрать
-   sudo cp deploy/systemd/nestor-collector.service /etc/systemd/system/
+   sudo cp /opt/nestor/.env.example /opt/nestor/.env && sudo chmod 600 /opt/nestor/.env
+   # в .env: BOT_TOKEN, ALLOWED_CHAT_IDS и DATABASE_URL на сервер базы, например
+   #   postgresql://nestor:...@100.64.0.1/nestor                      (через VPN)
+   #   postgresql://nestor:...@db.example.com/nestor?sslmode=verify-full  (через интернет)
+   # строки PG_ADMIN_URL, *_PASSWORD и NESTOR_TEST_PG_ADMIN_URL на Pi не нужны
+   sudo cp /opt/nestor/deploy/journald/nestor.conf /etc/systemd/journald.conf.d/ && sudo systemctl restart systemd-journald
+   sudo cp /opt/nestor/deploy/systemd/nestor-collector.service /etc/systemd/system/
    sudo systemctl enable --now nestor-collector
    ```
-   Миграции применяются при каждом старте юнита (`ExecStartPre`).
+   Миграции применяются при каждом старте юнита (`ExecStartPre`). Если база недоступна, юнит перезапускается каждые 10 секунд, пока она не появится.
+
+На microSD сборщик ничего не пишет, кроме журнала (до 100 МБ, 14 дней). Пока база недоступна, сообщения ждут в Telegram (до 24 часов) и дозаписываются после восстановления связи.
 
 `chat_id` группы: добавить бота с пустым `ALLOWED_CHAT_IDS`, он сразу выйдет и запишет `chat_id` в журнал (`journalctl -u nestor-collector`).
 
