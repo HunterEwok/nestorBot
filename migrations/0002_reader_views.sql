@@ -1,4 +1,4 @@
--- Read-only surface for Hermes (role hermes_reader, created by bootstrap.sql).
+-- Read-only surface for Hermes (role hermes_reader, created by nestor/bootstrap.py).
 -- The role gets SELECT on these views only, never on the tables: no raw JSON,
 -- no messages of users who opted out, no LLM audit log.
 CREATE SCHEMA reader;

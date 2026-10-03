@@ -11,7 +11,7 @@
   - `store.py` — идемпотентная запись: ключ `(chat_id, message_id)`, правки в `message_edits`.
   - `app.py` — aiogram-диспетчер, allowlist (FR-7), повтор записи при недоступной базе.
 - `migrations/` — SQL-миграции, применяются `python -m nestor.migrate`.
-- `deploy/postgres/bootstrap.sql` — роли `nestor` (пишет) и `hermes_reader` (только представления `reader.*`).
+- `nestor/bootstrap.py` — роли `nestor` (пишет) и `hermes_reader` (только представления `reader.*`) и сама база.
 - `deploy/systemd/nestor-collector.service` — юнит с `Restart=always`.
 
 ### Гарантия «0 потерь»
@@ -34,14 +34,15 @@
 ## Установка на Raspberry Pi
 
 1. PostgreSQL 16 с данными на USB SSD; положить `deploy/postgres/nestor.conf` в `/etc/postgresql/16/main/conf.d/`.
-2. `sudo -u postgres psql -v collector_password=... -v reader_password=... -f deploy/postgres/bootstrap.sql`
-3. В BotFather: Bot Settings → Group Privacy → Turn off. После этого удалить бота из группы и добавить заново.
-4. ```sh
+2. В BotFather: Bot Settings → Group Privacy → Turn off. После этого удалить бота из группы и добавить заново.
+3. ```sh
    sudo useradd --system --home /opt/nestor nestor
    sudo git clone https://github.com/HunterEwok/nestorBot /opt/nestor && sudo chown -R nestor: /opt/nestor
    sudo -u nestor python3 -m venv /opt/nestor/.venv      # 3.11 из Raspberry Pi OS подходит
    sudo -u nestor /opt/nestor/.venv/bin/pip install -e /opt/nestor
-   cp .env.example /opt/nestor/.env && chmod 600 /opt/nestor/.env   # заполнить
+   sudo -u postgres env PG_ADMIN_URL='postgresql:///postgres?host=/var/run/postgresql' \
+        COLLECTOR_PASSWORD=... READER_PASSWORD=... /opt/nestor/.venv/bin/python -m nestor.bootstrap
+   cp .env.example /opt/nestor/.env && chmod 600 /opt/nestor/.env   # заполнить, PG_ADMIN_URL и пароли bootstrap оттуда убрать
    sudo cp deploy/systemd/nestor-collector.service /etc/systemd/system/
    sudo systemctl enable --now nestor-collector
    ```
@@ -49,14 +50,24 @@
 
 `chat_id` группы: добавить бота с пустым `ALLOWED_CHAT_IDS`, он сразу выйдет и запишет `chat_id` в журнал (`journalctl -u nestor-collector`).
 
-## Тесты
+## Локальная разработка
 
-Нужен одноразовый PostgreSQL 16 (тесты пересоздают роли `nestor`, `hermes_reader` и базу `nestor_test`):
+Нужны Python 3.11+ и Docker (две базы PostgreSQL 16 из `docker-compose.yml`: `db` на 5432 для запуска, `db-test` на 5433 для тестов).
 
 ```sh
-pip install -e '.[dev]'
-NESTOR_TEST_PG_ADMIN_URL='postgresql://postgres@/postgres?host=/var/run/postgresql' pytest
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -e ".[dev]"
+cp .env.example .env          # для тестов менять ничего не нужно
+docker compose up -d
+pytest                        # тестам нужен только db-test
+python -m nestor.bootstrap    # один раз: роли и база в db
+python -m nestor.migrate
+python -m nestor.collector    # нужен настоящий BOT_TOKEN и ALLOWED_CHAT_IDS в .env
 ```
+
+В PyCharm те же шаги лежат готовыми конфигурациями запуска в `.run/`: `1 bootstrap db`, `2 migrate`, `3 collector`, `tests`.
+
+Тесты пересоздают роли `nestor`, `hermes_reader` и базу `nestor_test`, поэтому `NESTOR_TEST_PG_ADMIN_URL` должен указывать на одноразовый кластер. Без этой переменной тесты базы пропускаются.
 
 Покрыто приёмкой этапов 1–2: `hermes_reader` не может INSERT/UPDATE/DELETE/DDL и не видит таблицы; 1 000 сообщений через настоящий aiogram-диспетчер с повторной доставкой половины — 0 потерь и 0 дублей; правки, allowlist, переход группы в супергруппу.
 

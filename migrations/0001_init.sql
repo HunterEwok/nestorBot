@@ -1,4 +1,4 @@
--- Core archive schema. Owned by the collector role (nestor); see deploy/postgres/bootstrap.sql.
+-- Core archive schema. Owned by the collector role (nestor); see nestor/bootstrap.py.
 -- All timestamps are UTC; display in Europe/Tallinn happens in the application.
 
 -- Chats the bot has seen. Whether a chat may be read at all is decided by the

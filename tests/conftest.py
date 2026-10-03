@@ -1,35 +1,30 @@
 """Database fixtures.
 
-Set NESTOR_TEST_PG_ADMIN_URL to a superuser DSN of a THROWAWAY cluster, e.g.
-  postgresql://postgres@/postgres?host=/var/run/postgresql
+Set NESTOR_TEST_PG_ADMIN_URL (environment or .env) to a superuser DSN of a THROWAWAY
+cluster, e.g. the db-test service from docker-compose.yml:
+  postgresql://postgres:postgres@localhost:5433/postgres
 The roles nestor and hermes_reader and the database nestor_test are dropped and recreated.
 Without the variable, database tests are skipped.
 """
 from __future__ import annotations
 
 import os
-import subprocess
-from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
 
 import asyncpg
 import pytest
+from dotenv import load_dotenv
 
+from nestor.bootstrap import bootstrap, with_database
 from nestor.collector import store
 from nestor.migrate import migrate
 
+load_dotenv()
 ADMIN_URL = os.environ.get("NESTOR_TEST_PG_ADMIN_URL")
 DB = "nestor_test"
-ROOT = Path(__file__).resolve().parent.parent
-
-requires_db = pytest.mark.skipif(not ADMIN_URL, reason="NESTOR_TEST_PG_ADMIN_URL not set")
 
 
 def _dsn(user: str, password: str) -> str:
-    """Admin DSN with another user and the test database."""
-    parts = urlsplit(ADMIN_URL)
-    hostport = parts.netloc.rsplit("@", 1)[-1]
-    return urlunsplit(parts._replace(netloc=f"{user}:{password}@{hostport}", path=f"/{DB}"))
+    return with_database(ADMIN_URL, DB, user, password)
 
 
 @pytest.fixture(scope="session")
@@ -41,11 +36,7 @@ async def database():
     await admin.execute("DROP ROLE IF EXISTS hermes_reader")
     await admin.execute("DROP ROLE IF EXISTS nestor")
     await admin.close()
-    subprocess.run(
-        ["psql", ADMIN_URL, "-q", "-v", f"db={DB}", "-v", "collector_password=collector",
-         "-v", "reader_password=reader", "-f", str(ROOT / "deploy/postgres/bootstrap.sql")],
-        check=True, capture_output=True,
-    )
+    await bootstrap(ADMIN_URL, DB, "collector", "reader")
     owner = await asyncpg.connect(_dsn("nestor", "collector"))
     await migrate(owner)
     await owner.close()

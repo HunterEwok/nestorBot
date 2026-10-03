@@ -60,3 +60,12 @@ async def test_russian_full_text_search(conn, reader):
 async def test_forum_topic_link(conn, reader):
     await save(conn, message(11, "в теме", message_thread_id=10, is_topic_message=True))
     assert await reader.fetchval("SELECT link FROM reader.messages") == "https://t.me/c/1000000001/10/11"
+
+
+async def test_bootstrap_can_be_rerun(database, reader):
+    from nestor.bootstrap import bootstrap
+
+    from .conftest import ADMIN_URL, DB
+
+    await bootstrap(ADMIN_URL, DB, "collector", "reader")
+    assert await reader.fetchval("SELECT count(*) FROM reader.chats") == 0
