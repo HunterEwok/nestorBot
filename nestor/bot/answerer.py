@@ -222,16 +222,15 @@ class Answerer:
 
         await self._react(msg, "👀")
         ticket = secrets.token_urlsafe(18)
-        async with self.pool.acquire() as conn:
-            prompt, parent_id = await self._build_prompt(conn, job, ticket)
-            await conn.execute(
-                "INSERT INTO request_tickets (ticket, chat_id, thread_id, expires_at) VALUES ($1, $2, $3, $4)",
-                ticket, msg["chat"]["id"], _topic(msg),
-                datetime.now(timezone.utc) + timedelta(seconds=self.cfg.timeout_s + 30))
-
         started = time.monotonic()
-        status, fields = "ok", {"parent_id": parent_id}
+        status, fields = "ok", {}
         try:
+            async with self.pool.acquire() as conn:
+                prompt, fields["parent_id"] = await self._build_prompt(conn, job, ticket)
+                await conn.execute(
+                    "INSERT INTO request_tickets (ticket, chat_id, thread_id, expires_at) VALUES ($1, $2, $3, $4)",
+                    ticket, msg["chat"]["id"], _topic(msg),
+                    datetime.now(timezone.utc) + timedelta(seconds=self.cfg.timeout_s + 30))
             completion = await self._complete_with_progress(msg, prompt)
             sent = []
             for part in split_text(completion.text or "Мне нечего ответить по этим данным."):
