@@ -144,15 +144,24 @@ async def test_web_question_goes_to_web_profile_without_archive(make_env, conn):
     web = FakeLLM("В Таллине +12, источник: https://weather.example")
     bot, llm, feed = make_env(FakeLLM(prompts.WEB_MARKER), web=web)
     await feed(update("message", message(1, "секретный план Пети", uid=222)))
-    await feed(update("message", message(2, "нестор, какая погода в Таллине?", uid=111)))
+    await feed(update("message", message(2, "нестор, сколько лет Эйфелевой башне?", uid=111)))
 
     assert [s["text"] for s in bot.sent] == ["В Таллине +12, источник: https://weather.example"]
     assert "секретный план" in llm.calls[0][-1]["content"]  # the archive model saw the chat ...
     sent_to_web = "\n".join(m["content"] for m in web.calls[0])
-    assert "какая погода в Таллине?" in sent_to_web
+    assert "сколько лет Эйфелевой башне?" in sent_to_web
     assert "секретный план" not in sent_to_web and "User" not in sent_to_web and "ticket" not in sent_to_web
     req = await conn.fetchrow("SELECT * FROM bot_requests")
     assert (req["scenario"], req["status"], req["input_tokens"], req["output_tokens"]) == ("web", "ok", 2000, 400)
+
+
+async def test_plain_web_question_skips_the_archive_model(make_env, conn):
+    web = FakeLLM("В Кирове +5")
+    bot, llm, feed = make_env(FakeLLM("У меня нет доступа к интернету"), web=web)
+    await feed(update("message", message(1, "Нестор, какая погода в Кирове?")))
+    assert [s["text"] for s in bot.sent] == ["В Кирове +5"] and llm.calls == []
+    req = await conn.fetchrow("SELECT * FROM bot_requests")
+    assert (req["scenario"], req["input_tokens"], req["output_tokens"]) == ("web", 1000, 200)
 
 
 async def test_web_follow_up_carries_only_web_turns(make_env):
@@ -163,6 +172,7 @@ async def test_web_follow_up_carries_only_web_turns(make_env):
               "chat": {"id": CHAT_ID, "type": "supergroup"}, "from": {"id": BOT_ID, "is_bot": True, "first_name": "Н"},
               "text": "Какой город?"}
     await feed(update("message", message(2, "Таллин", reply_to_message=answer)))
+    assert llm.calls == []  # a reply to a web answer goes straight back to the web profile
     assert [(m["role"], m["content"]) for m in web.calls[1][1:3]] == [("user", "какая погода?"),
                                                                       ("assistant", "Какой город?")]
     assert "Таллин" in web.calls[1][-1]["content"]

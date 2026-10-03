@@ -144,7 +144,15 @@ _SCENARIOS = (
 )
 
 
+# Plainly about the outside world and not about this chat: goes straight to the web profile.
+_WEB = re.compile(r"погод|прогноз|температур|курс\w*\s+(валют|доллар|евро|рубл|юан|биткоин|бакс)|новост|"
+                  r"в\s+интернет|загугл|погугл|в\s+сети|правда\s+ли|сколько\s+стоит", re.I)
+_CHAT = re.compile(r"чат|групп|переписк|говорил|писал|обсужда|сказал|здесь|тут\b|@\w", re.I)
+
+
 def classify(question: str) -> str:
+    if _WEB.search(question) and not _CHAT.search(question):
+        return "web"
     for name, pattern in _SCENARIOS:
         if pattern.search(question):
             return name

@@ -229,14 +229,21 @@ class Answerer:
         status, fields = "ok", {}
         try:
             async with self.pool.acquire() as conn:
-                prompt, fields["parent_id"] = await self._build_prompt(conn, job, ticket)
-                await conn.execute(
-                    "INSERT INTO request_tickets (ticket, chat_id, thread_id, expires_at) VALUES ($1, $2, $3, $4)",
-                    ticket, msg["chat"]["id"], _topic(msg),
-                    datetime.now(timezone.utc) + timedelta(seconds=self.cfg.timeout_s + 30))
-            completion = await self._complete_with_progress(msg, prompt)
-            if prompts.WEB_MARKER in completion.text:
-                completion = await self._answer_from_web(job, completion)
+                parent = await self._parent(conn, job)
+            fields["parent_id"] = parent["id"] if parent else None
+            if self.web_llm is not None and (job.scenario == "web" or (parent and parent["scenario"] == "web")):
+                # Plain web question or a follow-up to a web answer: the archive model is not needed.
+                completion = await self._answer_from_web(job, None)
+            else:
+                async with self.pool.acquire() as conn:
+                    prompt = await self._build_prompt(conn, job, ticket, parent)
+                    await conn.execute(
+                        "INSERT INTO request_tickets (ticket, chat_id, thread_id, expires_at) VALUES ($1, $2, $3, $4)",
+                        ticket, msg["chat"]["id"], _topic(msg),
+                        datetime.now(timezone.utc) + timedelta(seconds=self.cfg.timeout_s + 30))
+                completion = await self._complete_with_progress(msg, prompt)
+                if prompts.WEB_MARKER in completion.text:
+                    completion = await self._answer_from_web(job, completion)
             sent = []
             for part in split_text(completion.text or "Мне нечего ответить по этим данным."):
                 sent.append(await self._reply(msg, part))
@@ -260,30 +267,37 @@ class Answerer:
                                     "latency_ms": fields["latency_ms"], "input_tokens": fields.get("input_tokens"),
                                     "output_tokens": fields.get("output_tokens")})
 
-    async def _answer_from_web(self, job: Job, routed: Completion) -> Completion:
+    async def _parent(self, conn, job: Job):
+        """The earlier request whose answer this message replies to, if any."""
+        if job.inv.replied_to_bot is None:
+            return None
+        return await conn.fetchrow(
+            "SELECT id, question, answer, scenario, parent_id FROM bot_requests "
+            "WHERE chat_id = $1 AND $2 = ANY(answer_msg_ids)", job.msg["chat"]["id"], job.inv.replied_to_bot)
+
+    async def _answer_from_web(self, job: Job, routed: Completion | None) -> Completion:
         """The archive model asked for the internet. The web profile gets the asker's question and
         earlier web turns of this conversation only: no archive text can reach a search engine."""
         job.scenario = "web"
         if self.web_llm is None or not job.question.strip():
             text = prompts.NO_WEB if self.web_llm is None else prompts.EMPTY_WEB_QUESTION
-            return Completion(text, routed.model, routed.input_tokens, routed.output_tokens)
+            return Completion(text, *((routed.model, routed.input_tokens, routed.output_tokens) if routed
+                                      else (None, None, None)))
         async with self.pool.acquire() as conn:
             history = await self._web_history(conn, job)
         now = datetime.now(self.cfg.tz).strftime("%Y-%m-%d %H:%M")
         prompt = [{"role": "system", "content": prompts.WEB_SYSTEM}, *history,
                   {"role": "user", "content": f"Сейчас {now} ({self.cfg.tz.key}). Вопрос: {job.question}"}]
         web = await self._complete_with_progress(job.msg, prompt, self.web_llm)
+        if routed is None:
+            return web
         return Completion(web.text, web.model, _add(routed.input_tokens, web.input_tokens),
                           _add(routed.output_tokens, web.output_tokens))
 
     async def _web_history(self, conn, job: Job) -> list[dict]:
         """Earlier turns of a reply chain, as long as they were web answers too."""
         history: list[dict] = []
-        if job.inv.replied_to_bot is None:
-            return history
-        parent = await conn.fetchrow(
-            "SELECT question, answer, scenario, parent_id FROM bot_requests "
-            "WHERE chat_id = $1 AND $2 = ANY(answer_msg_ids)", job.msg["chat"]["id"], job.inv.replied_to_bot)
+        parent = await self._parent(conn, job)
         while parent and parent["scenario"] == "web" and parent["question"] and len(history) < 6:
             history[:0] = [{"role": "user", "content": parent["question"]},
                            {"role": "assistant", "content": parent["answer"] or ""}]
@@ -306,7 +320,7 @@ class Answerer:
                     except TelegramAPIError:
                         pass
 
-    async def _build_prompt(self, conn, job: Job, ticket: str) -> tuple[list[dict], int | None]:
+    async def _build_prompt(self, conn, job: Job, ticket: str, parent) -> list[dict]:
         msg, tz = job.msg, self.cfg.tz
         chat_id = msg["chat"]["id"]
         ids = await context.chat_lineage(conn, chat_id)
@@ -337,20 +351,13 @@ class Answerer:
                                          title="последние сообщения чата"))
 
         history: list[dict] = []
-        parent_id = None
-        if job.inv.replied_to_bot is not None:
-            parent = await conn.fetchrow(
-                "SELECT id, question, answer, parent_id FROM bot_requests "
-                "WHERE chat_id = $1 AND $2 = ANY(answer_msg_ids)", chat_id, job.inv.replied_to_bot)
-            if parent:
-                parent_id = parent["id"]
-            depth = 0
-            while parent and depth < 3:
-                history[:0] = [{"role": "user", "content": parent["question"] or "(вопрос удалён)"},
-                               {"role": "assistant", "content": parent["answer"] or ""}]
-                parent = await conn.fetchrow("SELECT id, question, answer, parent_id FROM bot_requests WHERE id = $1",
-                                             parent["parent_id"]) if parent["parent_id"] else None
-                depth += 1
+        depth = 0
+        while parent and depth < 3:
+            history[:0] = [{"role": "user", "content": parent["question"] or "(вопрос удалён)"},
+                           {"role": "assistant", "content": parent["answer"] or ""}]
+            parent = await conn.fetchrow("SELECT id, question, answer, scenario, parent_id FROM bot_requests "
+                                         "WHERE id = $1", parent["parent_id"]) if parent["parent_id"] else None
+            depth += 1
 
         title = msg["chat"].get("title") or ""
         who = context.author({"first_name": msg["from"].get("first_name"), "last_name": msg["from"].get("last_name"),
@@ -359,8 +366,8 @@ class Answerer:
         question = job.question or ("Оцени тезисы в сообщении, на которое ответили." if target else "Что скажешь?")
         user = (f"Чат «{title}», сейчас {now} ({tz.key}). Запрос от {who}: {question}\n"
                 f"Сценарий: {job.scenario}\n\n" + "\n\n".join(blocks))
-        return [{"role": "system", "content": prompts.SYSTEM.format(ticket=ticket, web_marker=prompts.WEB_MARKER)}, *history,
-                {"role": "user", "content": user}], parent_id
+        system = prompts.SYSTEM.format(ticket=ticket, web_marker=prompts.WEB_MARKER)
+        return [{"role": "system", "content": system}, *history, {"role": "user", "content": user}]
 
     # ---- Telegram side ----
 
