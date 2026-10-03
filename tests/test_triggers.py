@@ -64,6 +64,10 @@ def test_classify_and_period():
     assert classify("кто из них прав?") == "who_is_right"
     assert classify("о чём говорили сегодня") == "summary"
     assert classify("кто и когда говорил про отпуск") == "search"
+    assert classify("какая погода в Кирове?") == "web"
+    assert classify("курс доллара сегодня") == "web"
+    assert classify("кто писал про погоду?") == "search"   # about this chat: archive, not the web
+    assert classify("найди в чате новости про ремонт") != "web"
     tz = ZoneInfo("Europe/Tallinn")
     now = datetime(2026, 10, 3, 12, 0, tzinfo=timezone.utc)
     assert period_start("неделя", now, tz) == datetime(2026, 9, 26, 12, 0, tzinfo=timezone.utc)
