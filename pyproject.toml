@@ -1,0 +1,22 @@
+[project]
+name = "nestor"
+version = "0.1.0"
+description = "Telegram group archive bot with Hermes Agent integration"
+requires-python = ">=3.11"
+dependencies = [
+    "aiogram>=3.13,<4",
+    "asyncpg>=0.29",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+
+[tool.setuptools.packages.find]
+include = ["nestor*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+testpaths = ["tests"]
