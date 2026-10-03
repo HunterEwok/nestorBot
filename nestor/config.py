@@ -12,6 +12,15 @@ class Settings:
     database_url: str
     allowed_chat_ids: frozenset[int]
     log_level: str = "INFO"
+    # Stage 3: answering. Without HERMES_URL the service only archives.
+    hermes_url: str | None = None
+    hermes_api_key: str = ""
+    hermes_model: str = "hermes-agent"
+    bot_keywords: tuple[str, ...] = ("нестор", "бот")
+    rate_limit: int = 5
+    rate_window_min: int = 10
+    daily_token_limit: int = 250_000
+    timezone: str = "Europe/Tallinn"
 
 
 def _parse_ids(value: str) -> frozenset[int]:
@@ -26,6 +35,15 @@ def load_settings() -> Settings:
             database_url=os.environ["DATABASE_URL"],
             allowed_chat_ids=_parse_ids(os.environ.get("ALLOWED_CHAT_IDS", "")),
             log_level=os.environ.get("LOG_LEVEL", "INFO"),
+            hermes_url=os.environ.get("HERMES_URL") or None,
+            hermes_api_key=os.environ.get("HERMES_API_KEY", ""),
+            hermes_model=os.environ.get("HERMES_MODEL", "hermes-agent"),
+            bot_keywords=tuple(w.strip().lower() for w in os.environ.get("BOT_KEYWORDS", "нестор,бот").split(",")
+                               if w.strip()),
+            rate_limit=int(os.environ.get("RATE_LIMIT_PER_USER", 5)),
+            rate_window_min=int(os.environ.get("RATE_LIMIT_WINDOW_MIN", 10)),
+            daily_token_limit=int(os.environ.get("DAILY_TOKEN_LIMIT", 250_000)),
+            timezone=os.environ.get("TIMEZONE", "Europe/Tallinn"),
         )
     except KeyError as e:
         raise SystemExit(f"missing required environment variable {e.args[0]}") from None

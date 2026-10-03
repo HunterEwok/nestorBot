@@ -66,6 +66,7 @@ class Collector:
         self.allowed = settings.allowed_chat_ids
         self.pool = pool
         self._allowed_cache: set[int] = set(self.allowed)
+        self.answerer = None  # nestor.bot.answerer.Answerer, set when answering is enabled
 
     async def is_allowed(self, chat_id: int, msg: dict | None = None) -> bool:
         if chat_id in self._allowed_cache:
@@ -107,7 +108,13 @@ class Collector:
         if not await self.is_allowed(message.chat.id, msg):
             await leave(bot, message.chat.id)
             return
-        await self.store(msg, is_edit=is_edit)
+        result = await self.store(msg, is_edit=is_edit)
+        # Only a first delivery may trigger an answer; edits and redeliveries never do.
+        if self.answerer is not None and not is_edit and result in (store.Result.INSERTED, store.Result.PAUSED):
+            try:
+                await self.answerer.on_message(msg, paused=result is store.Result.PAUSED)
+            except Exception:  # noqa: BLE001 - answering must never stop archiving
+                log.exception("invocation handling failed", extra={"chat_id": message.chat.id})
 
     async def handle_membership(self, event: ChatMemberUpdated, bot: Bot) -> None:
         if event.chat.type not in GROUP_TYPES:
@@ -160,13 +167,33 @@ async def leave(bot: Bot, chat_id: int, *, attempts: int = 6) -> None:
     log.error("leave_chat kept failing; will retry on the next update from this chat", extra={"chat_id": chat_id})
 
 
+async def make_answerer(settings: Settings, bot: Bot, pool: asyncpg.Pool, collector: Collector):
+    from zoneinfo import ZoneInfo
+
+    from ..bot.answerer import AnswerConfig, Answerer
+    from ..bot.llm import HermesClient
+    from ..bot.triggers import BotIdentity
+
+    me = await bot.me()
+    identity = BotIdentity(me.id, me.username, settings.bot_keywords)
+    cfg = AnswerConfig(rate_limit=settings.rate_limit, rate_window_min=settings.rate_window_min,
+                       daily_token_limit=settings.daily_token_limit, tz=ZoneInfo(settings.timezone))
+    llm = HermesClient(settings.hermes_url, settings.hermes_api_key, settings.hermes_model, timeout=cfg.timeout_s)
+    return Answerer(bot, pool, llm, identity, lambda msg: collector.store(msg, is_edit=False), cfg)
+
+
 async def run(settings: Settings) -> None:
     if not settings.allowed_chat_ids:
         log.warning("ALLOWED_CHAT_IDS is empty: the bot will leave every group it is added to")
     pool = await store.create_pool(settings.database_url)
     bot = Bot(settings.bot_token)
     dp = Dispatcher()
-    dp.include_router(Collector(settings, pool).router())
+    collector = Collector(settings, pool)
+    if settings.hermes_url:
+        collector.answerer = await make_answerer(settings, bot, pool, collector)
+    else:
+        log.warning("HERMES_URL is not set: archiving only, the bot will not answer")
+    dp.include_router(collector.router())
     try:
         await dp.start_polling(bot, handle_as_tasks=False, allowed_updates=ALLOWED_UPDATES)
     finally:
