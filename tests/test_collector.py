@@ -93,3 +93,46 @@ async def test_retry_forever_waits_out_database_outage(monkeypatch):
 
 async def _no_sleep(_):
     return None
+
+
+async def test_retry_forever_waits_out_disk_full(monkeypatch):
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    calls = 0
+
+    async def disk_full():
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise asyncpg.DiskFullError("could not extend file")
+        return "ok"
+
+    assert await retry_forever(disk_full, what="test") == "ok" and calls == 3
+
+
+async def test_leave_retries_transient_telegram_errors(monkeypatch):
+    from aiogram.exceptions import TelegramForbiddenError, TelegramNetworkError
+    from aiogram.methods import LeaveChat
+
+    from nestor.collector.app import leave
+
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+
+    class FlakyBot(FakeBot):
+        def __init__(self, errors):
+            super().__init__()
+            self.errors = list(errors)
+
+        async def leave_chat(self, chat_id, **kw):
+            self.left.append(chat_id)
+            if self.errors:
+                raise self.errors.pop(0)
+            return True
+
+    method = LeaveChat(chat_id=FOREIGN_CHAT)
+    bot = FlakyBot([TelegramNetworkError(method, "timeout"), TelegramNetworkError(method, "reset")])
+    await leave(bot, FOREIGN_CHAT)
+    assert len(bot.left) == 3
+
+    bot = FlakyBot([TelegramForbiddenError(method, "bot is not a member")])
+    await leave(bot, FOREIGN_CHAT)
+    assert len(bot.left) == 1  # permanent: no retry

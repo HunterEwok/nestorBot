@@ -69,3 +69,33 @@ async def test_bootstrap_can_be_rerun(database, reader):
 
     await bootstrap(ADMIN_URL, DB, "collector", "reader")
     assert await reader.fetchval("SELECT count(*) FROM reader.chats") == 0
+
+
+async def test_bootstrap_into_existing_database_owned_by_someone_else(database):
+    """As with the postgres Docker image: the database exists, owned by the superuser."""
+    import os
+    import subprocess
+    import sys
+
+    import asyncpg as pg
+
+    from nestor.bootstrap import bootstrap, with_database
+
+    from .conftest import ADMIN_URL
+
+    admin = await pg.connect(ADMIN_URL)
+    await admin.execute("DROP DATABASE IF EXISTS nestor_preexisting")
+    await admin.execute("CREATE DATABASE nestor_preexisting")
+    await admin.close()
+    try:
+        await bootstrap(ADMIN_URL, "nestor_preexisting", "collector", "reader")
+        env = {k: v for k, v in os.environ.items() if k not in ("BOT_TOKEN",)}
+        env["DATABASE_URL"] = with_database(ADMIN_URL, "nestor_preexisting", "nestor", "collector")
+        # Also: the migration CLI needs nothing but DATABASE_URL.
+        done = subprocess.run([sys.executable, "-m", "nestor.migrate"], env=env, capture_output=True, text=True)
+        assert done.returncode == 0, done.stderr
+        assert "0002_reader_views" in done.stdout
+    finally:
+        admin = await pg.connect(ADMIN_URL)
+        await admin.execute("DROP DATABASE IF EXISTS nestor_preexisting")
+        await admin.close()

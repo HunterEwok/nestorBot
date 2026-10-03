@@ -42,12 +42,19 @@ async def migrate(conn: asyncpg.Connection, directory: Path = MIGRATIONS_DIR) ->
 
 
 async def _main() -> None:
-    from .config import load_settings
+    import os
+
+    from dotenv import load_dotenv
+
     from .logs import setup_logging
 
-    settings = load_settings()
-    setup_logging(settings.log_level)
-    conn = await asyncpg.connect(settings.database_url)
+    load_dotenv()
+    setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
+    try:
+        dsn = os.environ["DATABASE_URL"]  # only the database: no bot token needed to migrate
+    except KeyError:
+        raise SystemExit("missing required environment variable DATABASE_URL") from None
+    conn = await asyncpg.connect(dsn)
     try:
         applied = await migrate(conn)
         log.info("migrations done", extra={"applied": applied})

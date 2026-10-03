@@ -13,7 +13,7 @@ from typing import Any, Awaitable, Callable, TypeVar
 
 import asyncpg
 from aiogram import Bot, Dispatcher, Router
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from aiogram.types import ChatMemberUpdated, Message
 
 from ..config import Settings
@@ -27,16 +27,19 @@ GROUP_TYPES = {"group", "supergroup"}
 
 T = TypeVar("T")
 
-# Errors after which the same write can succeed later: connection loss, server restart.
+# Errors after which the same write can succeed later: connection loss, server restart
+# or shutdown, cancelled statements, a full disk or memory pressure on the database
+# host, I/O errors, a read-only replica during failover. Retrying instead of skipping
+# keeps the update unconfirmed until it is stored.
 _TRANSIENT = (
     OSError,
     asyncio.TimeoutError,
     asyncpg.PostgresConnectionError,
     asyncpg.InterfaceError,
-    asyncpg.CannotConnectNowError,
-    asyncpg.TooManyConnectionsError,
-    asyncpg.AdminShutdownError,
-    asyncpg.CrashShutdownError,
+    asyncpg.OperatorInterventionError,      # admin/crash shutdown, cannot connect now, query canceled
+    asyncpg.InsufficientResourcesError,     # disk full, out of memory, too many connections
+    asyncpg.PostgresSystemError,            # I/O error
+    asyncpg.ReadOnlySQLTransactionError,
     asyncpg.SerializationError,
     asyncpg.DeadlockDetectedError,
 )
@@ -132,13 +135,29 @@ class Collector:
         return router
 
 
-async def leave(bot: Bot, chat_id: int) -> None:
-    """FR-7: never stay in a group that is not on the allowlist."""
+async def leave(bot: Bot, chat_id: int, *, attempts: int = 6) -> None:
+    """FR-7: never stay in a group that is not on the allowlist.
+
+    Network and server errors are retried before the update is confirmed, so a
+    single failed attempt in an otherwise quiet group does not keep the bot there.
+    """
     log.warning("leaving chat that is not on the allowlist", extra={"chat_id": chat_id})
-    try:
-        await bot.leave_chat(chat_id)
-    except TelegramAPIError as e:
-        log.warning("leave_chat failed", extra={"chat_id": chat_id, "error": type(e).__name__})
+    delay = 1.0
+    for attempt in range(1, attempts + 1):
+        try:
+            await bot.leave_chat(chat_id)
+            return
+        except TelegramRetryAfter as e:
+            wait = float(e.retry_after)
+        except (TelegramNetworkError, TelegramServerError):
+            wait = delay
+            delay = min(delay * 2, 30.0)
+        except TelegramAPIError as e:  # forbidden, not found, bad request: already out or kicked
+            log.warning("leave_chat failed", extra={"chat_id": chat_id, "error": type(e).__name__})
+            return
+        if attempt < attempts:
+            await asyncio.sleep(wait)
+    log.error("leave_chat kept failing; will retry on the next update from this chat", extra={"chat_id": chat_id})
 
 
 async def run(settings: Settings) -> None:

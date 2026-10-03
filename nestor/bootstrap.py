@@ -50,7 +50,10 @@ async def bootstrap(admin_url: str, database: str, collector_password: str, read
                 f'CREATE DATABASE "{database}" OWNER {COLLECTOR_ROLE} ENCODING \'UTF8\' TEMPLATE template0'
             )
         await admin.execute(f'REVOKE ALL ON DATABASE "{database}" FROM PUBLIC')
-        await admin.execute(f'GRANT CONNECT ON DATABASE "{database}" TO {COLLECTOR_ROLE}, {READER_ROLE}')
+        # CREATE is needed for the reader schema when the database already existed
+        # with another owner (e.g. created by the postgres Docker image).
+        await admin.execute(f'GRANT CONNECT, CREATE, TEMPORARY ON DATABASE "{database}" TO {COLLECTOR_ROLE}')
+        await admin.execute(f'GRANT CONNECT ON DATABASE "{database}" TO {READER_ROLE}')
     finally:
         await admin.close()
 
