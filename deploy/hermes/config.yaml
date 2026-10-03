@@ -1,0 +1,45 @@
+# Hermes profile `group` for the group bot: ~/.hermes/profiles/group/config.yaml
+# (create the profile with `hermes profile create group` or by copying this file).
+#
+# Principle: the model reads untrusted chat text, so this profile gets NO built-in
+# tools at all, only the read-only archive tools of nestor.mcp. Verify after every
+# Hermes update (see deploy/hermes/README.md, step "Проверка").
+
+model:
+  provider: anthropic            # API key in ~/.hermes/profiles/group/.env as ANTHROPIC_API_KEY
+  default: claude-sonnet-5-5     # or choose interactively: hermes -p group model
+
+# Only the API server platform is used; Telegram for this bot belongs to nestor-collector.
+platform_toolsets:
+  api_server: []                 # no terminal, files, browser, web, cron, memory, messaging, delegation
+
+agent:
+  disabled_toolsets:             # second line of defence; names per the Toolsets Reference of your Hermes version
+    - terminal
+    - file
+    - browser
+    - web
+    - code_execution
+    - delegation
+    - memory
+    - skills
+    - cronjob
+    - messaging
+
+gateway:
+  api_server:
+    enabled: true
+    # key: set API_SERVER_KEY in ~/.hermes/profiles/group/.env; the same value goes to
+    # HERMES_API_KEY in /opt/nestor/.env
+
+mcp_servers:
+  nestor:
+    command: /opt/nestor/.venv/bin/python
+    args: ["-m", "nestor.mcp"]
+    cwd: /opt/nestor
+    env:
+      READER_DATABASE_URL: "postgresql://hermes_reader:CHANGE_ME@DB_HOST/nestor"
+    tools:
+      include: [search_messages, get_thread, get_user_messages, get_recent]
+      prompts: false
+      resources: false

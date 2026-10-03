@@ -1,19 +1,19 @@
-# Local development databases. Not used on the Pi.
+# Local development databases, same major version as production (postgres:18 on the router).
 #   docker compose up -d
 services:
   db:          # for running the collector locally
-    image: postgres:16
+    image: postgres:18
     environment:
       POSTGRES_PASSWORD: postgres
     ports: ["5432:5432"]
-    volumes: [pgdata:/var/lib/postgresql/data]
+    volumes: [pgdata18:/var/lib/postgresql]   # postgres 18 images keep data under /var/lib/postgresql/18
 
   db-test:     # throwaway cluster for pytest; data lives in memory
-    image: postgres:16
+    image: postgres:18
     environment:
       POSTGRES_PASSWORD: postgres
     ports: ["5433:5432"]
-    tmpfs: [/var/lib/postgresql/data]
+    tmpfs: [/var/lib/postgresql]
 
 volumes:
-  pgdata:
+  pgdata18:

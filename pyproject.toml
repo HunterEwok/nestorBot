@@ -7,10 +7,13 @@ dependencies = [
     "aiogram>=3.13,<4",
     "asyncpg>=0.29",
     "python-dotenv>=1.0",
+    "mcp>=2.3,<3",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+# History import runs on the owner's laptop, not on the Pi.
+import = ["telethon>=1.36"]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "telethon>=1.36"]
 
 [tool.setuptools.packages.find]
 include = ["nestor*"]
