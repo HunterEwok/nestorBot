@@ -1,10 +1,9 @@
 # Hermes profile `group` for the group bot: ~/.hermes/profiles/group/config.yaml
 # (create the profile with `hermes profile create group` or by copying this file).
 #
-# Principle: the model reads untrusted chat text, so this profile gets only the
-# read-only archive tools of nestor.mcp plus web search/extract for public info
-# (requested by the owner 2026-10-03). Nothing that writes, runs code or reaches the
-# home network. Verify after every Hermes update (deploy/hermes/README.md, "Проверка").
+# Principle: the model reads untrusted chat text, so this profile gets NO built-in
+# tools at all, only the read-only archive tools of nestor.mcp. Verify after every
+# Hermes update (see deploy/hermes/README.md, step "Проверка").
 
 model:
   provider: anthropic            # API key in ~/.hermes/profiles/group/.env as ANTHROPIC_API_KEY
@@ -12,21 +11,14 @@ model:
 
 # Only the API server platform is used; Telegram for this bot belongs to nestor-collector.
 platform_toolsets:
-  api_server: [web]              # web_search + web_extract only; no terminal, files, browser, cron, memory, messaging, delegation
-
-# Web backends run in the provider's cloud (keyless free tiers by default, or set e.g.
-# TAVILY_API_KEY in the profile .env and web.backend: tavily). Pages on localhost and
-# private networks (the database on 192.168.0.1, Hermes API on 127.0.0.1) stay unreachable.
-web:
-  keyless_fallback: true
-security:
-  allow_private_urls: false
+  api_server: []                 # no terminal, files, browser, web, cron, memory, messaging, delegation
 
 agent:
   disabled_toolsets:             # second line of defence; names per the Toolsets Reference of your Hermes version
     - terminal
     - file
     - browser
+    - web
     - code_execution
     - delegation
     - memory

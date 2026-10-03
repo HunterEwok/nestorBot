@@ -1,0 +1,42 @@
+# Hermes profile `web` for internet questions: ~/.hermes/profiles/web/config.yaml
+# (hermes profile create web, then copy this file and web/SOUL.md into it).
+#
+# Principle: this profile can search the web, so it must never see the archive. It has
+# no MCP servers at all; nestor-collector sends it only the asker's own question and earlier
+# web turns of the same conversation. The `group` profile, which reads the archive, has no
+# web. Verify after every Hermes update (deploy/hermes/README.md, "Проверка").
+
+model:
+  provider: anthropic            # ANTHROPIC_API_KEY in ~/.hermes/profiles/web/.env (may be the same key as group)
+  default: claude-haiku-4-5      # short lookups: the cheapest model is enough
+
+platform_toolsets:
+  api_server: [web]              # web_search + web_extract only
+
+# Web backends run in the provider's cloud (keyless free tiers by default, or set e.g.
+# TAVILY_API_KEY in the profile .env and web.backend: tavily). Pages on localhost and
+# private networks (the database on 192.168.0.1, Hermes API on 127.0.0.1) stay unreachable.
+web:
+  keyless_fallback: true
+security:
+  allow_private_urls: false
+
+agent:
+  disabled_toolsets:             # second line of defence; names per the Toolsets Reference of your Hermes version
+    - terminal
+    - file
+    - browser
+    - code_execution
+    - delegation
+    - memory
+    - skills
+    - cronjob
+    - messaging
+
+gateway:
+  api_server:
+    enabled: true
+    # key: set API_SERVER_KEY in ~/.hermes/profiles/web/.env; the same value goes to
+    # HERMES_WEB_API_KEY in /opt/nestor/.env
+
+# No mcp_servers: the archive is out of reach by construction.
