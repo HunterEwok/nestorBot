@@ -70,5 +70,22 @@ async def get_recent(ticket: str, limit: int = 50) -> str:
     return await _call(tools.get_recent, ticket=ticket, limit=limit)
 
 
+@server.tool()
+async def find_links(ticket: str, query: str | None = None, author: str | None = None, days: int = 365,
+                     limit: int = 30) -> str:
+    """Messages of this group that contain links. `query` matches the link, the message text or its words;
+    `author` is @username or a name."""
+    return await _call(tools.find_links, ticket=ticket, query=query, author=author, days=days, limit=limit)
+
+
+@server.tool()
+async def find_files(ticket: str, query: str | None = None, kind: str | None = None, author: str | None = None,
+                     days: int = 365, limit: int = 30) -> str:
+    """Files, photos, videos, audio and voice messages of this group. `query` matches the file name or the
+    caption; `kind` is one of document, photo, video, audio, voice, video_note, animation."""
+    return await _call(tools.find_files, ticket=ticket, query=query, kind=kind, author=author, days=days,
+                       limit=limit)
+
+
 if __name__ == "__main__":
     server.run("stdio")

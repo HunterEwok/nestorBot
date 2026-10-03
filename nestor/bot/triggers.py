@@ -4,7 +4,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-COMMANDS = {"help", "privacy", "forget_me", "summary", "stats", "pause", "resume", "bot_word", "start"}
+COMMANDS = {"help", "privacy", "forget_me", "summary", "stats", "pause", "resume", "bot_word", "start",
+            "catchup", "export", "reminders", "unremind", "digest", "wisdom"}
 
 
 @dataclass(frozen=True)

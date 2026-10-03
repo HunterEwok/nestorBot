@@ -8,6 +8,7 @@ before it is stored; Telegram keeps unconfirmed updates for up to 24 hours.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from typing import Any, Awaitable, Callable, TypeVar
 
@@ -122,8 +123,16 @@ class Collector:
         return result
 
     async def handle_message(self, message: Message, bot: Bot, *, is_edit: bool) -> None:
+        if message.chat.type == "private":
+            # Never archived. Only /export is served there (the file with the person's own messages).
+            if self.answerer is not None and not is_edit:
+                try:
+                    await self.answerer.on_private(dump(message))
+                except Exception:  # noqa: BLE001
+                    log.exception("private message handling failed")
+            return
         if message.chat.type not in GROUP_TYPES:
-            return  # private chats: commands arrive in stage 3
+            return
         msg = dump(message)
         if not await self.is_allowed(message.chat.id, msg):
             await leave(bot, message.chat.id)
@@ -192,20 +201,30 @@ async def make_answerer(settings: Settings, bot: Bot, pool: asyncpg.Pool, collec
 
     from ..bot.answerer import AnswerConfig, Answerer
     from ..bot.llm import HermesClient
+    from ..bot.music import HttpChecker
     from ..bot.triggers import BotIdentity
 
     me = await bot.me()
     identity = BotIdentity(me.id, me.username, settings.bot_keywords)
     cfg = AnswerConfig(rate_limit=settings.rate_limit, rate_window_min=settings.rate_window_min,
-                       daily_token_limit=settings.daily_token_limit, tz=ZoneInfo(settings.timezone))
+                       daily_token_limit=settings.daily_token_limit, tz=ZoneInfo(settings.timezone),
+                       music_daily_limit=settings.music_daily_limit, allowed_chat_ids=settings.allowed_chat_ids,
+                       wisdom_chat_ids=settings.wisdom_chat_ids, digest_time=settings.digest_time,
+                       wisdom_time=settings.wisdom_time)
     llm = HermesClient(settings.hermes_url, settings.hermes_api_key, settings.hermes_model, timeout=cfg.timeout_s)
-    web = None
+    web = smart = None
     if settings.hermes_web_url:
         web = HermesClient(settings.hermes_web_url, settings.hermes_web_api_key, settings.hermes_model,
                            timeout=cfg.timeout_s)
     else:
         log.warning("HERMES_WEB_URL is not set: questions that need the internet get a refusal")
-    return Answerer(bot, pool, llm, identity, lambda msg: collector.store(msg, is_edit=False), cfg, web_llm=web)
+    if settings.hermes_smart_url:
+        smart = HermesClient(settings.hermes_smart_url, settings.hermes_smart_api_key, settings.hermes_model,
+                             timeout=cfg.smart_timeout_s)
+    else:
+        log.warning("HERMES_SMART_URL is not set: songs and the wisdom of the day use the web profile")
+    return Answerer(bot, pool, llm, identity, lambda msg: collector.store(msg, is_edit=False), cfg, web_llm=web,
+                    smart_llm=smart, checker=HttpChecker())
 
 
 async def run(settings: Settings) -> None:
@@ -220,7 +239,16 @@ async def run(settings: Settings) -> None:
     else:
         log.warning("HERMES_URL is not set: archiving only, the bot will not answer")
     dp.include_router(collector.router())
+    scheduler = None
+    if collector.answerer is not None:
+        from ..bot.scheduler import Scheduler
+
+        scheduler = asyncio.create_task(Scheduler(collector.answerer).run())
     try:
         await dp.start_polling(bot, handle_as_tasks=False, allowed_updates=ALLOWED_UPDATES)
     finally:
+        if scheduler is not None:
+            scheduler.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await scheduler
         await pool.close()

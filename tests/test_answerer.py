@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import pytest
 from aiogram import Dispatcher
 from aiogram.enums import ChatMemberStatus
+from aiogram.exceptions import TelegramForbiddenError
 from aiogram.types import Message, Update
 
 from nestor.bot import prompts
@@ -24,26 +25,36 @@ _ids = itertools.count(10_000)
 
 
 class FakeBot(BaseFakeBot):
-    def __init__(self, admins=()):
+    def __init__(self, admins=(), no_private=()):
         super().__init__()
         self.sent: list[dict] = []
+        self.documents: list[dict] = []
         self.deleted: list[int] = []
         self.reactions: list = []
         self.actions: list = []
         self.admins = set(admins)
+        self.no_private = set(no_private)  # users who never opened a private chat with the bot
+        self.bot_status = ChatMemberStatus.MEMBER
 
     async def send_message(self, chat_id, text, reply_parameters=None, **kw):
         mid = next(_ids)
-        self.sent.append({"chat_id": chat_id, "text": text, "reply_to": reply_parameters.message_id,
-                          "message_id": mid})
+        self.sent.append({"chat_id": chat_id, "text": text, "message_id": mid,
+                          "reply_to": reply_parameters.message_id if reply_parameters else None, **kw})
         return Message.model_validate({
             "message_id": mid, "date": int(datetime.now(timezone.utc).timestamp()),
-            "chat": {"id": chat_id, "type": "supergroup", "title": "Test group"},
+            "chat": {"id": chat_id, "type": "supergroup" if chat_id < 0 else "private", "title": "Test group"},
             "from": {"id": BOT_ID, "is_bot": True, "first_name": "Нестор", "username": "ewok_nestor_bot"},
             "text": text,
             # Telegram echoes the options back when the text has a link; aiogram adds Default(...) placeholders.
             **({"link_preview_options": {"is_disabled": True}} if "https://" in text else {}),
         })
+
+    async def send_document(self, chat_id, document, caption=None, **kw):
+        if chat_id in self.no_private:
+            raise TelegramForbiddenError(method=None, message="Forbidden: bot can't initiate conversation with a user")
+        self.documents.append({"chat_id": chat_id, "data": document.data, "filename": document.filename,
+                               "caption": caption})
+        return True
 
     async def set_message_reaction(self, chat_id, message_id, reaction=None, **kw):
         self.reactions.append((message_id, [r.emoji for r in reaction or []]))
@@ -58,8 +69,12 @@ class FakeBot(BaseFakeBot):
         return True
 
     async def get_chat_member(self, chat_id, user_id, **kw):
+        status = (self.bot_status if user_id == BOT_ID
+                  else ChatMemberStatus.ADMINISTRATOR if user_id in self.admins else ChatMemberStatus.MEMBER)
+
         class M:
-            status = ChatMemberStatus.ADMINISTRATOR if user_id in self.admins else ChatMemberStatus.MEMBER
+            pass
+        M.status = status
         return M()
 
 
@@ -82,14 +97,38 @@ class FakeLLM:
             self.active -= 1
 
 
-@pytest.fixture
-def make_env(pool):
-    def make(llm=None, admins=(), web=None, **cfg):
-        bot, llm = FakeBot(admins), llm or FakeLLM()
+class FakeChecker:
+    """music.Checker without the network: which videos and tracks "exist"."""
+
+    def __init__(self, videos=None, spotify=(), apple=None):
+        self.videos = videos or {}          # video id -> title; missing ids do not exist or cannot be embedded
+        self.spotify_ids = set(spotify)
+        self.apple_url = apple
+        self.calls: list = []
+
+    async def youtube(self, video_id):
+        self.calls.append(("youtube", video_id))
+        return {"title": self.videos[video_id]} if video_id in self.videos else None
+
+    async def spotify(self, track_id):
+        self.calls.append(("spotify", track_id))
+        return {"title": "track"} if track_id in self.spotify_ids else None
+
+    async def apple(self, artist, title):
+        self.calls.append(("apple", artist, title))
+        return self.apple_url
+
+
+@pytest.fixture(name="make_env")
+def make_env_fixture(pool):
+    def make(llm=None, admins=(), web=None, smart=None, checker=None, no_private=(), **cfg):
+        bot, llm = FakeBot(admins, no_private), llm or FakeLLM()
         settings = Settings(bot_token="42:TEST", database_url="", allowed_chat_ids=frozenset({CHAT_ID}))
         collector = Collector(settings, pool)
+        cfg.setdefault("allowed_chat_ids", frozenset({CHAT_ID}))
         collector.answerer = Answerer(bot, pool, llm, BotIdentity(BOT_ID, "ewok_nestor_bot", ("нестор", "бот")),
-                                      lambda m: collector.store(m, is_edit=False), AnswerConfig(**cfg), web_llm=web)
+                                      lambda m: collector.store(m, is_edit=False), AnswerConfig(**cfg), web_llm=web,
+                                      smart_llm=smart, checker=checker or FakeChecker())
         dp = Dispatcher()
         dp.include_router(collector.router())
 
@@ -333,4 +372,4 @@ async def test_mcp_server_exposes_only_read_tools():
     from nestor.mcp.__main__ import server
 
     names = sorted(t.name for t in await server.list_tools())
-    assert names == ["get_recent", "get_thread", "get_user_messages", "search_messages"]
+    assert names == ["find_files", "find_links", "get_recent", "get_thread", "get_user_messages", "search_messages"]
