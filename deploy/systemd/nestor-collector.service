@@ -1,0 +1,25 @@
+[Unit]
+Description=nestor collector: archives allowed Telegram groups to PostgreSQL
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=nestor
+Group=nestor
+WorkingDirectory=/opt/nestor
+EnvironmentFile=/opt/nestor/.env
+ExecStartPre=/opt/nestor/.venv/bin/python -m nestor.migrate
+ExecStart=/opt/nestor/.venv/bin/python -m nestor.collector
+Restart=always
+RestartSec=5
+# Logs go to journald (JSON, no message text); keep 14 days via journald.conf MaxRetentionSec=14d.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+MemoryMax=300M
+
+[Install]
+WantedBy=multi-user.target
