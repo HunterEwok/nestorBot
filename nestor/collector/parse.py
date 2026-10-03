@@ -37,6 +37,7 @@ class UserRow:
     first_name: str | None
     last_name: str | None
     is_bot: bool
+    partial: bool = False  # only the id is known (history import): never overwrite a profile
 
 
 @dataclass
@@ -81,6 +82,7 @@ def parse_user(u: dict) -> UserRow:
         first_name=u.get("first_name"),
         last_name=u.get("last_name"),
         is_bot=bool(u.get("is_bot", False)),
+        partial=bool(u.get("partial", False)),
     )
 
 
@@ -142,9 +144,10 @@ def parse_message(msg: dict) -> MessageRow:
     users: list[UserRow] = []
     if "from" in msg:
         users.append(parse_user(msg["from"]))
-    for member in msg.get("new_chat_members", []):
+    members = msg.get("new_chat_members")
+    for member in members if isinstance(members, list) else []:
         users.append(parse_user(member))
-    if "left_chat_member" in msg:
+    if isinstance(msg.get("left_chat_member"), dict):
         users.append(parse_user(msg["left_chat_member"]))
 
     return MessageRow(

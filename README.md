@@ -68,6 +68,17 @@
 
 `chat_id` группы: добавить бота с пустым `ALLOWED_CHAT_IDS`, он сразу выйдет и запишет `chat_id` в журнал (`journalctl -u nestor-collector`).
 
+## Импорт старой истории
+
+Bot API не отдаёт сообщения, написанные до добавления бота, поэтому история читается разово через твой аккаунт Telegram (Telethon) и запускается с ноутбука, не с Pi.
+
+1. На https://my.telegram.org → API development tools получить `api_id` и `api_hash`, вписать в `.env` как `TG_API_ID` и `TG_API_HASH`. В `DATABASE_URL` указать базу на сервере (роль `nestor`, через туннель).
+2. `pip install -e ".[import]"` (в dev-окружении уже стоит).
+3. `python -m nestor.importer --list`: список твоих групп с `chat_id`, звёздочкой отмечены те, что уже в `ALLOWED_CHAT_IDS`. Первый запуск спросит телефон и код входа; сессия сохранится в `nestor-import.session`, это залогиненный аккаунт, файл никому не отдавать.
+4. `python -m nestor.importer`: импорт всех групп из `ALLOWED_CHAT_IDS` (или `--chat <id>` для одной).
+
+Импорт можно прерывать и запускать снова: уже сохранённое пропускается, а живые сообщения сборщика импорт не перезаписывает. Обычные (не супер-) группы не импортируются: у них номера сообщений у каждого аккаунта свои. Такую группу нужно сначала превратить в супергруппу (например, включить видимость истории для новых участников), тогда её старая часть импортируется под прежним `chat_id`.
+
 ## Локальная разработка
 
 Нужны Python 3.11+ и Docker (две базы PostgreSQL 16 из `docker-compose.yml`: `db` на 5432 для запуска, `db-test` на 5433 для тестов).
@@ -83,7 +94,7 @@ python -m nestor.migrate
 python -m nestor.collector    # нужен настоящий BOT_TOKEN и ALLOWED_CHAT_IDS в .env
 ```
 
-В PyCharm те же шаги лежат готовыми конфигурациями запуска в `.run/`: `1 bootstrap db`, `2 migrate`, `3 collector`, `tests`.
+В PyCharm те же шаги лежат готовыми конфигурациями запуска в `.run/`: `1 bootstrap db`, `2 migrate`, `3 collector`, `4 import history`, `import: list groups`, `tests`.
 
 Тесты пересоздают роли `nestor`, `hermes_reader` и базу `nestor_test`, поэтому `NESTOR_TEST_PG_ADMIN_URL` должен указывать на одноразовый кластер. Без этой переменной тесты базы пропускаются.
 

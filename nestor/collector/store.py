@@ -52,6 +52,12 @@ async def upsert_chat(conn: asyncpg.Connection, chat: ChatRow, migrated_from: in
 
 async def upsert_users(conn: asyncpg.Connection, users: list[UserRow]) -> None:
     for u in users:
+        if u.partial:
+            await conn.execute(
+                "INSERT INTO users (user_id, is_bot) VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING",
+                u.user_id, u.is_bot,
+            )
+            continue
         await conn.execute(
             """INSERT INTO users (user_id, username, first_name, last_name, is_bot)
                VALUES ($1, $2, $3, $4, $5)
