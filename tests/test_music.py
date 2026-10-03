@@ -61,7 +61,7 @@ def test_needs_reply_text(question, needs):
 async def test_card_prefers_verified_matching_video_and_direct_links():
     pick = music.Pick("Кино", "Группа <крови>", ("AAAAAAAAAAA", "BBBBBBBBBBB", "CCCCCCCCCCC"), SPOTIFY)
     checker = FakeChecker(videos={"AAAAAAAAAAA": "Какой-то кавер", "BBBBBBBBBBB": "КИНО - Группа <крови> (Official)"},
-                          spotify={SPOTIFY}, apple="https://music.apple.com/ru/album/x/1?i=2")
+                          spotify={SPOTIFY: "Группа <крови> - Remastered"}, apple="https://music.apple.com/ru/album/x/1?i=2")
     card = await music.build_card(pick, checker)
     assert card.preview_url == "https://www.youtube.com/watch?v=BBBBBBBBBBB"
     assert "<b>Кино — Группа &lt;крови&gt;</b>" in card.html and prompts.MUSIC_PLAY in card.html
@@ -73,6 +73,31 @@ async def test_card_prefers_verified_matching_video_and_direct_links():
         ("🔎 Яндекс Музыка", "https://music.yandex.ru/search?text=%D0%9A%D0%B8%D0%BD%D0%BE%20%D0%93%D1%80%D1%83%D0%BF"
                             "%D0%BF%D0%B0%20%3C%D0%BA%D1%80%D0%BE%D0%B2%D0%B8%3E"),
     ]
+
+
+@pytest.mark.parametrize("found, wanted, same", [
+    ("КИНО - Группа крови (Official Video)", "Группа крови", True),
+    ("Kino - Gruppa Krovi", "Группа крови", True),
+    ("Кино – Хочешь?", "Хочешь", True),
+    ("Kino - Hochesh", "Хочешь", True),
+    ("Звезда по имени Солнце", "Zvezda po imeni Solnce", True),
+    ("Queen – Bohemian Rhapsody (Official Video Remastered)", "Bohemian Rhapsody", True),
+    ("Кино - Кукушка", "Группа крови", False),
+    ("Gruppa Krovi (cover by Ivan)", "Кукушка", False),
+    (None, "Группа крови", False),
+])
+def test_same_song(found, wanted, same):
+    assert music.same_song(found, wanted) is same
+
+
+async def test_card_ignores_links_to_another_song():
+    pick = music.Pick("Кино", "Группа крови", ("AAAAAAAAAAA",), SPOTIFY)
+    checker = FakeChecker(videos={"AAAAAAAAAAA": "Кино - Кукушка"}, spotify={SPOTIFY: "Кукушка"})
+    card = await music.build_card(pick, checker)
+    assert card.preview_url is None and prompts.MUSIC_NO_PLAYER in card.html
+    buttons = {b.text: b.url for row in card.keyboard.inline_keyboard for b in row}
+    assert buttons["🔎 YouTube Music"].startswith("https://music.youtube.com/search?q=")
+    assert buttons["🔎 Spotify"].startswith("https://open.spotify.com/search/")
 
 
 async def test_card_without_verified_links_uses_searches():

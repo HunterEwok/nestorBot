@@ -318,15 +318,26 @@ class Answerer:
                     r["chat_id"], text, parse_mode="HTML", message_thread_id=r["thread_id"],
                     reply_parameters=ReplyParameters(message_id=r["request_msg_id"], allow_sending_without_reply=True),
                     link_preview_options=LinkPreviewOptions(is_disabled=True))
-            except (TelegramRetryAfter, TelegramNetworkError, TelegramServerError) as e:
-                log.warning("reminder not sent, will retry", extra={"chat_id": r["chat_id"], "error": type(e).__name__})
+            except TelegramRetryAfter as e:  # flood control: wait as long as Telegram asks, not a failure
+                log.warning("reminder postponed by flood control",
+                            extra={"chat_id": r["chat_id"], "retry_after": e.retry_after})
                 async with self.pool.acquire() as conn:
-                    await reminders.mark_failed(conn, r["id"], give_up=r["attempts"] + 1 >= 5)
+                    await reminders.postpone(conn, r["id"], now + timedelta(seconds=e.retry_after), failed=False)
+                continue
+            except (TelegramNetworkError, TelegramServerError) as e:
+                failures = r["attempts"] + 1
+                log.warning("reminder not sent, will retry",
+                            extra={"chat_id": r["chat_id"], "error": type(e).__name__, "failures": failures})
+                async with self.pool.acquire() as conn:
+                    if failures >= reminders.MAX_FAILURES:
+                        await reminders.drop(conn, r["id"])
+                    else:
+                        await reminders.postpone(conn, r["id"], now + reminders.backoff(failures), failed=True)
                 continue
             except TelegramAPIError as e:  # removed from the chat, chat gone: no point in retrying
                 log.warning("reminder dropped", extra={"chat_id": r["chat_id"], "error": type(e).__name__})
                 async with self.pool.acquire() as conn:
-                    await reminders.mark_failed(conn, r["id"], give_up=True)
+                    await reminders.drop(conn, r["id"])
                 continue
             async with self.pool.acquire() as conn:
                 await reminders.mark_sent(conn, r["id"])
@@ -796,13 +807,16 @@ class Answerer:
                                               + context.render(rows, tz, title="сообщения за вчера")}]
         completion = await asyncio.wait_for(self.llm.complete(prompt), self.cfg.timeout_s)
         text = prompts.DIGEST_HEADER.format(date=daily.day_name(yesterday)) + "\n\n" + completion.text
-        sent = [await self._post(chat_id, part) for part in split_text(text)]
+        # Always one message, cut if the model overran its length limit: a post is then either
+        # delivered whole or retried whole, never left half-sent.
+        parts = split_text(text, TELEGRAM_LIMIT - 1)
+        sent = await self._post(chat_id, parts[0] + ("…" if len(parts) > 1 else ""))
         async with self.pool.acquire() as conn:
-            await self._log_scheduled(conn, chat_id, "digest", completion, sent, started,
-                                      status="ok" if sent and sent[0] else "error")
-        if not sent or sent[0] is None:
+            await self._log_scheduled(conn, chat_id, "digest", completion, [sent], started,
+                                      status="ok" if sent else "error")
+        if sent is None:
             return "failed", {}
-        return "posted", {"message_id": sent[0].message_id}
+        return "posted", {"message_id": sent.message_id}
 
     async def _wisdom(self, chat_id: int, day: date) -> tuple[str, dict]:
         """A real quote for today's themes. The archive model picks themes from a fixed list;

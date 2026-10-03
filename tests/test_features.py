@@ -7,6 +7,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from aiogram.enums import ChatMemberStatus
+from aiogram.exceptions import TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter
+from aiogram.methods import SendMessage
 
 from nestor.bot import prompts
 from nestor.bot.context import classify
@@ -109,6 +111,53 @@ async def test_reminder_in_paused_chat_waits_and_comes_late(make_env, conn):
     await feed(update("message", message(3, "/resume", date=ago())))
     assert await feed.answerer.send_due_reminders(due + timedelta(hours=2)) == 1
     assert "напоминаю про чайник\n(с опозданием: напоминание было на " in bot.sent[-1]["text"]
+
+
+async def test_reminder_waits_out_flood_control_and_network_errors(make_env, conn):
+    bot, llm, feed = make_env()
+    await feed(update("message", message(1, "нестор, напомни через 5 минут про чайник", date=ago())))
+    due = await conn.fetchval("SELECT due_at FROM reminders")
+    answerer, method = feed.answerer, SendMessage(chat_id=CHAT_ID, text="⏰")
+
+    # Flood control: wait as long as Telegram asks, and it does not count as a failure.
+    bot.send_errors = [TelegramRetryAfter(method, "Flood control exceeded", retry_after=600)]
+    t = due + timedelta(seconds=1)
+    assert await answerer.send_due_reminders(t) == 0
+    assert await answerer.send_due_reminders(t + timedelta(minutes=9)) == 0
+    # Then the network is down for hours: 1, 2, 4 … minutes between tries, at most an hour.
+    t += timedelta(minutes=10)
+    bot.send_errors = [TelegramNetworkError(method, "timeout") for _ in range(9)]
+    assert await answerer.send_due_reminders(t) == 0
+    assert len(bot.send_errors) == 8
+    assert await answerer.send_due_reminders(t + timedelta(seconds=30)) == 0
+    assert len(bot.send_errors) == 8          # too early for the next try: nothing was sent
+    for _ in range(8):
+        t += timedelta(hours=1)
+        assert await answerer.send_due_reminders(t) == 0
+    assert bot.send_errors == []
+    assert await answerer.send_due_reminders(t + timedelta(hours=1)) == 1
+    assert "напоминаю про чайник\n(с опозданием" in bot.sent[-1]["text"]
+
+
+async def test_reminder_dropped_after_repeated_failures_or_when_removed(make_env, conn):
+    bot, llm, feed = make_env()
+    await feed(update("message", message(1, "нестор, напомни через 5 минут про чайник", date=ago())))
+    await feed(update("message", message(2, "нестор, напомни через 10 минут про суп", date=ago())))
+    kettle, soup = await conn.fetch("SELECT id, due_at FROM reminders ORDER BY id")
+    answerer, method = feed.answerer, SendMessage(chat_id=CHAT_ID, text="⏰")
+
+    bot.send_errors = [TelegramForbiddenError(method, "bot was kicked from the group chat")]
+    assert await answerer.send_due_reminders(kettle["due_at"] + timedelta(seconds=1)) == 0
+    assert await conn.fetchval("SELECT cancelled_at IS NOT NULL FROM reminders WHERE id = $1", kettle["id"])
+
+    t = soup["due_at"]
+    bot.send_errors = [TelegramNetworkError(method, "timeout") for _ in range(10)]
+    for _ in range(10):
+        t += timedelta(hours=1)
+        assert await answerer.send_due_reminders(t) == 0
+    row = await conn.fetchrow("SELECT attempts, cancelled_at FROM reminders WHERE id = $1", soup["id"])
+    assert row["attempts"] == 10 and row["cancelled_at"] is not None
+    assert await answerer.send_due_reminders(t + timedelta(hours=1)) == 0
 
 
 # ---- «что я пропустил» ----
@@ -271,7 +320,7 @@ async def test_private_chat_serves_only_export_and_is_never_archived(make_env, c
 
 async def test_song_card_plays_in_telegram(make_env, conn):
     smart, web = FakeLLM(SONG), FakeLLM("web")
-    checker = FakeChecker(videos={"BBBBBBBBBBB": "КИНО - Группа крови"}, spotify={SPOTIFY},
+    checker = FakeChecker(videos={"BBBBBBBBBBB": "КИНО - Группа крови"}, spotify={SPOTIFY: "Группа крови"},
                           apple="https://music.apple.com/ru/album/x/1?i=2")
     bot, llm, feed = make_env(web=web, smart=smart, checker=checker)
     await feed(update("message", message(1, "секретный план Пети", uid=333)))
@@ -359,6 +408,30 @@ async def test_digest_is_switched_on_by_an_admin_and_posted_once(make_env, conn)
     assert (row["kind"], row["status"], row["message_id"]) == ("digest", "posted", post["message_id"])
     req = await conn.fetchrow("SELECT * FROM bot_requests WHERE scenario = 'digest'")
     assert (req["user_id"], req["trigger_msg_id"], req["input_tokens"]) == (None, None, 1000)
+
+
+async def test_long_digest_is_one_message_and_a_failed_send_is_retried(make_env, conn):
+    bot, llm, feed = make_env(FakeLLM("• тема: " + "очень длинно " * 600))
+    yesterday = int(local(-1, 12).timestamp())
+    for i in range(10, 16):
+        await feed(update("message", message(i, f"обсуждаем отпуск {i}", uid=200 + i, date=yesterday + i)))
+    await conn.execute("UPDATE chats SET settings = settings || jsonb_build_object('digest', true) WHERE chat_id = $1",
+                       CHAT_ID)
+    answerer = feed.answerer
+    count = len(bot.sent)
+    bot.send_errors = [TelegramNetworkError(SendMessage(chat_id=CHAT_ID, text="x"), "timeout")]
+    await answerer.run_daily_posts(local(0, 9, 30).astimezone(timezone.utc))
+    await answerer.drain()
+    assert len(bot.sent) == count
+    assert await conn.fetchval("SELECT status FROM daily_posts") == "failed"
+
+    await conn.execute("UPDATE daily_posts SET updated_at = now() - interval '11 minutes'")
+    await answerer.run_daily_posts(local(0, 9, 45).astimezone(timezone.utc))
+    await answerer.drain()
+    assert len(bot.sent) == count + 1
+    post = bot.sent[-1]["text"]
+    assert len(post) <= 4096 and post.endswith("…") and post.startswith("Дайджест за вчера, ")
+    assert await conn.fetchval("SELECT status FROM daily_posts") == "posted"
 
 
 async def test_wisdom_sends_only_themes_to_the_web_model(make_env, conn):

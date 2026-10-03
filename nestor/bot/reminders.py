@@ -241,6 +241,14 @@ def format_due(due: datetime, tz: ZoneInfo, now: datetime) -> str:
 
 # ---- table ----
 
+MAX_FAILURES = 10   # network or server errors in a row; with backoff() that is about four hours of trying
+
+
+def backoff(failures: int) -> timedelta:
+    """Pause before the next try after `failures` failed sends: 1, 2, 4 … minutes, at most an hour."""
+    return timedelta(minutes=min(2 ** (failures - 1), 60))
+
+
 async def create(conn: asyncpg.Connection, *, chat_id: int, thread_id: int | None, user_id: int,
                  request_msg_id: int, text: str, due: datetime) -> int:
     return await conn.fetchval(
@@ -279,6 +287,7 @@ async def due(conn, now: datetime, limit: int = 20) -> list[asyncpg.Record]:
            JOIN chats c ON c.chat_id = r.chat_id AND c.enabled
            LEFT JOIN users u ON u.user_id = r.user_id
            WHERE r.sent_at IS NULL AND r.cancelled_at IS NULL AND r.due_at <= $1
+             AND (r.next_attempt_at IS NULL OR r.next_attempt_at <= $1)
            ORDER BY r.due_at, r.id LIMIT $2""", now, limit))
 
 
@@ -286,7 +295,13 @@ async def mark_sent(conn, reminder_id: int) -> None:
     await conn.execute("UPDATE reminders SET sent_at = now(), attempts = attempts + 1 WHERE id = $1", reminder_id)
 
 
-async def mark_failed(conn, reminder_id: int, *, give_up: bool) -> None:
-    await conn.execute(
-        "UPDATE reminders SET attempts = attempts + 1, cancelled_at = CASE WHEN $2 THEN now() END WHERE id = $1",
-        reminder_id, give_up)
+async def postpone(conn, reminder_id: int, until: datetime, *, failed: bool) -> None:
+    """Try again at `until`. Flood control (failed=False) is Telegram asking to wait, not a failure."""
+    await conn.execute("UPDATE reminders SET next_attempt_at = $2, attempts = attempts + $3 WHERE id = $1",
+                       reminder_id, until, int(failed))
+
+
+async def drop(conn, reminder_id: int) -> None:
+    """Give up: the bot was removed, the chat is gone, or sending kept failing."""
+    await conn.execute("UPDATE reminders SET cancelled_at = now(), attempts = attempts + 1 WHERE id = $1",
+                       reminder_id)

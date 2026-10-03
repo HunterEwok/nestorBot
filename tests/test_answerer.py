@@ -35,8 +35,11 @@ class FakeBot(BaseFakeBot):
         self.admins = set(admins)
         self.no_private = set(no_private)  # users who never opened a private chat with the bot
         self.bot_status = ChatMemberStatus.MEMBER
+        self.send_errors: list[Exception] = []  # raised by the next send_message calls, one per call
 
     async def send_message(self, chat_id, text, reply_parameters=None, **kw):
+        if self.send_errors:
+            raise self.send_errors.pop(0)
         mid = next(_ids)
         self.sent.append({"chat_id": chat_id, "text": text, "message_id": mid,
                           "reply_to": reply_parameters.message_id if reply_parameters else None, **kw})
@@ -100,9 +103,9 @@ class FakeLLM:
 class FakeChecker:
     """music.Checker without the network: which videos and tracks "exist"."""
 
-    def __init__(self, videos=None, spotify=(), apple=None):
+    def __init__(self, videos=None, spotify=None, apple=None):
         self.videos = videos or {}          # video id -> title; missing ids do not exist or cannot be embedded
-        self.spotify_ids = set(spotify)
+        self.spotify_tracks = spotify or {}  # track id -> title
         self.apple_url = apple
         self.calls: list = []
 
@@ -112,7 +115,7 @@ class FakeChecker:
 
     async def spotify(self, track_id):
         self.calls.append(("spotify", track_id))
-        return {"title": "track"} if track_id in self.spotify_ids else None
+        return {"title": self.spotify_tracks[track_id]} if track_id in self.spotify_tracks else None
 
     async def apple(self, artist, title):
         self.calls.append(("apple", artist, title))

@@ -19,7 +19,8 @@ CREATE TABLE reminders (
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   sent_at         TIMESTAMPTZ,
   cancelled_at    TIMESTAMPTZ,
-  attempts        INT NOT NULL DEFAULT 0
+  attempts        INT NOT NULL DEFAULT 0,      -- failed sends (network, Telegram server errors)
+  next_attempt_at TIMESTAMPTZ                  -- after a failed send or Telegram's flood control
 );
 CREATE INDEX reminders_due_idx ON reminders (due_at) WHERE sent_at IS NULL AND cancelled_at IS NULL;
 CREATE INDEX reminders_user_idx ON reminders (chat_id, user_id) WHERE sent_at IS NULL AND cancelled_at IS NULL;

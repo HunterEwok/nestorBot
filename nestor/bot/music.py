@@ -109,9 +109,27 @@ def _norm(text: Any) -> str:
     return " ".join(re.findall(r"\w+", text))
 
 
+_CYRILLIC = dict(zip("абвгдежзийклмнопрстуфхцчшщъыьэюя",
+                     ["a", "b", "v", "g", "d", "e", "zh", "z", "i", "y", "k", "l", "m", "n", "o", "p", "r", "s", "t",
+                      "u", "f", "kh", "ts", "ch", "sh", "shch", "", "y", "", "e", "yu", "ya"], strict=True))
+_LOOSE = (("kh", "h"), ("ts", "c"), ("j", "i"), ("y", "i"))
+
+
+def _latin(text: str) -> str:
+    """A loose Latin spelling, so «Группа крови» matches a video titled «Gruppa Krovi»."""
+    text = "".join(_CYRILLIC.get(ch, ch) for ch in text)
+    for a, b in _LOOSE:
+        text = text.replace(a, b)
+    return text
+
+
 def same_song(found: Any, wanted: str) -> bool:
+    """Whether a found title (YouTube video, Spotify or Apple track) names the wanted song."""
     a, b = _norm(found), _norm(wanted)
-    return bool(a and b) and (b in a or a in b)
+    if not (a and b):
+        return False
+    la, lb = _latin(a), _latin(b)
+    return b in a or a in b or lb in la or la in lb
 
 
 @dataclass(frozen=True)
@@ -241,16 +259,19 @@ async def build_card(pick: Pick, checker: Checker) -> Card:
         checker.spotify(pick.spotify_id) if pick.spotify_id else _none(),
         checker.apple(pick.artist, pick.title),
         return_exceptions=True)
-    *video_checks, spotify_ok, apple = checks
-    videos = [(vid, info) for vid, info in zip(pick.youtube_ids, video_checks, strict=True) if isinstance(info, dict)]
-    matching = [v for v in videos if same_song(v[1].get("title"), pick.title)]
-    video = (matching or videos or [(None, None)])[0][0]
+    *video_checks, spotify, apple = checks
+    # A link becomes direct only if the service confirms it is this song: a model mistake or a
+    # stale id that leads to another song falls back to a search on that service.
+    matching = [vid for vid, info in zip(pick.youtube_ids, video_checks, strict=True)
+                if isinstance(info, dict) and same_song(info.get("title"), pick.title)]
+    video = matching[0] if matching else None
+    spotify_ok = isinstance(spotify, dict) and same_song(spotify.get("title"), pick.title)
 
     links = {
         "apple": (apple, True) if isinstance(apple, str) else (search_url("apple", pick.query), False),
         "youtube_music": ((f"https://music.youtube.com/watch?v={video}", True) if video
                           else (search_url("youtube_music", pick.query), False)),
-        "spotify": ((f"https://open.spotify.com/track/{pick.spotify_id}", True) if isinstance(spotify_ok, dict)
+        "spotify": ((f"https://open.spotify.com/track/{pick.spotify_id}", True) if spotify_ok
                     else (search_url("spotify", pick.query), False)),
         "yandex": (search_url("yandex", pick.query), False),
     }
