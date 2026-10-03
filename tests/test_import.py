@@ -62,6 +62,15 @@ def test_service_event_does_not_clobber_users():
     assert row.raw["import_action"] == {"users": [333]}
 
 
+async def test_photo_change_with_binary_fields_is_stored(conn):
+    photo = t.Photo(id=7, access_hash=8, file_reference=b"\x00\x01", date=WHEN, sizes=[], dc_id=2)
+    m = t.MessageService(id=31, peer_id=t.PeerChannel(1000000001), date=WHEN,
+                         from_id=t.PeerUser(222), action=t.MessageActionChatEditPhoto(photo=photo))
+    await save(conn, to_bot_api(m, CHAT, None))
+    action = await conn.fetchval("SELECT raw->'import_action' FROM messages WHERE message_id = 31")
+    assert "file_reference" not in action["photo"] and action["photo"]["date"] == int(WHEN.timestamp())
+
+
 def test_forward_origin():
     m = msg(40, "переслано", fwd_from=t.MessageFwdHeader(date=WHEN, from_name="Скрытый"))
     row = parse_message(to_bot_api(m, CHAT, PETYA))

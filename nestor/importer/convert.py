@@ -3,6 +3,7 @@ through the same parse_message/save_message path as live updates."""
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import Any
 
 from telethon import utils
@@ -162,7 +163,7 @@ def to_bot_api(msg: t.Message | t.MessageService, chat: dict, sender: Any = None
         # Service payloads carry only ids here; keep them under import_action so that
         # parse_message records the event without overwriting known user names.
         d[key] = True
-        d["import_action"] = action.to_dict()
+        d["import_action"] = _jsonable(action.to_dict())
         d["import_action"].pop("_", None)
         if isinstance(action, t.MessageActionChatEditTitle):
             d["new_chat_title"] = action.title
@@ -199,3 +200,15 @@ def to_bot_api(msg: t.Message | t.MessageService, chat: dict, sender: Any = None
         if entities:
             d["caption_entities"] = entities
     return d
+
+
+def _jsonable(value: Any) -> Any:
+    """Telethon to_dict() output -> JSON: dates become unix time, bytes (file references,
+    hashes: useless outside the session that fetched them) are dropped."""
+    if isinstance(value, dict):
+        return {k: _jsonable(v) for k, v in value.items() if not isinstance(v, (bytes, bytearray))}
+    if isinstance(value, list):
+        return [_jsonable(v) for v in value if not isinstance(v, (bytes, bytearray))]
+    if isinstance(value, datetime):
+        return int(value.timestamp())
+    return value
