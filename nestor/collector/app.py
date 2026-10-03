@@ -13,6 +13,7 @@ from typing import Any, Awaitable, Callable, TypeVar
 
 import asyncpg
 from aiogram import Bot, Dispatcher, Router
+from aiogram.client.default import Default
 from aiogram.exceptions import TelegramAPIError, TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from aiogram.types import ChatMemberUpdated, Message
 
@@ -57,8 +58,27 @@ async def retry_forever(op: Callable[[], Awaitable[T]], *, what: str, max_delay:
 
 
 def dump(obj: Any) -> dict:
-    """aiogram object -> Bot API JSON dict."""
-    return obj.model_dump(mode="json", exclude_none=True, by_alias=True)
+    """aiogram object -> Bot API JSON dict.
+
+    Some aiogram types (LinkPreviewOptions, present whenever a text has a link and its
+    preview options were set) hold Default(...) placeholders for fields Telegram did not
+    send; they are not JSON, so they are dropped like None.
+    """
+    return _drop_none(obj.model_dump(mode="json", exclude_none=True, by_alias=True, fallback=_default_to_none))
+
+
+def _default_to_none(value: Any) -> None:
+    if isinstance(value, Default):
+        return None
+    raise TypeError(f"cannot serialize {type(value).__name__}")
+
+
+def _drop_none(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
 
 
 class Collector:
