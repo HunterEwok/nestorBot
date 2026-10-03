@@ -89,7 +89,7 @@ Bot API не отдаёт сообщения, написанные до доба
 
 ## Локальная разработка
 
-Нужны Python 3.11+ и Docker (две базы PostgreSQL 16 из `docker-compose.yml`: `db` на 5432 для запуска, `db-test` на 5433 для тестов).
+Нужны Python 3.11+ и Docker (две базы PostgreSQL 18 (как на роутере) из `docker-compose.yml`: `db` на 5432 для запуска, `db-test` на 5433 для тестов).
 
 ```sh
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
