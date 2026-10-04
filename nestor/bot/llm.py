@@ -5,8 +5,10 @@ X-Hermes-Session-Id, so nothing from one group ends up in another group's sessio
 """
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 import aiohttp
 
@@ -48,3 +50,28 @@ class HermesClient:
             raise LLMError("unexpected response shape") from None
         usage = data.get("usage") or {}
         return Completion(text.strip(), data.get("model"), usage.get("prompt_tokens"), usage.get("completion_tokens"))
+
+
+_FENCE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S)
+
+
+def extract_json(text: str | None) -> dict[str, Any] | None:
+    """The first JSON object in a model answer, bare or in a ```json fence; None if there is none.
+
+    Models sometimes add a sentence around the JSON they were asked for, so the answer is
+    scanned instead of parsed as a whole. Whatever comes back is still untrusted data:
+    callers validate every field."""
+    if not text:
+        return None
+    decoder = json.JSONDecoder()
+    fenced = _FENCE.search(text)
+    starts = [fenced.start(1)] if fenced else []
+    starts += [i for i, ch in enumerate(text) if ch == "{"]
+    for start in starts:
+        try:
+            obj, _ = decoder.raw_decode(text[start:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return None

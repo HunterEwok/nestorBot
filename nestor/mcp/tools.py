@@ -40,8 +40,14 @@ def render(rows) -> str:
         if r["author_username"]:
             who += f" (@{r['author_username']})"
         reply = f" ↩#{r['reply_to_id']}" if r["reply_to_id"] else ""
-        text = (r["text"] or f"[{r['kind']}]").replace("\n", " ⏎ ")
-        out.append(f"#{r['message_id']} {when} {who}{reply} {r['link'] or ''}\n  {text}")
+        text = (r["text"] or "").replace("\n", " ⏎ ")
+        if r["kind"] != "text":
+            name = r.get("file_name")
+            text = f"[{r['kind']}{': ' + name if name else ''}] {text}".rstrip()
+        line = f"#{r['message_id']} {when} {who}{reply} {r['link'] or ''}\n  {text}"
+        if r.get("urls"):
+            line += "\n  ссылки: " + " ".join(r["urls"][:10])
+        out.append(line)
     return "\n".join(out)
 
 
@@ -111,4 +117,44 @@ async def get_recent(conn, ticket: str, limit: int = 50) -> str:
               AND ($2::bigint IS NULL OR (thread_id = $2 AND is_topic_message))
             ORDER BY sent_at DESC LIMIT $3""",
         ids, thread, _limit(limit, 50))
+    return render(rows[::-1])
+
+
+_SELECT_SHARED = """SELECT message_id, sent_at, author_name, author_username, reply_to_id, kind, text, link,
+                           urls, file_name
+                    FROM reader.messages"""
+FILE_KINDS = ("document", "photo", "video", "audio", "voice", "video_note", "animation")
+
+
+async def find_links(conn, ticket: str, query: str | None = None, author: str | None = None, days: int = 365,
+                     limit: int = 30) -> str:
+    """Messages with links. `query` matches the link itself, the message text or its words."""
+    ids, _ = await _scope(conn, ticket)
+    rows = await conn.fetch(
+        f"""{_SELECT_SHARED} WHERE {_IN_SCOPE} AND cardinality(urls) > 0
+              AND sent_at > now() - make_interval(days => $2)
+              AND ($3::text IS NULL OR author_username ILIKE $3 OR author_name ILIKE '%' || $3 || '%')
+              AND ($4::text IS NULL OR text ILIKE '%' || $4 || '%'
+                   OR array_to_string(urls, ' ') ILIKE '%' || $4 || '%'
+                   OR tsv @@ websearch_to_tsquery('russian', $4))
+            ORDER BY sent_at DESC LIMIT $5""",
+        ids, int(days), (author or "").lstrip("@") or None, (query or "").strip() or None, _limit(limit, 30))
+    return render(rows[::-1])
+
+
+async def find_files(conn, ticket: str, query: str | None = None, kind: str | None = None,
+                     author: str | None = None, days: int = 365, limit: int = 30) -> str:
+    """Documents, photos, videos, audio, voice and video messages. `query` matches the file
+    name or the caption."""
+    ids, _ = await _scope(conn, ticket)
+    kinds = [kind] if kind in FILE_KINDS else list(FILE_KINDS)
+    rows = await conn.fetch(
+        f"""{_SELECT_SHARED} WHERE {_IN_SCOPE} AND kind = ANY($2::text[])
+              AND sent_at > now() - make_interval(days => $3)
+              AND ($4::text IS NULL OR author_username ILIKE $4 OR author_name ILIKE '%' || $4 || '%')
+              AND ($5::text IS NULL OR file_name ILIKE '%' || $5 || '%' OR text ILIKE '%' || $5 || '%'
+                   OR tsv @@ websearch_to_tsquery('russian', $5))
+            ORDER BY sent_at DESC LIMIT $6""",
+        ids, kinds, int(days), (author or "").lstrip("@") or None, (query or "").strip() or None,
+        _limit(limit, 30))
     return render(rows[::-1])

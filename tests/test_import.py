@@ -53,6 +53,26 @@ def test_voice_with_caption_and_photo():
     assert (photo.kind, photo.text) == ("photo", None)
 
 
+def document(*attributes, mime="application/octet-stream"):
+    return t.MessageMediaDocument(document=t.Document(
+        id=1, access_hash=2, file_reference=b"\x00", date=WHEN, mime_type=mime, size=10, dc_id=2,
+        attributes=list(attributes)))
+
+
+def test_file_name_and_song_tags_are_kept():
+    pdf = parse_message(to_bot_api(msg(22, "", media=document(t.DocumentAttributeFilename("отчёт.pdf"))),
+                                   CHAT, PETYA))
+    assert (pdf.kind, pdf.raw["document"]) == ("document", {"file_name": "отчёт.pdf"})
+    song = document(t.DocumentAttributeAudio(duration=200, performer="Кино", title="Группа крови"),
+                    t.DocumentAttributeFilename("kino.mp3"), mime="audio/mpeg")
+    row = parse_message(to_bot_api(msg(23, "", media=song), CHAT, PETYA))
+    assert (row.kind, row.raw["audio"]) == ("audio", {"performer": "Кино", "title": "Группа крови",
+                                                      "file_name": "kino.mp3"})
+    voice = document(t.DocumentAttributeAudio(duration=3, voice=True), t.DocumentAttributeFilename("v.ogg"))
+    voice.voice = True
+    assert parse_message(to_bot_api(msg(24, "", media=voice), CHAT, PETYA)).raw["voice"] == {}
+
+
 def test_service_event_does_not_clobber_users():
     m = t.MessageService(id=30, peer_id=t.PeerChannel(1000000001), date=WHEN,
                          from_id=t.PeerUser(222), action=t.MessageActionChatAddUser(users=[333]))

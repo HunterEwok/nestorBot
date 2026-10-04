@@ -8,6 +8,8 @@ from zoneinfo import ZoneInfo
 
 import asyncpg
 
+from . import reminders
+
 _COLUMNS = """m.chat_id, m.message_id, m.thread_id, m.is_topic_message, m.user_id, m.sent_at,
               m.reply_to_id, m.kind, m.text, m.edited_at,
               u.first_name, u.last_name, u.username, u.is_bot"""
@@ -84,15 +86,99 @@ async def user_messages(conn, chat_ids: list[int], thread_id: int | None, user_i
 
 
 async def period_messages(conn, chat_ids: list[int], thread_id: int | None, since: datetime,
-                          limit: int = 400) -> list[asyncpg.Record]:
+                          limit: int = 400, *, until: datetime | None = None,
+                          humans_only: bool = False) -> list[asyncpg.Record]:
+    """The latest `limit` messages of [since, until), oldest first. humans_only: without bots."""
     rows = await conn.fetch(
         f"""SELECT {_COLUMNS} {_FROM}
             WHERE m.chat_id = ANY($1::bigint[]) AND {_VISIBLE} AND m.sent_at >= $3
+              AND ($5::timestamptz IS NULL OR m.sent_at < $5)
+              AND (NOT $6::bool OR u.user_id IS NULL OR NOT u.is_bot)
               AND ($2::bigint IS NULL OR (m.thread_id = $2 AND m.is_topic_message))
             ORDER BY m.sent_at DESC LIMIT $4""",
-        chat_ids, thread_id, since, limit,
+        chat_ids, thread_id, since, limit, until, humans_only,
     )
     return rows[::-1]
+
+
+async def last_message_at(conn, chat_ids: list[int], thread_id: int | None, user_id: int, *,
+                          before: datetime, exclude_id: int) -> datetime | None:
+    """When the user last wrote here before the current message (for «что я пропустил»)."""
+    return await conn.fetchval(
+        """SELECT max(sent_at) FROM messages
+           WHERE chat_id = ANY($1::bigint[]) AND user_id = $3 AND sent_at <= $4 AND message_id <> $5
+             AND ($2::bigint IS NULL OR (thread_id = $2 AND is_topic_message))""",
+        chat_ids, thread_id, user_id, before, exclude_id)
+
+
+async def count_since(conn, chat_ids: list[int], thread_id: int | None, since: datetime, *,
+                      except_user: int) -> int:
+    """Visible messages by others (bots excluded) since the moment."""
+    return await conn.fetchval(
+        f"""SELECT count(*) {_FROM}
+            WHERE m.chat_id = ANY($1::bigint[]) AND {_VISIBLE} AND m.sent_at > $3
+              AND m.user_id IS DISTINCT FROM $4 AND (u.user_id IS NULL OR NOT u.is_bot)
+              AND ($2::bigint IS NULL OR (m.thread_id = $2 AND m.is_topic_message))""",
+        chat_ids, thread_id, since, except_user)
+
+
+async def addressed_to(conn, chat_ids: list[int], thread_id: int | None, user_id: int, username: str | None,
+                       since: datetime, limit: int = 50) -> list[asyncpg.Record]:
+    """Replies to the user's messages and @mentions of the user since the moment."""
+    rows = await conn.fetch(
+        f"""SELECT {_COLUMNS} {_FROM}
+            WHERE m.chat_id = ANY($1::bigint[]) AND {_VISIBLE} AND m.sent_at > $3
+              AND m.user_id IS DISTINCT FROM $4 AND (u.user_id IS NULL OR NOT u.is_bot)
+              AND ($2::bigint IS NULL OR (m.thread_id = $2 AND m.is_topic_message))
+              AND (EXISTS (SELECT 1 FROM messages p
+                           WHERE p.chat_id = m.chat_id AND p.message_id = m.reply_to_id AND p.user_id = $4)
+                   OR ($5::text IS NOT NULL AND m.text ILIKE '%@' || $5 || '%'))
+            ORDER BY m.sent_at DESC LIMIT $6""",
+        chat_ids, thread_id, since, user_id, username, limit,
+    )
+    return rows[::-1]
+
+
+async def top_branches(conn, chat_ids: list[int], thread_id: int | None, since: datetime,
+                       limit: int = 5, min_size: int = 3) -> list[asyncpg.Record]:
+    """The largest reply trees among messages since the moment: chat_id, root, size and the
+    ids of the period's messages in the tree. Bots and people who opted out are not counted."""
+    return list(await conn.fetch(
+        """WITH RECURSIVE period AS (
+               SELECT m.chat_id, m.message_id, m.reply_to_id
+               FROM messages m LEFT JOIN users u ON u.user_id = m.user_id
+               WHERE m.chat_id = ANY($1::bigint[]) AND m.sent_at >= $3 AND m.kind <> 'service'
+                 AND (u.user_id IS NULL OR NOT (u.opted_out OR u.is_bot))
+                 AND ($2::bigint IS NULL OR (m.thread_id = $2 AND m.is_topic_message))),
+           up(chat_id, leaf, node, parent, depth) AS (
+               SELECT chat_id, message_id, message_id, reply_to_id, 0 FROM period
+             UNION ALL
+               SELECT up.chat_id, up.leaf, m.message_id, m.reply_to_id, up.depth + 1
+               FROM up JOIN messages m ON m.chat_id = up.chat_id AND m.message_id = up.parent
+               WHERE up.depth < 200),
+           roots AS (
+               SELECT DISTINCT ON (chat_id, leaf) chat_id, leaf, node AS root
+               FROM up ORDER BY chat_id, leaf, depth DESC)
+           SELECT chat_id, root, count(*) AS size, array_agg(leaf ORDER BY leaf) AS members
+           FROM roots GROUP BY chat_id, root HAVING count(*) >= $4
+           ORDER BY size DESC, root DESC LIMIT $5""",
+        chat_ids, thread_id, since, min_size, limit))
+
+
+async def messages_by_id(conn, chat_id: int, message_ids: list[int]) -> list[asyncpg.Record]:
+    return list(await conn.fetch(
+        f"""SELECT {_COLUMNS} {_FROM}
+            WHERE m.chat_id = $1 AND m.message_id = ANY($2::bigint[]) AND {_VISIBLE}
+            ORDER BY m.sent_at, m.message_id""", chat_id, message_ids))
+
+
+def plural(n: int, forms: tuple[str, str, str]) -> str:
+    """plural(5, ("сообщение", "сообщения", "сообщений")) -> "сообщений"."""
+    if n % 10 == 1 and n % 100 != 11:
+        return forms[0]
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return forms[1]
+    return forms[2]
 
 
 async def mentioned_users(conn, msg: dict, bot_username: str) -> list[asyncpg.Record]:
@@ -148,11 +234,31 @@ _SCENARIOS = (
 _WEB = re.compile(r"погод|прогноз|температур|курс\w*\s+(валют|доллар|евро|рубл|юан|биткоин|бакс)|новост|"
                   r"в\s+интернет|загугл|погугл|в\s+сети|правда\s+ли|сколько\s+стоит", re.I)
 _CHAT = re.compile(r"чат|групп|переписк|говорил|писал|обсужда|сказал|здесь|тут\b|@\w", re.I)
+_CATCHUP = re.compile(r"что\s+(?:я\s+)?пропустил|пока\s+меня\s+не\s+было|что\s+(?:тут|здесь)\s+было|catch\s*up", re.I)
+# Only together with a reply to someone's message: that message is what gets checked.
+_FACTCHECK = re.compile(r"провер|правда|верно|так\s+ли|факт|фейк|миф|вр[её]т|соврал|брехн|чушь|пруф|источник|"
+                        r"подтверд|опроверг", re.I)
+_BARE_FACTCHECK = re.compile(r"(?:проверь|проверка|это\s+правда|правда)\W*", re.I)
+_LINKS = re.compile(r"ссылк|линк|(?<!\w)url|видос|видео|ролик|файл|документ|(?<!\w)pdf|пдф|картинк|фотк|фото|"
+                    r"голосов|скидывал|кидал|присылал|постил", re.I)
+_MUSIC = re.compile(r"^\s*(?:включи|вруби|поставь|сыграй|запусти|play)(?!\w)"
+                    r"|^\s*(?:найди|скинь|пришли|дай)\s+(?:мне\s+|нам\s+)?(?:песн|трек|музык|клип|композици)", re.I)
 
 
-def classify(question: str) -> str:
+def classify(question: str, *, reply_target: bool = False) -> str:
+    """Scenario of a request. reply_target: it replies to someone's message (not the bot's)."""
+    if reminders.is_request(question):
+        return "reminder"
+    if _MUSIC.search(question):
+        return "music"
+    if _CATCHUP.search(question):
+        return "catchup"
+    if (reply_target and _FACTCHECK.search(question)) or _BARE_FACTCHECK.fullmatch(question.strip()):
+        return "factcheck"
     if _WEB.search(question) and not _CHAT.search(question):
         return "web"
+    if _LINKS.search(question):
+        return "links"
     for name, pattern in _SCENARIOS:
         if pattern.search(question):
             return name

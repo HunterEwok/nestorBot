@@ -130,6 +130,26 @@ def _media_kind(media: Any) -> str | None:
     }.get(type(media), "document")
 
 
+# Kinds whose Bot API object carries file_name (and, for audio, the song tags).
+_NAMED_KINDS = ("document", "audio", "video", "animation")
+
+
+def _media_meta(media: Any) -> dict:
+    """File name and song tags, under the same keys as in Bot API objects, so imported
+    files can be found by name like live ones (reader.messages.file_name)."""
+    document = getattr(media, "document", None)
+    meta: dict[str, Any] = {}
+    for a in getattr(document, "attributes", None) or []:
+        if isinstance(a, t.DocumentAttributeFilename) and a.file_name:
+            meta["file_name"] = a.file_name
+        elif isinstance(a, t.DocumentAttributeAudio) and not a.voice:
+            if a.performer:
+                meta["performer"] = a.performer
+            if a.title:
+                meta["title"] = a.title
+    return meta
+
+
 def to_bot_api(msg: t.Message | t.MessageService, chat: dict, sender: Any = None) -> dict:
     """Build a Bot API Message dict. `sender` is the resolved User/Channel (msg.sender)."""
     d: dict[str, Any] = {
@@ -194,7 +214,7 @@ def to_bot_api(msg: t.Message | t.MessageService, chat: dict, sender: Any = None
         if entities:
             d["entities"] = entities
     else:
-        d[kind] = {}
+        d[kind] = _media_meta(msg.media) if kind in _NAMED_KINDS else {}
         if text:
             d["caption"] = text
         if entities:

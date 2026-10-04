@@ -1,0 +1,40 @@
+# Hermes profile `smart` for songs and the wisdom of the day: ~/.hermes/profiles/smart/config.yaml
+# (hermes profile create smart, then copy this file and smart/SOUL.md into it).
+#
+# Same principle as `web`: this profile can search the web, so it must never see the
+# archive. It has no MCP servers; nestor-collector sends it only a song request in the
+# asker's own words (or the one replied message for «включи»), or, once a day, themes from
+# a fixed list of words. Without this profile the collector falls back to `web`.
+# Verify after every Hermes update (deploy/hermes/README.md, "Проверка").
+
+model:
+  provider: anthropic            # ANTHROPIC_API_KEY in ~/.hermes/profiles/smart/.env (may be the same key)
+  default: claude-opus-5-5       # the smartest; claude-sonnet-5-5 costs half and is usually enough
+
+platform_toolsets:
+  api_server: [web]              # web_search + web_extract only
+
+web:
+  keyless_fallback: true
+security:
+  allow_private_urls: false
+
+agent:
+  disabled_toolsets:             # second line of defence; names per the Toolsets Reference of your Hermes version
+    - terminal
+    - file
+    - browser
+    - code_execution
+    - delegation
+    - memory
+    - skills
+    - cronjob
+    - messaging
+
+gateway:
+  api_server:
+    enabled: true
+    # key: set API_SERVER_KEY in ~/.hermes/profiles/smart/.env; the same value goes to
+    # HERMES_SMART_API_KEY in /opt/nestor/.env
+
+# No mcp_servers: the archive is out of reach by construction.

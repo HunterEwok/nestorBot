@@ -40,6 +40,6 @@ mcp_servers:
     env:
       READER_DATABASE_URL: "postgresql://hermes_reader:CHANGE_ME@DB_HOST/nestor"
     tools:
-      include: [search_messages, get_thread, get_user_messages, get_recent]
+      include: [search_messages, get_thread, get_user_messages, get_recent, find_links, find_files]
       prompts: false
       resources: false
