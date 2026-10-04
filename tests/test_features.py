@@ -10,13 +10,14 @@ from aiogram.enums import ChatMemberStatus
 from aiogram.exceptions import TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter
 from aiogram.methods import SendMessage
 
+from nestor import forget
 from nestor.bot import markup, prompts
 from nestor.bot.context import classify
 from nestor.bot.scheduler import Scheduler
 from nestor.mcp import tools
 
 from .factories import CHAT_ID, message, update
-from .test_answerer import BOT_ID, FakeChecker, FakeLLM, make_env_fixture  # noqa: F401 - fixture make_env
+from .test_answerer import BOT_ID, FakeChecker, FakeLLM, insert_started, make_env_fixture  # noqa: F401 - make_env
 
 TZ = ZoneInfo("Europe/Moscow")     # the answerer's default zone: local times here are its times
 SPOTIFY = "4" * 22
@@ -621,6 +622,40 @@ async def test_the_digest_leaves_with_the_oldest_of_yesterdays_messages(make_env
     await feed.answerer.drain()
     assert bot.sent[-1]["text"].startswith("☀️ <b>Дайджест за вчера, ")
     assert await conn.fetchval("SELECT oldest_source_at FROM bot_requests WHERE scenario = 'digest'") == oldest
+
+
+async def test_stats_leaves_with_the_oldest_message_of_the_branches_it_showed_the_model(make_env, conn):
+    bot, _, feed = make_env(FakeLLM("1. Налоги и бюджет"))
+    root = message(1, "Налоги надо снизить", uid=222, date=ago(hours=5))
+    await feed(update("message", root))
+    second = message(2, "Нет, повысить", uid=333, date=ago(hours=4), reply_to_message=root)
+    await feed(update("message", second))
+    await feed(update("message", message(3, "Почему?", uid=222, date=ago(hours=3), reply_to_message=second)))
+    oldest = await _aged(conn, 3, 5)            # it entered the archive 5 days ago; the others just now
+    await feed(update("message", message(4, "/stats", date=ago())))
+    assert "Налоги и бюджет" in bot.sent[-1]["text"]
+    assert await conn.fetchval("SELECT oldest_source_at FROM bot_requests WHERE scenario = 'stats'") == oldest
+
+
+async def test_the_digest_that_may_erase_waits_for_a_purge_batch_in_flight(make_env, pool, conn):
+    bot, _, feed = make_env(FakeLLM("• отпуск: [«обсуждаем отпуск 10»](#10)"))
+    yesterday = int(local(-1, 12).timestamp())
+    for i in range(10, 16):
+        await feed(update("message", message(i, f"обсуждаем отпуск {i}", uid=200 + i, date=yesterday + i)))
+    await conn.execute("UPDATE chats SET settings = settings || jsonb_build_object('digest', true) WHERE chat_id = $1",
+                       CHAT_ID)
+    async with pool.acquire() as batch:
+        purging = batch.transaction()
+        await purging.start()
+        await forget.erase_lock(batch)                  # a batch in flight
+        await feed.answerer.run_daily_posts(local(0, 9, 30))
+        posting = asyncio.create_task(feed.answerer.drain())
+        await asyncio.sleep(0.5)
+        assert bot.sent[-1]["text"].startswith("☀️ <b>Дайджест за вчера, ")      # posted, not yet logged
+        assert not posting.done() and not await insert_started(conn, "bot_requests")
+        await purging.commit()
+    await posting
+    assert await conn.fetchval("SELECT quoted_user_ids FROM bot_requests WHERE scenario = 'digest'") == [210]
 
 
 async def test_a_verdict_and_a_song_leave_with_the_replied_message(make_env, conn):

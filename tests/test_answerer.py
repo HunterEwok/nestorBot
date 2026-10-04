@@ -634,6 +634,47 @@ async def test_a_reference_to_the_bots_own_answer_carries_what_that_answer_did(m
     assert await conn.fetchval("SELECT oldest_source_at FROM bot_requests ORDER BY id DESC LIMIT 1") == earlier
 
 
+async def test_an_id_two_chats_share_makes_the_answer_leave_with_the_older_message(make_env, conn):
+    old = -4242
+    _, llm, feed = make_env(FakeLLM("Про это писали: [«едем в Грецию»](#157)"))
+    await feed(update("message", message(157, "едем в Грецию", uid=111)))
+    await feed.answerer.save_outgoing(message(157, "едем в Грецию", chat_id=old, uid=222)
+                                      | {"chat": {"id": old, "type": "group", "title": "Old"}})
+    await conn.execute("UPDATE chats SET migrated_from_chat_id = $1 WHERE chat_id = $2", old, CHAT_ID)
+    older = await conn.fetchval("UPDATE messages SET stored_at = now() - interval '300 days' "
+                                "WHERE chat_id = $1 RETURNING stored_at", old)
+    # Asked in a topic, so the prompt holds neither copy: only the model's #157 may carry their words.
+    await feed(update("message", message(200, "нестор, что там было?", message_thread_id=9, is_topic_message=True)))
+    assert "едем в Грецию" not in llm.calls[0][-1]["content"]
+    # Which of the two it meant is not known: both authors are recorded, and the answer leaves with the older.
+    assert await conn.fetchval("SELECT quoted_user_ids FROM bot_requests") == [111, 222]
+    assert await conn.fetchval("SELECT oldest_source_at FROM bot_requests") == older
+
+
+async def insert_started(conn, table: str) -> bool:
+    """Whether a transaction is inserting into the table: its rows are invisible until it commits, its lock is not."""
+    return await conn.fetchval(
+        """SELECT count(*) > 0 FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+           WHERE c.relname = $1 AND l.mode = 'RowExclusiveLock'
+             AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())""", table)
+
+
+async def test_an_answer_that_may_erase_waits_for_a_purge_batch_in_flight(make_env, pool, conn):
+    _, _, feed = make_env(FakeLLM("Петя берёт: [«палатку»](#1)"))
+    await feed(update("message", message(1, "беру палатку", uid=222)))
+    async with pool.acquire() as batch:
+        purging = batch.transaction()
+        await purging.start()
+        await forget.erase_lock(batch)                  # a batch in flight
+        asking = asyncio.create_task(feed(update("message", message(2, "нестор, кто что берёт?", uid=111))))
+        await asyncio.sleep(0.5)
+        # The lock comes before the insert's row locks, not after them.
+        assert not asking.done() and not await insert_started(conn, "bot_requests")
+        await purging.commit()
+    await asking
+    assert await conn.fetchval("SELECT quoted_user_ids FROM bot_requests") == [222]
+
+
 async def test_a_reply_to_a_scrubbed_answer_continues_with_answer_removed(make_env, pool, conn):
     bot, llm, feed = make_env()
     await feed(update("message", message(1, "нестор, кто прав?")))

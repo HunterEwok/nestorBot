@@ -1,11 +1,16 @@
 """The backfill of migrations 0006 and 0007: answers written before quoted_user_ids existed get
 the authors they quoted, the way the bot tags them now, and what cannot be attributed any more
 leaves the archive the way /forget_me takes it. And of 0008: when older answers leave by the
-retention clock, and the copies of words the archive should not hold."""
+retention clock, and the copies of words the archive should not hold. And the runner's lock wait."""
+import logging
 from pathlib import Path
+
+import asyncpg
+import pytest
 
 from nestor.collector import store
 from nestor.collector.parse import parse_chat, parse_message, reduce_raw
+from nestor.migrate import migrate
 
 from .factories import CHAT_ID, message
 from .test_answerer import BOT_ID
@@ -352,3 +357,26 @@ async def test_0008_scrubs_what_was_stored_the_way_a_new_message_is_stored(conn)
     assert backfilled[1]["text"] is None and backfilled[2]["text"] == "из канала" and backfilled[3]["text"] == "мысль Пети"
     assert "quote" not in backfilled[4]["raw"] and "quote" not in backfilled[5]["raw"]
     assert backfilled[6]["raw"]["quote"]["text"] == "мой текст"
+
+
+async def test_a_migration_gives_up_waiting_for_a_locked_table_and_says_so(database, tmp_path, caplog):
+    (tmp_path / "9001_timeout.sql").write_text(
+        "DO $$ BEGIN IF current_setting('lock_timeout') <> '30s' THEN "
+        "RAISE EXCEPTION 'lock_timeout is %', current_setting('lock_timeout'); END IF; END $$;")
+    owner, other = await asyncpg.connect(database["collector"]), await asyncpg.connect(database["collector"])
+    try:
+        assert await migrate(owner, tmp_path) == ["9001_timeout"]       # the runner sets 30 s for every migration
+        (tmp_path / "9002_locked.sql").write_text("SET LOCAL lock_timeout = '200ms'; LOCK TABLE chats;")
+        holding = other.transaction()
+        await holding.start()
+        await other.execute("LOCK TABLE chats IN ACCESS SHARE MODE")        # a long dump
+        with caplog.at_level(logging.WARNING, logger="nestor.migrate"), pytest.raises(asyncpg.LockNotAvailableError):
+            await migrate(owner, tmp_path)
+        await holding.rollback()
+        warned = [(r.getMessage(), r.version) for r in caplog.records if r.name == "nestor.migrate"]
+        assert warned == [("migration waiting for lock", "9002_locked")]
+        assert await owner.fetchval("SELECT count(*) FROM schema_migrations WHERE version = '9002_locked'") == 0
+    finally:
+        await owner.execute("DELETE FROM schema_migrations WHERE version LIKE '900%'")
+        await owner.close()
+        await other.close()

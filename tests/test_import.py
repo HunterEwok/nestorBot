@@ -168,6 +168,25 @@ async def test_import_after_a_purge_of_live_rows_loads_the_history_before_them_n
     assert await import_history(_History(170), pool, None, CHAT) == 0       # and a second run finds nothing new
 
 
+async def test_import_after_a_purge_by_archive_time_leaves_out_the_whole_span_of_ids(pool, conn):
+    await conn.execute("INSERT INTO chats (chat_id, type) VALUES ($1, 'supergroup')", CHAT["id"])
+    await conn.execute("INSERT INTO users (user_id, first_name) VALUES (222, 'Петя')")
+    # Live #9 entered the archive a month before history up to #3 was imported: the purge goes by that
+    # time, so #9 leaves first and #3 after it, one batch each. The mark must keep #9.
+    await conn.execute(
+        """INSERT INTO messages (chat_id, message_id, user_id, sent_at, text, raw, stored_at)
+           VALUES ($1, 9, 222, now(), 'x', '{}', now() - interval '14 months'),
+                  ($1, 3, 222, now(), 'x', '{}', now() - interval '13 months')""", CHAT["id"])
+    _, cutoff = await retention.db_times(conn)
+    assert (await retention.purge(pool, cutoff, batch=1, pause_s=0))["messages"] == 2
+    assert await import_ranges(conn, CHAT["id"]) == [(0, 3), (9, None)]
+    client = _History(12)
+    assert await import_history(client, pool, None, CHAT) == 2 + 3
+    assert client.asked == [0, 9]
+    ids = {r["message_id"] for r in await conn.fetch("SELECT message_id FROM messages")}
+    assert ids == {1, 2, 10, 11, 12}
+
+
 async def test_imported_forward_of_an_opted_out_author_is_stored_without_text(conn):
     async with conn.transaction():
         await forget.forget(conn, 222, 42)

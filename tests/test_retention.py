@@ -91,6 +91,18 @@ async def test_messages_leave_by_the_time_they_entered_the_archive_with_edits_an
     assert await _purge(pool, conn) == {}            # nothing left to do
 
 
+async def test_the_mark_keeps_the_newest_id_whatever_order_the_purge_goes_in(pool, conn):
+    """The purge goes by stored_at, Telegram's ids by sent time: imported history has the lower ids and
+    the later stored_at. The span must not shrink when a lower id leaves after a higher one, or the
+    importer would load the messages between again, with a fresh stored_at."""
+    await _setup(conn)
+    await _msg(conn, 9, 111, "живое, давно в архиве", stored="14 months")
+    await _msg(conn, 3, 222, "история, загружена позже", stored="13 months", imported=True)
+    assert (await _purge(pool, conn, batch=1))["messages"] == 2        # 9 leaves first, then 3
+    span = await conn.fetchrow("SELECT first_message_id, message_id FROM retention_marks WHERE chat_id = $1", CHAT_ID)
+    assert tuple(span) == (3, 9)                     # the importer skips 3..9, not only 3..3
+
+
 async def test_answers_built_on_purged_messages_go_the_way_forget_me_takes_them(pool, conn):
     await _setup(conn)
     await _msg(conn, 1, 111, "старое", stored="13 months")
@@ -204,22 +216,23 @@ async def test_a_cliff_is_blocked_until_confirmed(pool, conn):
     await _setup(conn)
     await _many(conn, 1, 6000, stored="13 months")
     await _many(conn, 6001, 9000, stored="1 day")
+    await _many(conn, 9001, 9500, stored="12 months -3 days")      # leave in 3 days: confirm counts them too
     pi_now = await _now(conn)
     ret = retention.Retention(pool, tz=MSK, at=dtime(0), pause_s=0)
     assert await ret.run_once(pi_now) == "blocked"
     row = await _run(conn)
-    assert (row["status"], row["counts"], row["error"]) == ("blocked", {"would_delete": 6000, "total": 9000}, "too_many")
-    assert await conn.fetchval("SELECT count(*) FROM messages") == 9000
+    assert (row["status"], row["counts"], row["error"]) == ("blocked", {"would_delete": 6000, "total": 9500}, "too_many")
+    assert await conn.fetchval("SELECT count(*) FROM messages") == 9500
     assert await ret.run_once(pi_now) is None                   # asked again only after 10 minutes
 
-    assert await retention.confirm(conn, pi_now.astimezone(MSK).date()) == 6000
+    assert await retention.confirm(conn, pi_now.astimezone(MSK).date()) == 6500
     await conn.execute("UPDATE maintenance_runs SET updated_at = now() - interval '11 minutes' WHERE job = $1",
                        retention.JOB)
     assert await ret.run_once(pi_now) == "ok"
     row = await _run(conn)
     assert (row["status"], row["error"], row["counts"]["messages"]) == ("ok", None, 6000)
     assert "would_delete" not in row["counts"]
-    assert await conn.fetchval("SELECT count(*) FROM messages") == 3000
+    assert await conn.fetchval("SELECT count(*) FROM messages") == 3500
 
 
 async def test_confirm_does_not_cover_more_than_it_saw(pool, conn):
@@ -238,11 +251,22 @@ async def test_confirm_does_not_cover_more_than_it_saw(pool, conn):
     assert await conn.fetchval("SELECT count(*) FROM messages") == 10000
 
 
-class _SlowOnce:
-    """The pool, but the first batch statement times out, like a slow router on the night of the cliff."""
+async def test_a_busy_month_that_is_a_small_share_of_the_archive_runs_without_confirm(pool, conn):
+    await _setup(conn)
+    await _many(conn, 1, 6000, stored="13 months")          # more than 5000, but 10 % of 60 000
+    await _many(conn, 6001, 60000, stored="1 day")
+    ret = retention.Retention(pool, tz=MSK, at=dtime(0), pause_s=0)
+    assert await ret.run_once(await _now(conn)) == "ok"
+    row = await _run(conn)
+    assert (row["status"], row["error"], row["counts"]["messages"]) == ("ok", None, 6000)
+    assert await conn.fetchval("SELECT count(*) FROM messages") == 54000
 
-    def __init__(self, pool):
-        self.pool, self.sizes, self.left = pool, [], 1
+
+class _SlowPool:
+    """The pool, but the first `times` batch statements time out, like a slow router on the night of the cliff."""
+
+    def __init__(self, pool, times=1):
+        self.pool, self.sizes, self.left = pool, [], times
 
     @contextlib.asynccontextmanager
     async def acquire(self):
@@ -260,6 +284,7 @@ class _SlowConn:
     async def fetchrow(self, sql, *args, **kw):
         if "LIMIT $2" in sql:                   # a batch: $2 is its size
             self._owner.sizes.append(args[1])
+            assert len(self._owner.sizes) < 50, "the purge never gives up"      # ends a runaway loop
             await asyncio.sleep(0.005)
             if self._owner.left:
                 self._owner.left -= 1
@@ -270,7 +295,7 @@ class _SlowConn:
 async def test_slow_batch_halves_and_continues(pool, conn, caplog):
     await _setup(conn)
     await _many(conn, 1, 600, stored="13 months")
-    slow = _SlowOnce(pool)
+    slow = _SlowPool(pool)
     ret = retention.Retention(slow, tz=MSK, at=dtime(0), pause_s=0)
     with caplog.at_level(logging.WARNING, logger="nestor.retention"):
         assert await ret.run_once(await _now(conn)) == "ok"
@@ -280,6 +305,59 @@ async def test_slow_batch_halves_and_continues(pool, conn, caplog):
     row = await _run(conn)
     assert row["counts"]["messages"] == 600 and row["counts"]["max_batch_ms"] >= 5
     assert await conn.fetchval("SELECT count(*) FROM messages") == 0
+
+
+async def test_a_batch_that_stays_slow_postpones_the_run_to_a_later_tick(pool, conn, caplog):
+    await _setup(conn)
+    await _many(conn, 1, 10, stored="13 months")
+    pi_now = await _now(conn)
+    slow = _SlowPool(pool, times=10**6)
+    ret = retention.Retention(slow, tz=MSK, at=dtime(0), pause_s=0, clock=lambda: pi_now)
+    with caplog.at_level(logging.WARNING, logger="nestor.retention"):
+        assert await ret.tick() is None
+    # It halves down to MIN_BATCH, tries that five times, and gives the connection back.
+    assert slow.sizes == [500, 250, 125, 62] + [retention.MIN_BATCH] * 5
+    row = await _run(conn)
+    assert (row["status"], row["error"]) == ("failed", "TimeoutError")
+    logged = [r.getMessage() for r in caplog.records if r.name == "nestor.retention"]
+    assert "retention postponed" in logged and "retention failed" not in logged
+    assert await conn.fetchval("SELECT count(*) FROM messages") == 10
+    slow.left = 0                                       # the router is itself again
+    await conn.execute("UPDATE maintenance_runs SET updated_at = now() - interval '11 minutes'")
+    assert await ret.tick() == "ok"
+    assert (await _run(conn))["attempts"] == 2 and await conn.fetchval("SELECT count(*) FROM messages") == 0
+
+
+async def test_rows_another_transaction_holds_make_the_run_fail_and_are_taken_next_time(pool, conn):
+    await _setup(conn)
+    await _msg(conn, 1, 111, "занято", stored="13 months")
+    await _msg(conn, 2, 111, "свободно", stored="13 months")
+    pi_now = await _now(conn)
+    ret = retention.Retention(pool, tz=MSK, at=dtime(0), pause_s=0)
+    async with pool.acquire() as other:
+        holding = other.transaction()
+        await holding.start()
+        await other.execute("SELECT 1 FROM messages WHERE message_id = 1 FOR UPDATE")      # SKIP LOCKED passes it by
+        assert await ret.run_once(pi_now) == "failed"
+        await holding.rollback()
+    row = await _run(conn)
+    assert (row["status"], row["error"], row["counts"]["messages"]) == ("failed", "rows_left", 1)
+    assert await conn.fetchval("SELECT message_id FROM messages") == 1
+    await conn.execute("UPDATE maintenance_runs SET updated_at = now() - interval '11 minutes'")
+    assert await ret.run_once(pi_now) == "ok"
+    row = await _run(conn)
+    assert (row["status"], row["attempts"], row["error"], row["counts"]["messages"]) == ("ok", 2, None, 2)
+    assert await conn.fetchval("SELECT count(*) FROM messages") == 0
+
+
+async def test_a_run_that_failed_six_times_is_not_claimed_again_that_day(conn):
+    day = (await _now(conn)).astimezone(MSK).date()
+    _, cutoff = await retention.db_times(conn)
+    await conn.execute("""INSERT INTO maintenance_runs (job, day, status, attempts, updated_at)
+                          VALUES ($1, $2, 'failed', 6, now() - interval '1 hour')""", retention.JOB, day)
+    assert await retention.claim(conn, day, cutoff) is None
+    await conn.execute("UPDATE maintenance_runs SET attempts = 5")
+    assert await retention.claim(conn, day, cutoff) is not None
 
 
 async def test_purge_waits_for_forget_me(pool, conn):
@@ -297,6 +375,54 @@ async def test_purge_waits_for_forget_me(pool, conn):
         await forgetting.commit()
     assert _plain(await purging)["messages"] == 1
     assert await conn.fetchval("SELECT count(*) FROM messages") == 0
+
+
+async def test_purge_waits_for_a_forget_me_that_has_started(pool, conn):
+    await _setup(conn)
+    await _msg(conn, 1, 222, "старое слово Пети", stored="13 months")
+    await _msg(conn, 2, 111, "ответ", stored="1 day", reply_to=1, quote="старое")
+    _, cutoff = await retention.db_times(conn)
+    async with pool.acquire() as other:
+        forgetting = other.transaction()
+        await forgetting.start()
+        await forget.forget(other, 222, BOT_ID)         # it holds its rows now: the reply (quote) and the old message
+        purging = asyncio.create_task(retention.purge(pool, cutoff, pause_s=0))
+        await asyncio.sleep(0.3)
+        assert not purging.done()
+        await forgetting.commit()
+    assert _plain(await purging).get("messages", 0) == 0     # the /forget_me took it
+    assert [(r["message_id"], "quote" in r["raw"]) for r in await conn.fetch("SELECT message_id, raw FROM messages")] \
+        == [(2, False)]
+
+
+async def _waits_for_a_batch(pool, erasing) -> bool:
+    """Whether `erasing(conn)`, run in its own transaction, waits while a purge batch holds ERASE_LOCK
+    and then finishes."""
+    async def erase():
+        async with pool.acquire() as c, c.transaction():
+            await erasing(c)
+
+    async with pool.acquire() as batch:
+        purging = batch.transaction()
+        await purging.start()
+        await forget.erase_lock(batch)                  # a batch in flight
+        task = asyncio.create_task(erase())
+        await asyncio.sleep(0.3)
+        waiting = not task.done()
+        await purging.commit()
+    await task
+    return waiting
+
+
+async def test_forget_me_and_the_scrub_of_a_logged_answer_wait_for_a_batch_in_flight(pool, conn):
+    await _setup(conn)
+    await _msg(conn, 1, 222, "слово Пети", stored="1 day")
+    rid = await conn.fetchval("""INSERT INTO bot_requests (chat_id, user_id, scenario, answer, status, quoted_user_ids)
+                                 VALUES ($1, 111, 'other', 'Петя: «слово»', 'ok', '{222}') RETURNING id""", CHAT_ID)
+    assert await _waits_for_a_batch(pool, lambda c: forget.forget(c, 222, BOT_ID))
+    await conn.execute("UPDATE bot_requests SET answer = 'Петя: «слово»' WHERE id = $1", rid)
+    assert await _waits_for_a_batch(pool, lambda c: forget.scrub_if_opted_out(c, rid, [222], BOT_ID))
+    assert await conn.fetchval("SELECT answer FROM bot_requests WHERE id = $1", rid) is None
 
 
 async def test_forget_me_waits_for_a_slow_purge_batch_instead_of_failing(database, pool, conn):
@@ -330,6 +456,7 @@ async def test_preview_counts_without_deleting(conn):
     await _msg(conn, 1, 111, "старое", stored="13 months")
     await _msg(conn, 2, 222, "тоже старое", stored="13 months")
     await _msg(conn, 3, 111, "свежее", stored="1 day")
+    await _msg(conn, 4, 111, "уйдёт через 10 дней", stored="11 months 20 days")
     await conn.execute("INSERT INTO message_edits (chat_id, message_id, old_text, replaced_at) "
                        "VALUES ($1, 2, 'черновик', now())", CHAT_ID)
     await conn.execute("""INSERT INTO bot_requests (chat_id, user_id, scenario, answer, status, created_at, oldest_source_at)
@@ -339,12 +466,35 @@ async def test_preview_counts_without_deleting(conn):
     await conn.execute("""INSERT INTO reminders (chat_id, user_id, request_msg_id, text, due_at, created_at, sent_at)
                           VALUES ($1, 111, 1, 'x', now(), now() - interval '13 months', now())""", CHAT_ID)
     expected = {"answers": 1, "messages": 2, "edits": 1, "requests": 1, "reminders": 1, "users": 3,
-                "total_messages": 3}                 # 222, 333 and the bot keep no message newer than the cutoff
+                "total_messages": 4}                 # 222, 333 and the bot keep no message newer than the cutoff
     assert await retention.preview(conn) == expected
     assert await retention.preview(conn) == expected     # nothing was deleted
     in_a_month = await conn.fetchval("SELECT now() + interval '1 month'")
-    assert (await retention.preview(conn, in_a_month))["messages"] == 2
-    assert await conn.fetchval("SELECT count(*) FROM messages") == 3
+    assert (await retention.preview(conn, in_a_month))["messages"] == 3        # a run on that day takes #4 too
+    assert await conn.fetchval("SELECT count(*) FROM messages") == 4
+
+
+async def test_the_cli_previews_a_day_confirms_and_runs(database, conn, monkeypatch, capsys):
+    await _setup(conn)
+    await _msg(conn, 1, 111, "уйдёт через 3 дня", stored="12 months -3 days")
+    await _msg(conn, 2, 111, "свежее", stored="1 day")
+    monkeypatch.setenv("DATABASE_URL", database["collector"])
+    monkeypatch.setattr("nestor.logs.setup_logging", lambda level: None)        # keeps pytest's log capture
+    today = (await _now(conn)).astimezone(MSK).date()
+
+    async def cli(*args) -> list[str]:
+        await retention._main(list(args))
+        return capsys.readouterr().out.splitlines()
+
+    assert "messages: 0" in await cli()                                     # now: nothing is due
+    assert "messages: 1" in await cli("--at", (today + timedelta(days=10)).isoformat())
+    assert "messages: 0" in await cli("--at", today.isoformat())
+    assert await cli("--confirm") == ["confirmed 1"]                        # the next 7 days take #1
+    assert await conn.fetchval("SELECT counts FROM maintenance_runs WHERE job = $1",
+                               retention.CONFIRM_JOB) == {"messages": 1}
+    assert await conn.fetchval("SELECT count(*) FROM messages") == 2        # nothing above deleted anything
+    assert (await cli("--run"))[0].startswith("ok ")
+    assert await cli("--run") == ["nothing to do: today's run is done or still running"]
 
 
 async def test_overdue_counts_every_kind(conn):
