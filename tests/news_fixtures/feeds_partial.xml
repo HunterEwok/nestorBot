@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+<channel>
+<title>Edge cases</title>
+<link>https://example.org/</link>
+<description>Entries a generic adapter must survive</description>
+<item>
+<title>No link, opaque guid</title>
+<guid isPermaLink="false">5f9dc79d:604545f7:6ac11b5b</guid>
+<description>Skipped: nothing to link to.</description>
+</item>
+<item>
+<title>No link, opaque guid without isPermaLink</title>
+<guid>post-80412</guid>
+<description>Skipped: feedparser takes the guid for a permalink, but it is no URL.</description>
+</item>
+<item>
+<title>   </title>
+<link>https://example.org/empty-title</link>
+<description>Skipped: no title.</description>
+</item>
+<item>
+<title>Script link</title>
+<link>javascript:alert(1)</link>
+</item>
+<item>
+<title>FTP link</title>
+<link>ftp://example.org/file.txt</link>
+</item>
+<item>
+<title>Guid is the permalink</title>
+<guid>https://example.org/guid-permalink</guid>
+<pubDate>not a date</pubDate>
+</item>
+<item>
+<title>Double-escaped: Why &amp;#8216;microdosing&amp;#8217; studies disagree &amp;amp; what&amp;nbsp;next</title>
+<link>https://example.org/double-escaped</link>
+<pubDate>Sat, 03 Oct 2026 10:00:00 GMT</pubDate>
+</item>
+<item>
+<title>&lt;b&gt;Bold&lt;/b&gt; title with &lt;a href="https://example.org/x"&gt;a link&lt;/a&gt; &#8212; and AT&amp;T, 5 &lt; 7</title>
+<link>https://example.org/markup-title</link>
+<description><![CDATA[<script>alert("x")</script><style>p{color:red}</style><p>Visible&#8203; text&shy;here.</p>]]></description>
+</item>
+<item>
+<title>Duplicate guid, first</title>
+<link>https://example.org/dup-1</link>
+<guid isPermaLink="false">dup</guid>
+</item>
+<item>
+<title>Duplicate guid, second</title>
+<link>https://example.org/dup-2</link>
+<guid isPermaLink="false">dup</guid>
+</item>
+</channel>
+</rss>

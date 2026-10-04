@@ -19,6 +19,7 @@ class Completion:
     model: str | None
     input_tokens: int | None
     output_tokens: int | None
+    profile: str | None = None      # Hermes profile that answered: group, deep, web, smart, news
 
 
 class LLM(Protocol):
@@ -30,7 +31,9 @@ class LLMError(Exception):
 
 
 class HermesClient:
-    def __init__(self, base_url: str, api_key: str, model: str = "hermes-agent", timeout: float = 120):
+    def __init__(self, base_url: str, api_key: str, model: str = "hermes-agent", timeout: float = 120,
+                 name: str | None = None):
+        self.name = name
         self.url = base_url.rstrip("/") + "/chat/completions"
         self.headers = {"Authorization": f"Bearer {api_key}"}
         self.model = model
@@ -49,7 +52,8 @@ class HermesClient:
         except (KeyError, IndexError, TypeError):
             raise LLMError("unexpected response shape") from None
         usage = data.get("usage") or {}
-        return Completion(text.strip(), data.get("model"), usage.get("prompt_tokens"), usage.get("completion_tokens"))
+        return Completion(text.strip(), data.get("model"), usage.get("prompt_tokens"), usage.get("completion_tokens"),
+                          self.name)
 
 
 _FENCE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S)

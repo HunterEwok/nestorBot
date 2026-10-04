@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"
+	xmlns:content="http://purl.org/rss/1.0/modules/content/"
+	xmlns:wfw="http://wellformedweb.org/CommentAPI/"
+	xmlns:dc="http://purl.org/dc/elements/1.1/"
+	xmlns:atom="http://www.w3.org/2005/Atom"
+	xmlns:sy="http://purl.org/rss/1.0/modules/syndication/"
+	xmlns:slash="http://purl.org/rss/1.0/modules/slash/"
+	>
+
+<channel>
+	<title>News Releases Archive - NORML</title>
+	<atom:link href="https://norml.org/news/feed/" rel="self" type="application/rss+xml" />
+	<link>https://norml.org/news/</link>
+	<description>Working to reform marijuana laws</description>
+	<lastBuildDate>Thu, 01 Oct 2026 16:35:49 +0000</lastBuildDate>
+	<language>en-US</language>
+	<sy:updatePeriod>
+	hourly	</sy:updatePeriod>
+	<sy:updateFrequency>
+	1	</sy:updateFrequency>
+	<item>
+		<title>Analysis: Teen Marijuana Use Has Declined Significantly in Adult-Use Legalization States</title>
+		<link>https://norml.org/news/2026/10/01/analysis-teen-marijuana-use-has-declined-significantly-in-adult-use-legalization-states/</link>
+		<dc:creator><![CDATA[NORML]]></dc:creator>
+		<pubDate>Thu, 01 Oct 2026 16:35:49 +0000</pubDate>
+				<category><![CDATA[2026]]></category>
+		<category><![CDATA[high school]]></category>
+		<category><![CDATA[teens]]></category>
+		<guid isPermaLink="false">https://norml.org/?post_type=news&#038;p=80801</guid>
+
+					<description><![CDATA[Self-reported marijuana use by high-school students fell in states that legalized adult use, according to an analysis of federal survey data published in <em>Addictive Behaviors</em>. &#8220;These results are consistent with dozens of prior studies,&#8221; NORML&#8217;s Deputy Director said.]]></description>
+		</item>
+	<item>
+		<title>Survey: Patients With Eating Disorders Frequently Report Benefits From Cannabis</title>
+		<link>https://norml.org/news/2026/09/17/survey-patients-with-eating-disorders-frequently-report-benefits-from-cannabis/</link>
+		<dc:creator><![CDATA[NORML]]></dc:creator>
+		<pubDate>Thu, 17 Sep 2026 14:02:11 +0000</pubDate>
+				<category><![CDATA[eating disorders]]></category>
+		<category><![CDATA[patients]]></category>
+		<guid isPermaLink="false">https://norml.org/?post_type=news&#038;p=80655</guid>
+
+					<description><![CDATA[Most respondents with anorexia or bulimia who used cannabis said it eased anxiety around meals, according to survey data published in the <em>Journal of Eating Disorders</em>.]]></description>
+		</item>
+	</channel>
+</rss>

@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"
+	xmlns:content="http://purl.org/rss/1.0/modules/content/"
+	xmlns:wfw="http://wellformedweb.org/CommentAPI/"
+	xmlns:dc="http://purl.org/dc/elements/1.1/"
+	xmlns:atom="http://www.w3.org/2005/Atom"
+	xmlns:sy="http://purl.org/rss/1.0/modules/syndication/"
+	xmlns:slash="http://purl.org/rss/1.0/modules/slash/"
+	>
+
+<channel>
+	<title>Politics Archives | Leafly</title>
+	<atom:link href="https://www.leafly.com/news/category/politics/feed" rel="self" type="application/rss+xml" />
+	<link>https://www.leafly.com/news/category/politics</link>
+	<description>Leafly News</description>
+	<lastBuildDate>Fri, 07 Aug 2026 17:49:30 +0000</lastBuildDate>
+	<language>en-US</language>
+	<item>
+		<title>Texas government outlaws THC&#8212;confuses country, consumers, and themselves</title>
+		<link>https://www.leafly.com/news/politics/texas-government-outlaws-thc</link>
+		<dc:creator><![CDATA[Bruce Barcott]]></dc:creator>
+		<pubDate>Fri, 07 Aug 2026 17:49:30 +0000</pubDate>
+				<category><![CDATA[Politics]]></category>
+		<category><![CDATA[2026]]></category>
+		<category><![CDATA[news]]></category>
+		<category><![CDATA[texas]]></category>
+		<guid isPermaLink="false">https://www.leafly.com/wp-home/?p=284163</guid>
+
+					<description><![CDATA[A new state law bans most intoxicating hemp products, but nobody can agree on what it covers.]]></description>
+		</item>
+	<item>
+		<title>What the 2026 midterms mean for cannabis legalization</title>
+		<link>https://www.leafly.com/news/politics/2026-midterms-cannabis-legalization</link>
+		<dc:creator><![CDATA[Leafly Staff]]></dc:creator>
+		<pubDate>Tue, 02 Jun 2026 13:00:00 +0000</pubDate>
+				<category><![CDATA[Politics]]></category>
+		<category><![CDATA[elections]]></category>
+		<guid isPermaLink="false">https://www.leafly.com/wp-home/?p=283310</guid>
+
+					<description><![CDATA[Five states vote on cannabis ballot measures this November.]]></description>
+		</item>
+	</channel>
+</rss>

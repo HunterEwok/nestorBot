@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"
+	xmlns:content="http://purl.org/rss/1.0/modules/content/"
+	xmlns:wfw="http://wellformedweb.org/CommentAPI/"
+	xmlns:dc="http://purl.org/dc/elements/1.1/"
+	xmlns:atom="http://www.w3.org/2005/Atom"
+	xmlns:sy="http://purl.org/rss/1.0/modules/syndication/"
+	xmlns:slash="http://purl.org/rss/1.0/modules/slash/"
+	>
+
+<channel>
+	<title>Multidisciplinary Association for Psychedelic Studies &#8211; MAPS</title>
+	<atom:link href="https://maps.org/feed/" rel="self" type="application/rss+xml" />
+	<link>https://maps.org</link>
+	<description>Since 1986</description>
+	<lastBuildDate>Tue, 29 Sep 2026 21:04:58 +0000</lastBuildDate>
+	<language>en-US</language>
+	<item>
+		<title>Statement on DEA attempt to reschedule five tryptamines</title>
+		<link>https://maps.org/2026/09/29/statement-dea-attempt-to-reschedule-five-tryptamines/</link>
+		<dc:creator><![CDATA[Kevin Cranford]]></dc:creator>
+		<pubDate>Tue, 29 Sep 2026 21:04:58 +0000</pubDate>
+				<category><![CDATA[Uncategorized]]></category>
+		<guid isPermaLink="false">https://maps.org/?p=361279</guid>
+
+					<description><![CDATA[MAPS opposes the proposed placement of five tryptamines in Schedule I and urges the DEA to hold a hearing. [&#8230;]]]></description>
+										<content:encoded><![CDATA[<p>MAPS opposes the proposed placement of five tryptamines in Schedule&nbsp;I and urges the DEA to hold a public hearing before any final rule.</p>
+<p>Scheduling would make research on these compounds harder without evidence of a public health need.</p>]]></content:encoded>
+		</item>
+	<item>
+		<title>New ibogaine research consortium announced</title>
+		<link>https://maps.org/2026/06/02/new-ibogaine-research-consortium-announced/</link>
+		<dc:creator><![CDATA[MAPS]]></dc:creator>
+		<pubDate>Tue, 02 Jun 2026 18:00:00 +0000</pubDate>
+				<category><![CDATA[Uncategorized]]></category>
+		<guid isPermaLink="false">https://maps.org/?p=360012</guid>
+
+					<description><![CDATA[A group of universities will coordinate cardiac safety studies of ibogaine.]]></description>
+										<content:encoded><![CDATA[<p>A group of universities will coordinate cardiac safety studies of ibogaine.</p>]]></content:encoded>
+		</item>
+	</channel>
+</rss>

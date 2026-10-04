@@ -124,14 +124,16 @@ class FakeChecker:
 
 @pytest.fixture(name="make_env")
 def make_env_fixture(pool):
-    def make(llm=None, admins=(), web=None, smart=None, checker=None, no_private=(), **cfg):
+    def make(llm=None, admins=(), web=None, smart=None, checker=None, no_private=(), deep=None, news_llm=None,
+             routes=None, **cfg):
         bot, llm = FakeBot(admins, no_private), llm or FakeLLM()
         settings = Settings(bot_token="42:TEST", database_url="", allowed_chat_ids=frozenset({CHAT_ID}))
         collector = Collector(settings, pool)
         cfg.setdefault("allowed_chat_ids", frozenset({CHAT_ID}))
         collector.answerer = Answerer(bot, pool, llm, BotIdentity(BOT_ID, "ewok_nestor_bot", ("нестор", "бот")),
                                       lambda m: collector.store(m, is_edit=False), AnswerConfig(**cfg), web_llm=web,
-                                      smart_llm=smart, checker=checker or FakeChecker())
+                                      smart_llm=smart, checker=checker or FakeChecker(), deep_llm=deep,
+                                      news_llm=news_llm, routes=routes)
         dp = Dispatcher()
         dp.include_router(collector.router())
 

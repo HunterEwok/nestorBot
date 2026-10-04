@@ -1,0 +1,36 @@
+# Hermes profile `news` for sorting the news digest's items: ~/.hermes/profiles/news/config.yaml
+# (hermes profile create news, then copy this file and news/SOUL.md into it).
+#
+# It reads only public news items (titles and teasers from the sources in nestor/news/sources.py)
+# and needs no tools at all: one line in Russian per item, a section, a verdict. No archive,
+# no internet, so a prompt injection in a feed has nothing to use. Without this profile the
+# collector uses `web` for it (its search tools then add some tokens to every call).
+# Verify after every Hermes update (deploy/hermes/README.md, "Проверка").
+
+model:
+  provider: anthropic            # ANTHROPIC_API_KEY in ~/.hermes/profiles/news/.env (may be the same key)
+  default: claude-haiku-4-5      # cheap: dozens of items a day
+
+platform_toolsets:
+  api_server: []                 # no tools at all
+
+agent:
+  disabled_toolsets:             # second line of defence; names per the Toolsets Reference of your Hermes version
+    - terminal
+    - file
+    - browser
+    - web
+    - code_execution
+    - delegation
+    - memory
+    - skills
+    - cronjob
+    - messaging
+
+gateway:
+  api_server:
+    enabled: true
+    # key: set API_SERVER_KEY in ~/.hermes/profiles/news/.env; the same value goes to
+    # HERMES_NEWS_API_KEY in /opt/nestor/.env
+
+# No mcp_servers: the archive is out of reach by construction.

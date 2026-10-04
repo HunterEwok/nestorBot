@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE rss [
+  <!ENTITY lol "lol">
+  <!ENTITY lol1 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">
+  <!ENTITY lol2 "&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;">
+]>
+<rss version="2.0">
+<channel>
+<title>Entity test</title>
+<link>https://example.org/</link>
+<description>A feed that declares entities</description>
+<item>
+<title>&lol2;</title>
+<link>https://example.org/post</link>
+<guid>https://example.org/post</guid>
+</item>
+</channel>
+</rss>

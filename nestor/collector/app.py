@@ -208,23 +208,39 @@ async def make_answerer(settings: Settings, bot: Bot, pool: asyncpg.Pool, collec
     identity = BotIdentity(me.id, me.username, settings.bot_keywords)
     cfg = AnswerConfig(rate_limit=settings.rate_limit, rate_window_min=settings.rate_window_min,
                        daily_token_limit=settings.daily_token_limit, tz=ZoneInfo(settings.timezone),
-                       music_daily_limit=settings.music_daily_limit, allowed_chat_ids=settings.allowed_chat_ids,
+                       music_daily_limit=settings.music_daily_limit,
+                       music_player_app=settings.music_player_app, allowed_chat_ids=settings.allowed_chat_ids,
                        wisdom_chat_ids=settings.wisdom_chat_ids, digest_time=settings.digest_time,
-                       wisdom_time=settings.wisdom_time)
-    llm = HermesClient(settings.hermes_url, settings.hermes_api_key, settings.hermes_model, timeout=cfg.timeout_s)
-    web = smart = None
-    if settings.hermes_web_url:
-        web = HermesClient(settings.hermes_web_url, settings.hermes_web_api_key, settings.hermes_model,
-                           timeout=cfg.timeout_s)
-    else:
-        log.warning("HERMES_WEB_URL is not set: questions that need the internet get a refusal")
-    if settings.hermes_smart_url:
-        smart = HermesClient(settings.hermes_smart_url, settings.hermes_smart_api_key, settings.hermes_model,
-                             timeout=cfg.smart_timeout_s)
-    else:
-        log.warning("HERMES_SMART_URL is not set: songs and the wisdom of the day use the web profile")
-    return Answerer(bot, pool, llm, identity, lambda msg: collector.store(msg, is_edit=False), cfg, web_llm=web,
-                    smart_llm=smart, checker=HttpChecker())
+                       wisdom_time=settings.wisdom_time, news_chat_ids=settings.news_chat_ids,
+                       news_time=settings.news_time, news_max_topics=settings.news_max_topics)
+
+    def client(name: str, url: str | None, key: str, timeout: float, missing: str) -> HermesClient | None:
+        if not url:
+            if missing:
+                log.warning(missing)
+            return None
+        return HermesClient(url, key, settings.hermes_model, timeout=timeout, name=name)
+
+    llm = client("group", settings.hermes_url, settings.hermes_api_key, cfg.timeout_s, "")
+    web = client("web", settings.hermes_web_url, settings.hermes_web_api_key, cfg.timeout_s,
+                 "HERMES_WEB_URL is not set: questions that need the internet get a refusal")
+    smart = client("smart", settings.hermes_smart_url, settings.hermes_smart_api_key, cfg.smart_timeout_s,
+                   "HERMES_SMART_URL is not set: songs, the wisdom of the day and the news digest use the web profile")
+    deep = client("deep", settings.hermes_deep_url, settings.hermes_deep_api_key, cfg.smart_timeout_s, "")
+    news_llm = client("news", settings.hermes_news_url, settings.hermes_news_api_key, cfg.timeout_s, "")
+    answerer = Answerer(bot, pool, llm, identity, lambda msg: collector.store(msg, is_edit=False), cfg, web_llm=web,
+                        smart_llm=smart, checker=HttpChecker(), deep_llm=deep, news_llm=news_llm,
+                        routes=settings.model_routes)
+    for task in ("theses", "news_triage", "news"):
+        log.info("model route", extra={"task": task, "profile": answerer.router.profile(task)})
+    from ..news.service import NewsService
+    from ..news.sources import all_sources
+
+    answerer.news = NewsService(pool, all_sources(settings.news_telegram_channels),
+                                triage_llm=answerer.router.llm("news_triage"), is_wanted=answerer.news_wanted,
+                                tz=cfg.tz, daily_token_limit=cfg.daily_token_limit,
+                                contact=settings.news_contact_email, timeout_s=cfg.smart_timeout_s)
+    return answerer
 
 
 async def run(settings: Settings) -> None:
@@ -239,16 +255,18 @@ async def run(settings: Settings) -> None:
     else:
         log.warning("HERMES_URL is not set: archiving only, the bot will not answer")
     dp.include_router(collector.router())
-    scheduler = None
+    background: list[asyncio.Task] = []
     if collector.answerer is not None:
         from ..bot.scheduler import Scheduler
 
-        scheduler = asyncio.create_task(Scheduler(collector.answerer).run())
+        background.append(asyncio.create_task(Scheduler(collector.answerer).run()))
+        if collector.answerer.news is not None:
+            background.append(asyncio.create_task(collector.answerer.news.run()))
     try:
         await dp.start_polling(bot, handle_as_tasks=False, allowed_updates=ALLOWED_UPDATES)
     finally:
-        if scheduler is not None:
-            scheduler.cancel()
+        for task in background:
+            task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await scheduler
+                await task
         await pool.close()

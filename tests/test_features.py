@@ -318,6 +318,15 @@ async def test_private_chat_serves_only_export_and_is_never_archived(make_env, c
 
 # ---- songs ----
 
+async def test_song_card_has_the_player_button_when_it_is_set_up(make_env):
+    checker = FakeChecker(videos={"BBBBBBBBBBB": "КИНО - Группа крови"})
+    bot, llm, feed = make_env(web=FakeLLM("web"), smart=FakeLLM(SONG), checker=checker, music_player_app="play")
+    await feed(update("message", message(2, "нестор, включи Кино — Группа крови")))
+    card = bot.sent[-1]
+    assert card["reply_markup"].inline_keyboard[0][0].url == "https://t.me/ewok_nestor_bot/play?startapp=BBBBBBBBBBB"
+    assert card["text"].endswith(prompts.MUSIC_PLAY_APP)
+
+
 async def test_song_card_plays_in_telegram(make_env, conn):
     smart, web = FakeLLM(SONG), FakeLLM("web")
     checker = FakeChecker(videos={"BBBBBBBBBBB": "КИНО - Группа крови"}, spotify={SPOTIFY: "Группа крови"},
@@ -329,8 +338,10 @@ async def test_song_card_plays_in_telegram(make_env, conn):
     card = bot.sent[-1]
     youtube = "https://www.youtube.com/watch?v=BBBBBBBBBBB"
     assert card["parse_mode"] == "HTML" and card["reply_to"] == 2
-    assert card["text"] == f'🎵 <b>Кино — Группа крови</b>\n<a href="{youtube}">{prompts.MUSIC_PLAY}</a>'
-    assert card["link_preview_options"].url == youtube
+    # The video is only the preview, above the text: a text link would open YouTube outside Telegram.
+    assert card["text"] == f"🎵 <b>Кино — Группа крови</b>\n{prompts.MUSIC_PLAY}" and "href" not in card["text"]
+    options = card["link_preview_options"]
+    assert (options.url, options.prefer_large_media, options.show_above_text) == (youtube, True, True)
     urls = [b.url for row in card["reply_markup"].inline_keyboard for b in row]
     assert urls[:3] == ["https://music.apple.com/ru/album/x/1?i=2", "https://music.youtube.com/watch?v=BBBBBBBBBBB",
                         f"https://open.spotify.com/track/{SPOTIFY}"]

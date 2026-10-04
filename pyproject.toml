@@ -9,6 +9,9 @@ dependencies = [
     "asyncpg>=0.29",
     "python-dotenv>=1.0",
     "mcp>=2.3,<3",
+    # News digest: RSS/Atom feeds and two HTML pages (Telegram channel previews, Reggaeville).
+    "feedparser>=6.0.11,<7",
+    "beautifulsoup4>=4.12,<5",
 ]
 
 [project.optional-dependencies]

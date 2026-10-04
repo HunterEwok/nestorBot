@@ -1,6 +1,7 @@
 """The loop for what the bot does by itself, inside the collector process: due reminders,
-the morning digest and the wisdom of the day. Everything it sends goes through the same
-Answerer: the per-chat queue, the daily token limit and the bot_requests log."""
+the morning digest, the wisdom of the day and the evening news (fetched by its own loop in
+nestor.news.service). Everything it sends goes through the same Answerer: the per-chat
+queue, the daily token limit and the bot_requests log."""
 from __future__ import annotations
 
 import asyncio

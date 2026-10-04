@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="windows-1251"?>
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/">
+<channel>
+<title>Наука и общество — новости</title>
+<link>https://science-news.example.ru/</link>
+<description>Лента новостей</description>
+<language>ru</language>
+<item>
+<title>Учёные изучили действие каннабидиола при эпилепсии — «обнадёживающие» результаты</title>
+<link>https://science-news.example.ru/news/2026/10/03/kannabidiol-epilepsiya/</link>
+<guid isPermaLink="true">https://science-news.example.ru/news/2026/10/03/kannabidiol-epilepsiya/</guid>
+<pubDate>Sat, 03 Oct 2026 11:20:00 +0300</pubDate>
+<category>Медицина</category>
+<description><![CDATA[<p>Исследование № 42: у&nbsp;детей с&nbsp;синдромом Драве число приступов снизилось на треть.</p>]]></description>
+</item>
+<item>
+<title>Обзор: что известно о микродозинге</title>
+<link>https://science-news.example.ru/news/2026/10/02/mikrodozing/</link>
+<guid isPermaLink="true">https://science-news.example.ru/news/2026/10/02/mikrodozing/</guid>
+<pubDate>Fri, 02 Oct 2026 18:05:00 +0300</pubDate>
+<category>Наука</category>
+<description>Плацебо-контролируемые исследования пока не подтвердили эффект.</description>
+</item>
+</channel>
+</rss>

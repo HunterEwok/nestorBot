@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:media="http://search.yahoo.com/mrss/" xmlns:atom="http://www.w3.org/2005/Atom">
+  <channel>
+    <title><![CDATA[N + 1 — главное издание о науке, технике и технологиях]]></title>
+    <link>https://nplus1.ru</link>
+    <description><![CDATA[Интернет-издание о науке, технике и технологиях]]></description>
+    <language>ru</language>
+    <atom:link href="https://nplus1.ru/rss" rel="self" type="application/rss+xml"/>
+    <item>
+      <title><![CDATA[Псилоцибин ослабил симптомы нервной анорексии в небольшом исследовании]]></title>
+      <link>https://nplus1.ru/news/2026/10/02/psilocybin-anorexia</link>
+      <guid>https://nplus1.ru/news/2026/10/02/psilocybin-anorexia</guid>
+      <pubDate>Fri, 02 Oct 2026 15:38:00 +0300</pubDate>
+      <description><![CDATA[Псилоцибин ослабил симптомы нервной анорексии в небольшом исследовании]]></description>
+      <dc:creator><![CDATA[Мария Иванова (m.ivanova@nplus1.ru)]]></dc:creator>
+      <media:content url="https://nplus1.ru/images/2026/10/02/psilocybin.jpg" type="image/jpeg"/>
+      <enclosure url="https://nplus1.ru/images/2026/10/02/psilocybin.jpg" length="0" type="image/jpeg"/>
+    </item>
+    <item>
+      <title><![CDATA[Жевательный табак оставил след в зубном налёте у&nbsp;жителей Скандинавии XVII века]]></title>
+      <link>https://nplus1.ru/news/2026/10/02/chewing-tobacco-exposure</link>
+      <guid>https://nplus1.ru/news/2026/10/02/chewing-tobacco-exposure</guid>
+      <pubDate>Fri, 02 Oct 2026 09:30:00 +0300</pubDate>
+      <description><![CDATA[Археологи нашли следы никотина в&nbsp;зубном камне]]></description>
+      <dc:creator><![CDATA[Олег Лищук (o.lishchuk@nplus1.ru)]]></dc:creator>
+      <media:content url="https://nplus1.ru/images/2026/10/02/tobacco.jpg" type="image/jpeg"/>
+      <enclosure url="https://nplus1.ru/images/2026/10/02/tobacco.jpg" length="0" type="image/jpeg"/>
+    </item>
+  </channel>
+</rss>

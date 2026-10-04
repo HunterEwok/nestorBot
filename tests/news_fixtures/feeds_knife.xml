@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"
+	xmlns:content="http://purl.org/rss/1.0/modules/content/"
+	xmlns:wfw="http://wellformedweb.org/CommentAPI/"
+	xmlns:dc="http://purl.org/dc/elements/1.1/"
+	xmlns:atom="http://www.w3.org/2005/Atom"
+	xmlns:sy="http://purl.org/rss/1.0/modules/syndication/"
+	xmlns:slash="http://purl.org/rss/1.0/modules/slash/"
+	>
+
+<channel>
+	<title>Нож</title>
+	<atom:link href="https://knife.media/feed/" rel="self" type="application/rss+xml" />
+	<link>https://knife.media</link>
+	<description>Интеллектуальный журнал о культуре и обществе</description>
+	<lastBuildDate>Sat, 03 Oct 2026 13:50:13 +0000</lastBuildDate>
+	<language>ru-RU</language>
+	<item>
+		<title>Как психоделики вернулись в науку: краткая история «психоделического ренессанса»</title>
+		<link>https://knife.media/psychedelic-renaissance/</link>
+		<dc:creator><![CDATA[Редакция «Ножа»]]></dc:creator>
+		<pubDate>Sat, 03 Oct 2026 13:50:13 +0000</pubDate>
+				<category><![CDATA[Наука]]></category>
+		<category><![CDATA[Психоделики]]></category>
+		<guid isPermaLink="false">https://knife.media/?p=273790</guid>
+
+					<description><![CDATA[<p>Рассказываем, как исследования ЛСД и&nbsp;псилоцибина, запрещённые в&nbsp;1970-х, снова стали мейнстримом.</p>]]></description>
+		</item>
+	<item>
+		<title>Новости: в Москве открылась выставка о советском авангарде</title>
+		<link>https://knife.media/news-avant-garde/</link>
+		<dc:creator><![CDATA[Редакция «Ножа»]]></dc:creator>
+		<pubDate>Fri, 02 Oct 2026 07:00:25 +0000</pubDate>
+				<category><![CDATA[Новости]]></category>
+		<guid isPermaLink="false">https://knife.media/?p=273702</guid>
+
+					<description><![CDATA[<p>Выставка продлится до&nbsp;января.</p>]]></description>
+		</item>
+	</channel>
+</rss>
