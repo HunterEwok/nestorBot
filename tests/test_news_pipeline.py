@@ -336,7 +336,9 @@ async def test_triage_stops_at_the_daily_token_limit(pool, conn):
     adapter.results = {"mm": FetchResult([item(f"x{i}", f"Cannabis policy story number {i:02d} today", 1)
                                           for i in range(20)])}
     await service.collect(NOW + timedelta(hours=1))
-    assert await service.triage(NOW + timedelta(hours=1)) == 15      # the first batch spends the budget
+    # The day of the limit is NOW's: the database stamps the spent tokens with its own clock, which
+    # is past NOW but may already be in the next local day at NOW + 1 h.
+    assert await service.triage(NOW) == 15      # the first batch spends the budget
     assert len(llm.calls) == 1
     assert await conn.fetchval("SELECT count(*) FROM news_items WHERE status = 'new'") == 5
 

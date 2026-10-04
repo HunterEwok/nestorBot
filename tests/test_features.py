@@ -18,7 +18,7 @@ from nestor.mcp import tools
 from .factories import CHAT_ID, message, update
 from .test_answerer import BOT_ID, FakeChecker, FakeLLM, make_env_fixture  # noqa: F401 - fixture make_env
 
-TZ = ZoneInfo("Europe/Tallinn")
+TZ = ZoneInfo("Europe/Moscow")     # the answerer's default zone: local times here are its times
 SPOTIFY = "4" * 22
 SONG = json.dumps({"artist": "Кино", "title": "Группа крови",
                    "youtube": ["https://www.youtube.com/watch?v=AAAAAAAAAAA", "https://youtu.be/BBBBBBBBBBB"],
