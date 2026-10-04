@@ -12,6 +12,7 @@ dependencies = [
     # News digest: RSS/Atom feeds and two HTML pages (Telegram channel previews, Reggaeville).
     "feedparser>=6.0.11,<7",
     "beautifulsoup4>=4.12,<5",
+    "idna>=3.7",  # IDNA 2008 for look-alike hosts in link hints (nestor.bot.markup)
 ]
 
 [project.optional-dependencies]

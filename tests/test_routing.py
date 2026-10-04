@@ -60,3 +60,14 @@ def test_routes_that_break_the_split_are_refused(value):
 ])
 def test_split_think(text, think, rest):
     assert split_think(text) == (think, rest)
+
+
+def test_reactions_use_the_profile_without_tools_and_never_fall_back():
+    assert Router({"group": "G", "news": "N"}).llm("react") == "N"
+    # Without `news` the code picks reactions: no silent move to the archive or the internet profiles.
+    assert Router({"group": "G", "deep": "D", "web": "W", "smart": "S"}).llm("react") is None
+    assert parse_routes("react:group") == {"react": "group"}
+    assert Router({"group": "G", "news": "N"}, {"react": "group"}).llm("react") == "G"
+    for value in ("react:web", "react:smart", "react:deep"):
+        with pytest.raises(ValueError):
+            parse_routes(value)

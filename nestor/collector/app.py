@@ -212,7 +212,8 @@ async def make_answerer(settings: Settings, bot: Bot, pool: asyncpg.Pool, collec
                        music_player_app=settings.music_player_app, allowed_chat_ids=settings.allowed_chat_ids,
                        wisdom_chat_ids=settings.wisdom_chat_ids, digest_time=settings.digest_time,
                        wisdom_time=settings.wisdom_time, news_chat_ids=settings.news_chat_ids,
-                       news_time=settings.news_time, news_max_topics=settings.news_max_topics)
+                       news_time=settings.news_time, news_max_topics=settings.news_max_topics,
+                       reaction_chat_ids=settings.reaction_chat_ids)
 
     def client(name: str, url: str | None, key: str, timeout: float, missing: str) -> HermesClient | None:
         if not url:
@@ -231,7 +232,7 @@ async def make_answerer(settings: Settings, bot: Bot, pool: asyncpg.Pool, collec
     answerer = Answerer(bot, pool, llm, identity, lambda msg: collector.store(msg, is_edit=False), cfg, web_llm=web,
                         smart_llm=smart, checker=HttpChecker(), deep_llm=deep, news_llm=news_llm,
                         routes=settings.model_routes)
-    for task in ("theses", "news_triage", "news"):
+    for task in ("theses", "news_triage", "news", "react"):
         log.info("model route", extra={"task": task, "profile": answerer.router.profile(task)})
     from ..news.service import NewsService
     from ..news.sources import all_sources

@@ -5,7 +5,7 @@ import re
 from datetime import datetime, time as dtime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from nestor.bot import prompts
+from nestor.bot import markup, prompts
 from nestor.news.model import FetchResult
 
 from .factories import CHAT_ID, message, update
@@ -128,14 +128,14 @@ async def test_news_command_is_for_admins_and_switches_the_digest(make_env, pool
     await feed(update("message", message(2, "/news on", uid=222, date=ago())))
     assert bot.sent[-1]["text"] == prompts.ADMINS_ONLY
     await feed(update("message", message(3, "/news on", date=ago())))
-    assert bot.sent[-1]["text"].startswith("Новостная сводка включена. Она приходит в 20:00")
+    assert markup.to_plain(bot.sent[-1]["text"]).startswith("🗞 Новостная сводка включена. Она приходит в 20:00")
     assert await answerer.news_wanted()
     await feed(update("message", message(4, "/news status", date=ago())))
     status = bot.sent[-1]["text"]
     assert status.startswith(prompts.NEWS_STATUS_HEADER)
     assert re.search(r"^mm: ok, \d\d\.\d\d \d\d:\d\d, 2 / 0 / 0$", status, re.M)
     await feed(update("message", message(5, "/news off", date=ago())))
-    assert bot.sent[-1]["text"].startswith("Новостная сводка выключена.")
+    assert markup.to_plain(bot.sent[-1]["text"]).startswith("🗞 Новостная сводка выключена.")
     assert not await answerer.news_wanted()
     await answerer.run_daily_posts(local(23, 0))
     await answerer.drain()
@@ -156,7 +156,7 @@ async def test_think_goes_to_the_bigger_models(make_env, conn):
     assert len(deep.calls) == 2 and "о чём говорили сегодня?" in deep.calls[-1][-1]["content"]
     await feed(update("message", message(5, "нестор, подумай: какая погода в Таллине?", date=ago())))
     assert len(smart.calls) == 1 and web.calls == []
-    assert smart.calls[0][-1]["content"].endswith("Вопрос: какая погода в Таллине?")
+    assert "Вопрос: какая погода в Таллине?\nСтиль собеседника:" in smart.calls[0][-1]["content"]
     rows = [tuple(r) for r in await conn.fetch(
         "SELECT trigger_msg_id, scenario, profile FROM bot_requests ORDER BY id")]
     assert rows == [(2, "who_is_right", "deep"), (3, "summary", None), (4, "summary", "deep"), (5, "web", "smart")]
@@ -189,7 +189,7 @@ async def test_bare_think_reply_reconsiders_a_web_answer_on_the_bigger_model(mak
               "text": "В Таллине +8"}
     await feed(update("message", message(2, "подумай хорошенько", reply_to_message=answer, date=ago())))
     assert bot.sent[-1]["text"] == "Если подумать, к вечеру +5" and len(web.calls) == 1
-    assert smart.calls[0][-1]["content"].endswith("подумай хорошенько")
+    assert "Вопрос: подумай хорошенько\nСтиль собеседника:" in smart.calls[0][-1]["content"]
 
 
 async def test_archive_ticket_outlives_the_bigger_models_timeout(make_env, pool):

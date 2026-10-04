@@ -1,7 +1,7 @@
 """Stage 3 through the real dispatcher with a fake Telegram and a fake LLM."""
 import asyncio
 import itertools
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from aiogram import Dispatcher
@@ -36,6 +36,9 @@ class FakeBot(BaseFakeBot):
         self.no_private = set(no_private)  # users who never opened a private chat with the bot
         self.bot_status = ChatMemberStatus.MEMBER
         self.send_errors: list[Exception] = []  # raised by the next send_message calls, one per call
+        self.reaction_errors: dict[str, Exception] = {}  # emoji -> raised by set_message_reaction
+        self.available_reactions = None   # ChatFullInfo.available_reactions; None: all allowed
+        self.get_chat_calls = 0
 
     async def send_message(self, chat_id, text, reply_parameters=None, **kw):
         if self.send_errors:
@@ -60,8 +63,21 @@ class FakeBot(BaseFakeBot):
         return True
 
     async def set_message_reaction(self, chat_id, message_id, reaction=None, **kw):
-        self.reactions.append((message_id, [r.emoji for r in reaction or []]))
+        emojis = [r.emoji for r in reaction or []]
+        for emoji in emojis:
+            if emoji in self.reaction_errors:
+                raise self.reaction_errors[emoji]
+        self.reactions.append((message_id, emojis))
         return True
+
+    async def get_chat(self, chat_id, **kw):
+        self.get_chat_calls += 1
+
+        class Chat:
+            pass
+        chat = Chat()
+        chat.id, chat.available_reactions = chat_id, self.available_reactions
+        return chat
 
     async def send_chat_action(self, chat_id, action, **kw):
         self.actions.append(action)
@@ -165,11 +181,14 @@ async def test_keyword_invocation_answers_and_archives(make_env, conn):
 
 
 async def test_answer_with_link_is_archived_without_apology(make_env, conn):
-    answer = "Это было в #1 (https://t.me/c/1234567890/1)."
+    answer = "Это было в #1 (https://t.me/c/1000000001/1)."
     bot, llm, feed = make_env(FakeLLM(answer))
     await feed(update("message", message(1, "нестор, где это было?")))
-    assert [s["text"] for s in bot.sent] == [answer]
-    assert await conn.fetchval("SELECT text FROM messages WHERE message_id = $1", bot.sent[0]["message_id"]) == answer
+    # The reference becomes a quote of the message, linked to it.
+    sent = 'Это было в <a href="https://t.me/c/1000000001/1">«нестор, где это было?»</a>.'
+    assert [(s["text"], s["parse_mode"]) for s in bot.sent] == [(sent, "HTML")]
+    assert await conn.fetchval("SELECT text FROM messages WHERE message_id = $1", bot.sent[0]["message_id"]) == sent
+    assert await conn.fetchval("SELECT answer FROM bot_requests") == answer   # the model's own words, for follow-ups
     assert await conn.fetchval("SELECT status FROM bot_requests") == "ok"
 
 
@@ -266,7 +285,7 @@ async def test_rate_limit_per_user(make_env, conn):
     for i in range(1, 4):
         await feed(update("message", message(i, "бот, привет")))
     assert len(llm.calls) == 2
-    assert bot.sent[-1]["text"].startswith("Слишком часто")
+    assert bot.sent[-1]["text"].startswith("⏳ Слишком часто")
     assert await conn.fetchval("SELECT count(*) FROM bot_requests WHERE status = 'rate_limited'") == 1
 
 
@@ -318,7 +337,7 @@ async def test_forget_me(make_env, conn):
 
     assert await conn.fetchval("SELECT count(*) FROM messages WHERE user_id = 222") == 0
     assert "моё личное" not in str(await conn.fetchval("SELECT raw FROM messages WHERE message_id = 2"))
-    assert bot.sent[-1]["text"].startswith("Готово: удалил из архива твои сообщения (2)")
+    assert bot.sent[-1]["text"].startswith("🧹 Готово: удалил из архива твои сообщения (2)")
 
 
 async def test_pause_requires_admin_and_stops_archiving(make_env, conn):
@@ -350,7 +369,7 @@ async def test_summary_command_and_stats(make_env):
     assert "Сценарий: summary" in llm.calls[0][-1]["content"]
     assert "<сообщения за период>" in llm.calls[0][-1]["content"]
     await feed(update("message", message(3, "/stats", uid=111, date=int(datetime.now(timezone.utc).timestamp()))))
-    assert bot.sent[-1]["text"].startswith("Активность за 7 дней")
+    assert bot.sent[-1]["text"].startswith(f"<b>{prompts.STATS_ACTIVITY}</b>")
 
 
 async def test_mcp_tools_are_scoped_by_ticket(make_env, conn, reader):
@@ -378,3 +397,188 @@ async def test_mcp_server_exposes_only_read_tools():
 
     names = sorted(t.name for t in await server.list_tools())
     assert names == ["find_files", "find_links", "get_recent", "get_thread", "get_user_messages", "search_messages"]
+
+
+# ---- formatting ----
+
+async def test_model_markdown_is_sent_as_telegram_formatting(make_env, conn):
+    answer = ("**Итог:** договорились ехать 🏖\n\n- Петя: [«беру палатку»](#1)\n- Вася: [«гитару»](#2)\n"
+              "- кто-то: [«удалено»](#99)")
+    bot, llm, feed = make_env(FakeLLM(answer))
+    await feed(update("message", message(1, "беру палатку и котелок", uid=222)))
+    await feed(update("message", message(2, "а я гитару", uid=333)))
+    await conn.execute("UPDATE users SET opted_out = TRUE WHERE user_id = 333")   # Вася used /forget_me
+    await feed(update("message", message(3, "нестор, кто что берёт?", uid=111)))
+    sent = bot.sent[-1]
+    assert sent["parse_mode"] == "HTML" and sent["text"] == (
+        "<b>Итог:</b> договорились ехать 🏖\n\n"
+        '• Петя: <a href="https://t.me/c/1000000001/1">«беру палатку»</a>\n'
+        "• Вася: «гитару»\n"                 # an author who opted out: no quote of theirs, no link
+        "• кто-то: «удалено»")
+    assert "Стиль собеседника: пишет коротко." in llm.calls[0][-1]["content"]
+    req = await conn.fetchrow("SELECT answer, quoted_user_ids FROM bot_requests")
+    assert (req["answer"], req["quoted_user_ids"]) == (answer, [222])
+
+
+async def test_summaries_keep_their_own_format(make_env):
+    bot, llm, feed = make_env()
+    now = int(datetime.now(timezone.utc).timestamp())
+    await feed(update("message", message(1, "беру палатку", uid=222, date=now - 300)))
+    await feed(update("message", message(2, "/summary", uid=111, date=now - 200)))
+    await feed(update("message", message(3, "а я котелок", uid=222, date=now - 100)))
+    await feed(update("message", message(4, "нестор, что я пропустил?", uid=111, date=now - 50)))
+    await feed(update("message", message(5, "нестор, оцени тезисы", uid=111, date=now)))
+    assert len(llm.calls) == 3 and not any("Стиль собеседника" in c[-1]["content"] for c in llm.calls)
+
+
+async def test_forget_me_also_removes_answers_that_quote_them(make_env, conn):
+    bot, llm, feed = make_env(FakeLLM("Петя берёт: [«палатку»](#1)"))
+    await feed(update("message", message(1, "беру палатку и секретный котелок", uid=222)))
+    await feed(update("message", message(2, "нестор, кто что берёт?", uid=111)))
+    answer_id = bot.sent[-1]["message_id"]
+    assert "секретный" not in bot.sent[-1]["text"] and "палатку" in bot.sent[-1]["text"]
+    reply = message(3, "точно", uid=111, reply_to_message={"message_id": answer_id, "date": 1, "chat": {"id": CHAT_ID,
+                    "type": "supergroup"}, "from": {"id": BOT_ID, "is_bot": True, "first_name": "Нестор"}},
+                    quote={"text": "палатку", "position": 0})
+    await feed(update("message", reply))
+    await feed(update("message", message(4, "/forget_me", uid=222)))
+
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE message_id = $1", answer_id) == 0
+    assert "палатку" not in str(await conn.fetchval("SELECT raw FROM messages WHERE message_id = 3"))
+    assert await conn.fetchval("SELECT answer FROM bot_requests WHERE scenario = 'other'") is None
+    # The next request does not carry their words to the model in any form.
+    await feed(update("message", message(5, "нестор, а теперь?", uid=111)))
+    assert "палатк" not in str(llm.calls[-1])
+
+
+async def test_ids_shared_by_a_migrated_chat_and_its_old_group_are_not_linked(make_env, conn):
+    old = -4242
+    bot, llm, feed = make_env(FakeLLM("Это сказал Петя: [«едем в Грецию»](#7), а Вася: [«ок»](#8)"))
+    for i in range(1, 9):
+        await feed(update("message", message(i, f"новая группа {i}", uid=111)))
+    await feed.answerer.save_outgoing(message(7, "едем в Грецию", chat_id=old, uid=222)
+                                      | {"chat": {"id": old, "type": "group", "title": "Old"}})
+    await conn.execute("UPDATE chats SET migrated_from_chat_id = $1 WHERE chat_id = $2", old, CHAT_ID)
+    await feed(update("message", message(9, "нестор, кто что сказал?", uid=111)))
+    assert bot.sent[-1]["text"] == 'Это сказал Петя: «едем в Грецию», а Вася: ' \
+                                   '<a href="https://t.me/c/1000000001/8">«ок»</a>'
+    # Both people who might have written #7 are recorded: the quote itself is in the answer.
+    assert await conn.fetchval("SELECT quoted_user_ids FROM bot_requests") == [111, 222]
+    # A t.me/c link names the supergroup itself, so it is never ambiguous.
+    llm.answer = "Вот: [«новая группа 7»](https://t.me/c/1000000001/7)"
+    await feed(update("message", message(10, "нестор, а ссылкой?", uid=111)))
+    assert bot.sent[-1]["text"] == 'Вот: <a href="https://t.me/c/1000000001/7">«новая группа 7»</a>'
+
+
+async def test_a_number_the_model_was_not_shown_stays_a_number(make_env, conn):
+    bot, llm, feed = make_env(FakeLLM("Про issue #1234 спорили, см. [«купил хлеб»](#1234)"))
+    three_days_ago = int((datetime.now(timezone.utc) - timedelta(days=3)).timestamp())
+    await feed(update("message", message(1234, "купил хлеб и молоко", uid=333, date=three_days_ago)))
+    await feed(update("message", message(2000, "/summary", uid=111, date=int(datetime.now(timezone.utc).timestamp()))))
+    assert "#1234" not in llm.calls[0][-1]["content"]
+    assert bot.sent[-1]["text"] == \
+        'Про issue #1234 спорили, см. <a href="https://t.me/c/1000000001/1234">«купил хлеб»</a>'
+    # Shown to the model, the same bare number is a reference.
+    await feed(update("message", message(2001, "нестор, что там с хлебом?", uid=111)))
+    assert "#1234" in llm.calls[1][-1]["content"]
+    assert bot.sent[-1]["text"].startswith(
+        'Про issue <a href="https://t.me/c/1000000001/1234">«купил хлеб и молоко»</a>')
+
+
+async def test_forget_me_during_an_answer_in_flight_still_removes_it(make_env, conn):
+    bot, llm, feed = make_env(FakeLLM("Петя берёт: [«палатку и секретный котелок»](#1)", delay=0.4))
+    await feed(update("message", message(1, "беру палатку и секретный котелок", uid=222)))
+    asking = asyncio.create_task(feed(update("message", message(2, "нестор, кто что берёт?", uid=111))))
+    await asyncio.sleep(0.15)                       # the model is thinking
+    await feed(update("message", message(3, "/forget_me", uid=222)))
+    await asking
+    answer = next(m for m in bot.sent if m["text"].startswith("Петя берёт"))
+    assert "секретный котелок" in answer["text"]   # the model's own label: nothing else was left to quote
+    req = await conn.fetchrow("SELECT answer, quoted_user_ids FROM bot_requests WHERE scenario = 'other'")
+    assert (req["answer"], req["quoted_user_ids"]) == (None, [222])
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE message_id = $1", answer["message_id"]) == 0
+    await feed(update("message", message(4, "нестор, а теперь?", uid=111)))
+    assert "котелок" not in str(llm.calls[-1])
+
+
+async def test_answers_that_repeat_an_earlier_answer_go_with_it(make_env, conn):
+    bot, llm, feed = make_env(FakeLLM("Петя берёт: [«палатку»](#1)"))
+    await feed(update("message", message(1, "беру палатку", uid=222)))
+    await feed(update("message", message(2, "нестор, кто что берёт?", uid=111)))
+    first = bot.sent[-1]
+    # An answer that quotes the bot's own answer: the people quoted there are quoted again.
+    llm.answer = f"Я уже отвечал: [«Петя берёт: палатку»](#{first['message_id']})"
+    await feed(update("message", message(3, "нестор, повтори, кто что берёт?", uid=333)))
+    second = bot.sent[-1]
+    assert second["text"] == \
+        f'Я уже отвечал: <a href="https://t.me/c/1000000001/{first["message_id"]}">«Петя берёт: палатку»</a>'
+    # A follow-up in the same conversation may repeat the quotes without a reference.
+    llm.answer = "Да, Петя так и сказал про палатку."
+    bot_msg = {"message_id": first["message_id"], "date": 1, "chat": {"id": CHAT_ID, "type": "supergroup"},
+               "from": {"id": BOT_ID, "is_bot": True, "first_name": "Нестор"}, "text": first["text"]}
+    await feed(update("message", message(4, "точно?", uid=111, reply_to_message=bot_msg)))
+    third = bot.sent[-1]
+    rows = await conn.fetch("SELECT quoted_user_ids FROM bot_requests ORDER BY id")
+    assert [r["quoted_user_ids"] for r in rows] == [[222], [222], [222]]
+    await feed(update("message", message(5, "/forget_me", uid=222)))
+    gone = [first["message_id"], second["message_id"], third["message_id"]]
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE message_id = ANY($1::bigint[])", gone) == 0
+    assert await conn.fetchval("SELECT count(*) FROM bot_requests WHERE answer IS NOT NULL") == 0
+
+
+async def test_an_answer_about_a_replied_message_goes_with_its_author(make_env, conn):
+    bot, llm, feed = make_env()
+    claim = message(1, "налоги надо снизить срочно", uid=222)
+    await feed(update("message", claim))
+    await feed(update("message", message(2, "нестор, оцени тезисы", uid=111, reply_to_message=claim)))
+    assert await conn.fetchval("SELECT quoted_user_ids FROM bot_requests WHERE scenario = 'theses'") == [222]
+
+
+async def test_refused_formatting_is_sent_as_plain_text(make_env, conn):
+    from aiogram.methods import SendMessage
+    from aiogram.exceptions import TelegramBadRequest
+
+    bot, llm, feed = make_env(FakeLLM("**Итог:** [сайт](https://a.example)"))
+    bot.send_errors = [TelegramBadRequest(SendMessage(chat_id=CHAT_ID, text="x"),
+                                          "Bad Request: can't parse entities")]
+    await feed(update("message", message(1, "нестор, итог?")))
+    assert [(s["text"], s["parse_mode"]) for s in bot.sent] == [("Итог: сайт (a.example)", None)]
+    assert await conn.fetchval("SELECT status FROM bot_requests") == "ok"
+
+
+async def test_long_writers_get_room_for_longer_answers(make_env):
+    bot, llm, feed = make_env()
+    for i in range(1, 4):
+        await feed(update("message", message(i, "очень подробное рассуждение " * 12, uid=111)))
+    await feed(update("message", message(4, "нестор, а ты что думаешь?", uid=111)))
+    assert "Стиль собеседника: пишет развёрнуто." in llm.calls[0][-1]["content"]
+
+
+async def test_a_bare_number_from_an_archive_tool_is_not_linked_but_goes_with_its_author(make_env, conn):
+    # The archive tools show ids the prompt does not; the model may copy one bare. Not linked (it
+    # may be a number), but the words beside it are the author's: /forget_me removes the answer.
+    bot, llm, feed = make_env(FakeLLM("Вася писал об этом: #1234 — «купил хлеб и молоко»"))
+    three_days_ago = int((datetime.now(timezone.utc) - timedelta(days=3)).timestamp())
+    await feed(update("message", message(1234, "купил хлеб и молоко", uid=333, date=three_days_ago)))
+    await feed(update("message", message(2000, "/summary", uid=111, date=int(datetime.now(timezone.utc).timestamp()))))
+    assert "#1234" not in llm.calls[0][-1]["content"]
+    answer = bot.sent[-1]
+    assert answer["text"] == "Вася писал об этом: #1234 — «купил хлеб и молоко»"
+    assert await conn.fetchval("SELECT quoted_user_ids FROM bot_requests WHERE scenario = 'summary'") == [333]
+    await feed(update("message", message(3000, "/forget_me", uid=333)))
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE message_id = $1", answer["message_id"]) == 0
+    assert await conn.fetchval("SELECT answer FROM bot_requests WHERE scenario = 'summary'") is None
+
+
+async def test_thanks_for_an_answer_with_a_link_is_a_reaction_even_when_the_link_has_a_query(make_env, conn):
+    bot, llm, feed = make_env(FakeLLM("Вот: https://example.com/search?q=налоги"))
+    await feed(update("message", message(1, "нестор, какую ссылку кидал Петя про налоги", uid=222)))
+    answer = bot.sent[-1]
+    telegram_view = {"message_id": answer["message_id"], "date": 1, "chat": {"id": CHAT_ID, "type": "supergroup"},
+                     "from": {"id": BOT_ID, "is_bot": True, "first_name": "Нестор"}, "text": answer["text"]}
+    await feed(update("message", message(2, "спасибо", uid=222, reply_to_message=telegram_view)))
+    assert len(llm.calls) == 1 and (2, ["❤"]) in bot.reactions
+    # A question in the answer itself still makes the «угу» an answer for the model.
+    telegram_view["text"] = "Ты про https://example.com/search?q=налоги?"
+    await feed(update("message", message(3, "угу", uid=222, reply_to_message=telegram_view)))
+    assert len(llm.calls) == 2

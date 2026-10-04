@@ -46,11 +46,13 @@ class Settings:
     news_max_topics: int = 10
     news_contact_email: str = ""        # for NCBI's email= and the User-Agent of the news fetcher
     news_telegram_channels: tuple[str, ...] = ("psychedelicsocietyvienna",)
+    # Groups where the bot puts reactions on emotional messages; group admins switch it with /reactions on|off.
+    reaction_chat_ids: frozenset[int] = frozenset()
     bot_keywords: tuple[str, ...] = ("нестор", "бот")
     rate_limit: int = 5
     rate_window_min: int = 10
     daily_token_limit: int = 250_000
-    timezone: str = "Europe/Tallinn"
+    timezone: str = "Europe/Moscow"
 
 
 _COMMENT = re.compile(r"(?:^|\s)#.*\Z", re.S)
@@ -137,12 +139,13 @@ def load_settings() -> Settings:
             news_max_topics=_int("NEWS_MAX_TOPICS", 10),
             news_contact_email=_env("NEWS_CONTACT_EMAIL"),
             news_telegram_channels=_channels(),
+            reaction_chat_ids=_parse_ids(_env("REACTION_CHAT_IDS")),
             bot_keywords=tuple(w.strip().lower() for w in _env("BOT_KEYWORDS", "нестор,бот").split(",")
                                if w.strip()),
             rate_limit=_int("RATE_LIMIT_PER_USER", 5),
             rate_window_min=_int("RATE_LIMIT_WINDOW_MIN", 10),
             daily_token_limit=_int("DAILY_TOKEN_LIMIT", 250_000),
-            timezone=_env("TIMEZONE", "Europe/Tallinn"),
+            timezone=_env("TIMEZONE", "Europe/Moscow"),
         )
     except KeyError as e:
         raise SystemExit(f"missing required environment variable {e.args[0]}") from None

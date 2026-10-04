@@ -43,8 +43,12 @@ def test_parse_wisdom():
     assert daily.parse_wisdom(json.dumps({"quote": "Да.", "author": "Я", "source_url": "https://a.b/"}), []) is None
 
     text = daily.format_wisdom(w)
-    assert text.startswith(prompts.WISDOM_HEADER) and "«Счастлив тот, кто счастлив у себя дома.»\n— Лев Толстой" in text
-    assert "К сегодняшним разговорам: дом." in text and text.endswith("Источник: https://ru.wikiquote.org/wiki/Лев_Толстой")
+    assert text.startswith(f"<b>{prompts.WISDOM_HEADER}</b>")
+    assert "<blockquote>«Счастлив тот, кто счастлив у себя дома.»\n— <i>Лев Толстой</i></blockquote>" in text
+    assert "К сегодняшним разговорам: дом." in text
+    assert text.endswith('<a href="https://ru.wikiquote.org/wiki/Лев_Толстой">Источник</a> (ru.wikiquote.org)')
+    odd = daily.format_wisdom(daily.Wisdom("a < b & c", "Автор <i>", "https://a.example/?x=1&y=\"2\"", None))
+    assert "«a &lt; b &amp; c»" in odd and "Автор &lt;i&gt;" in odd and 'href="https://a.example/?x=1&amp;y=&quot;2&quot;"' in odd
     assert daily.is_repeat(w, [{"quote": "Счастлив тот, кто счастлив у себя дома", "author": "Толстой"}])
     assert not daily.is_repeat(w, [{"quote": "Всё смешалось в доме Облонских.", "author": "Толстой"}])
 

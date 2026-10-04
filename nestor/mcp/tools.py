@@ -3,11 +3,14 @@ to one chat (and its pre-migration predecessor), so injected text cannot reach o
 groups. The role behind the connection can only SELECT from reader.* views."""
 from __future__ import annotations
 
+import os
 from zoneinfo import ZoneInfo
 
 import asyncpg
 
-TZ = ZoneInfo("Europe/Tallinn")
+# The bot's time zone: the same TIMEZONE as in /opt/nestor/.env, passed by the Hermes profile
+# (mcp_servers.nestor.env in deploy/hermes/config.yaml), so tool results and the prompt agree.
+TZ = ZoneInfo((os.environ.get("TIMEZONE") or "").split("#")[0].strip() or "Europe/Moscow")
 MAX_LIMIT = 100
 
 

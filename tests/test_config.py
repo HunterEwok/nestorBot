@@ -37,7 +37,7 @@ def test_trailing_comments_are_not_part_of_the_value(env):
 def test_defaults_and_bad_values(env):
     s = config.load_settings()
     assert (s.news_time, s.news_max_topics, s.music_player_app, s.timezone) == (time(20, 0), 10, "",
-                                                                               "Europe/Tallinn")
+                                                                               "Europe/Moscow")
     env.setenv("NEWS_MAX_TOPICS", "десять")
     with pytest.raises(SystemExit, match="NEWS_MAX_TOPICS must be a whole number"):
         config.load_settings()

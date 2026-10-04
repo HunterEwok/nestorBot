@@ -4,7 +4,7 @@
       nestor:
         command: /opt/nestor/.venv/bin/python
         args: ["-m", "nestor.mcp"]
-        env: {READER_DATABASE_URL: "postgresql://hermes_reader:...@db/nestor"}
+        env: {READER_DATABASE_URL: "postgresql://hermes_reader:...@db/nestor", TIMEZONE: Europe/Moscow}
 """
 from __future__ import annotations
 

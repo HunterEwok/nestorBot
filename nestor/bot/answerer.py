@@ -14,9 +14,9 @@ import logging
 import re
 import secrets
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time as dtime, timedelta, timezone
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Collection
 from zoneinfo import ZoneInfo
 
 import asyncpg
@@ -27,14 +27,14 @@ from aiogram.types import (BufferedInputFile, InlineKeyboardMarkup, LinkPreviewO
                            ReplyParameters)
 
 from ..collector.app import dump
-from . import context, daily, export, music, prompts, reminders, routing
+from . import context, daily, export, markup, music, prompts, reactions, reminders, routing
 from .llm import LLM, Completion
+from .markup import TELEGRAM_LIMIT, split_text
 from .triggers import BotIdentity, Invocation, detect
 
 log = logging.getLogger("nestor.answerer")
 
 ANONYMOUS_ADMIN_ID = 1087968824  # GroupAnonymousBot: an admin posting as the group
-TELEGRAM_LIMIT = 4096
 _OFF = ("off", "выкл", "0", "нет", "no")
 
 
@@ -46,7 +46,7 @@ class AnswerConfig:
     timeout_s: float = 120
     progress_after_s: float = 60
     retention_months: int = 12
-    tz: ZoneInfo = ZoneInfo("Europe/Tallinn")
+    tz: ZoneInfo = ZoneInfo("Europe/Moscow")
     smart_timeout_s: float = 240        # songs and the wisdom: a bigger model and several web searches
     music_daily_limit: int = 10         # songs per day, all chats together
     music_player_app: str = ""          # short name of the player Mini App in BotFather; empty: none
@@ -58,6 +58,8 @@ class AnswerConfig:
     news_chat_ids: frozenset[int] = frozenset()      # news digest on by default; /news on|off overrides
     news_time: dtime = dtime(20, 0)
     news_max_topics: int = 10
+    reaction_chat_ids: frozenset[int] = frozenset()  # reactions on by default; /reactions on|off overrides
+    reactions: reactions.ReactionConfig = reactions.ReactionConfig()
 
 
 @dataclass
@@ -68,11 +70,14 @@ class Job:
     question: str
     since: datetime | None = None       # /summary period, «что я пропустил»
     think: bool = False                 # «нестор, подумай …»: the bigger model
+    seen: dict[int, int | None] = field(default_factory=dict)   # messages shown to the model: id -> author
+    quoted: set[int] = field(default_factory=set)   # people whose words the answer carries besides its refs
 
 
 @dataclass
 class Outgoing:
-    """What an answer sends. Plain text is split into Telegram-sized parts; an HTML card
+    """What an answer sends. Plain text is split into Telegram-sized parts; a model answer
+    (markdown) is formatted by nestor.bot.markup and split the same way; an HTML card
     (songs) goes as one message."""
     text: str
     completion: Completion | None = None
@@ -81,21 +86,8 @@ class Outgoing:
     preview_url: str | None = None
     keyboard: InlineKeyboardMarkup | None = None
     log_text: str | None = None         # for bot_requests.answer when the text is not plain
-
-
-def split_text(text: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
-    """SC-6: split on paragraph, then line, then word boundaries."""
-    parts: list[str] = []
-    rest = text.strip()
-    while len(rest) > limit:
-        cut = max(rest.rfind("\n\n", 0, limit), rest.rfind("\n", 0, limit), rest.rfind(" ", 0, limit))
-        if cut <= limit // 2:
-            cut = limit
-        parts.append(rest[:cut].rstrip())
-        rest = rest[cut:].lstrip()
-    if rest:
-        parts.append(rest)
-    return parts
+    markdown: bool = False
+    refs: dict[int, markup.Ref] | None = None   # archive messages the answer refers to
 
 
 SaveOutgoing = Callable[[dict], Awaitable[object]]
@@ -115,6 +107,9 @@ class Answerer:
         self.news = news                # nestor.news.service.NewsService, None without the news digest
         self.checker = checker or music.HttpChecker()
         self.save_outgoing = save_outgoing
+        self.reactor = reactions.Reactor(bot, pool, lambda: self.router.llm("react"), wanted=self._reactions_wanted,
+                                         calls_today=self._reaction_calls_today, may_spend=self._may_spend_on_reactions,
+                                         log_call=self._log_reaction, cfg=cfg.reactions)
         self._queues: dict[int, asyncio.Queue[Callable[[], Awaitable[None]]]] = {}
         self._workers: dict[int, asyncio.Task] = {}
 
@@ -125,12 +120,18 @@ class Answerer:
         async with self.pool.acquire() as conn:
             settings = await conn.fetchval("SELECT settings FROM chats WHERE chat_id = $1", msg["chat"]["id"]) or {}
         inv = detect(msg, self.me, generic_keyword_enabled=settings.get("keyword_bot", True))
-        if inv is None or "from" not in msg:
+        if "from" not in msg:
+            return
+        if inv is None:
+            if not paused and self._reactions_on(msg["chat"]["id"], settings):
+                self.reactor.consider(msg)
             return
         if paused and inv.command != "resume":
             return
         if inv.kind == "command":
             await self._command(msg, inv)
+            return
+        if await self._acknowledged(msg, inv):    # «спасибо», «ок»: a reaction says it, no model needed
             return
         think, question = routing.split_think(inv.text)
         scenario = context.classify(question, reply_target=_reply_target(msg, inv) is not None)
@@ -146,7 +147,7 @@ class Answerer:
                 inv.command == "export" or (inv.command == "start" and inv.args == "export")):
             await self._export(msg, private=True)
         else:
-            await self._reply(msg, prompts.PRIVATE_HELP, save=False)
+            await self._say(msg, prompts.PRIVATE_HELP, save=False)
 
     def submit(self, job: Job) -> None:
         self._enqueue(job.msg["chat"]["id"], functools.partial(self._answer, job))
@@ -161,6 +162,7 @@ class Answerer:
         """Wait until all queued jobs are done (tests, shutdown)."""
         for queue in list(self._queues.values()):
             await queue.join()
+        await self.reactor.drain()
 
     async def _worker(self, chat_id: int) -> None:
         queue = self._queues[chat_id]
@@ -179,12 +181,12 @@ class Answerer:
         chat_id, user_id = msg["chat"]["id"], msg["from"]["id"]
         cmd = inv.command
         if cmd in ("help", "start"):
-            await self._reply(msg, prompts.HELP.format(username=self.me.username))
+            await self._say(msg, prompts.HELP.format(username=self.me.username))
         elif cmd == "privacy":
-            await self._reply(msg, prompts.PRIVACY.format(retention=self.cfg.retention_months))
+            await self._say(msg, prompts.PRIVACY.format(retention=self.cfg.retention_months))
         elif cmd == "forget_me":
             count = await self.forget_user(user_id)
-            await self._reply(msg, prompts.FORGOTTEN.format(count=count), save=False)
+            await self._say(msg, prompts.FORGOTTEN.format(count=count), save=False)
         elif cmd == "stats":
             self.submit(Job(msg, inv, "stats", "/stats"))
         elif cmd == "summary":
@@ -199,14 +201,14 @@ class Answerer:
             await self._list_reminders(msg)
         elif cmd == "unremind":
             await self._unremind(msg, inv.args)
-        elif cmd in ("pause", "resume", "bot_word", "digest", "wisdom", "news"):
+        elif cmd in ("pause", "resume", "bot_word", "digest", "wisdom", "news", "reactions"):
             if not await self._is_admin(msg):
-                await self._reply(msg, prompts.ADMINS_ONLY)
+                await self._say(msg, prompts.ADMINS_ONLY)
                 return
             if cmd == "news" and inv.args.strip().lower() in ("status", "статус"):
-                await self._reply(msg, await self._news_status())
+                await self._say(msg, await self._news_status())
                 return
-            if cmd in ("digest", "wisdom", "news"):
+            if cmd in ("digest", "wisdom", "news", "reactions"):
                 await self._toggle(msg, cmd, inv.args)
                 return
             async with self.pool.acquire() as conn:
@@ -215,13 +217,13 @@ class Answerer:
                     await conn.execute(
                         "UPDATE chats SET settings = settings || jsonb_build_object('keyword_bot', $2::bool) "
                         "WHERE chat_id = $1", chat_id, on)
-                    await self._reply(msg, prompts.BOT_WORD.format(state="включено" if on else "выключено"))
+                    await self._say(msg, prompts.BOT_WORD.format(state="включено" if on else "выключено"))
                     return
                 await conn.execute("UPDATE chats SET enabled = $2 WHERE chat_id = $1", chat_id, cmd == "resume")
-            await self._reply(msg, prompts.RESUMED if cmd == "resume" else prompts.PAUSED)
+            await self._say(msg, prompts.RESUMED if cmd == "resume" else prompts.PAUSED)
 
     async def _toggle(self, msg: dict, key: str, args: str) -> None:
-        """/digest, /wisdom, /news on|off; without an argument shows the current state."""
+        """/digest, /wisdom, /news, /reactions on|off; without an argument shows the current state."""
         chat_id, arg = msg["chat"]["id"], args.strip().lower()
         async with self.pool.acquire() as conn:
             if arg:
@@ -237,11 +239,15 @@ class Answerer:
             on = self._news_on(chat_id, settings)
             text = prompts.NEWS_STATE.format(state="включена" if on else "выключена",
                                              time=self.cfg.news_time.strftime("%H:%M"), topics=self.cfg.news_max_topics)
+        elif key == "reactions":
+            on = self._reactions_on(chat_id, settings)
+            text = prompts.REACTIONS_STATE.format(state="включены" if on else "выключены",
+                                                  per_hour=self.cfg.reactions.per_hour)
         else:
             on = self._wisdom_on(chat_id, settings)
             text = prompts.WISDOM_STATE.format(state="включена" if on else "выключена",
                                                time=self.cfg.wisdom_time.strftime("%H:%M"))
-        await self._reply(msg, text)
+        await self._say(msg, text)
 
     def _wisdom_on(self, chat_id: int, settings: dict) -> bool:
         value = (settings or {}).get("wisdom")
@@ -250,6 +256,56 @@ class Answerer:
     def _news_on(self, chat_id: int, settings: dict) -> bool:
         value = (settings or {}).get("news")
         return bool(value) if value is not None else chat_id in self.cfg.news_chat_ids
+
+    def _reactions_on(self, chat_id: int, settings: dict) -> bool:
+        value = (settings or {}).get("reactions")
+        return bool(value) if value is not None else chat_id in self.cfg.reaction_chat_ids
+
+    # ---- reactions (nestor.bot.reactions) ----
+
+    async def _reactions_wanted(self, chat_id: int) -> bool:
+        """Checked again when a batch is due: the chat may have been paused or switched off meanwhile."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT enabled, settings FROM chats WHERE chat_id = $1", chat_id)
+        return row is not None and row["enabled"] and self._reactions_on(chat_id, row["settings"] or {})
+
+    async def _reaction_calls_today(self, chat_id: int) -> int:
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT count(*) FROM bot_requests WHERE chat_id = $1 AND scenario = 'reaction' AND created_at >= $2",
+                chat_id, self._day_start())
+
+    async def _may_spend_on_reactions(self) -> bool:
+        """Reactions stop asking the model at half the daily tokens: answers come first."""
+        async with self.pool.acquire() as conn:
+            return await self._tokens_today(conn) < self.cfg.daily_token_limit // 2
+
+    async def _log_reaction(self, chat_id: int, completion: Completion, started: float, status: str) -> None:
+        async with self.pool.acquire() as conn:
+            await self._log_scheduled(conn, chat_id, "reaction", completion, [], started, status=status)
+
+    async def _put_reaction(self, msg: dict, emoji: str) -> bool:
+        try:
+            await self.bot.set_message_reaction(msg["chat"]["id"], msg["message_id"],
+                                                reaction=[ReactionTypeEmoji(emoji=emoji)])
+        except TelegramAPIError as e:
+            log.warning("reaction failed", extra={"chat_id": msg["chat"]["id"], "error": type(e).__name__})
+            return False
+        return True
+
+    async def _acknowledged(self, msg: dict, inv: Invocation) -> bool:
+        """Answer a bare «спасибо», «ок» or emoji with a reaction the chat allows. Not when it
+        answers the bot's own question («Ты про Кино?» — «угу») or replies to someone else's
+        message: then it is a request. False sends the message on to the model."""
+        emoji = reactions.acknowledgement(inv.text)
+        if emoji is None or _reply_target(msg, inv) is not None:
+            return False
+        replied = (msg.get("reply_to_message") or {}).get("text") or ""
+        if inv.replied_to_bot is not None and "?" in _LINKS.sub("", replied):   # a «?q=» inside a link is not one
+            return False
+        allowed = await self.reactor.allowed(msg["chat"]["id"])
+        emoji = next((e for e in (emoji, "👍", "👌", "❤") if e in allowed), None)
+        return emoji is not None and await self._put_reaction(msg, emoji)
 
     async def _is_admin(self, msg: dict) -> bool:
         if msg["from"]["id"] == ANONYMOUS_ADMIN_ID and (msg.get("sender_chat") or {}).get("id") == msg["chat"]["id"]:
@@ -273,7 +329,37 @@ class Answerer:
                    WHERE raw ? 'quote' AND raw->'reply_to_message'->'from'->>'id' = $1::text""", str(user_id))
             await conn.execute("UPDATE bot_requests SET question = NULL WHERE user_id = $1", user_id)
             await conn.execute("DELETE FROM reminders WHERE user_id = $1", user_id)
+            await self._scrub_answers(conn, user_id)
         return int(status.split()[-1])
+
+    async def _scrub_answers(self, conn, user_id: int, request_id: int | None = None) -> None:
+        """The bot's answers that carried the user's words (quote-links and the rest that
+        bot_requests.quoted_user_ids records): out of the archive, and out of the conversation
+        history that goes back to the model. All of them, or one request's."""
+        for r in await conn.fetch(
+                """SELECT chat_id, answer_msg_ids FROM bot_requests
+                   WHERE $1 = ANY(quoted_user_ids) AND answer_msg_ids IS NOT NULL
+                     AND ($2::bigint IS NULL OR id = $2)""", user_id, request_id):
+            await conn.execute("DELETE FROM messages WHERE chat_id = $1 AND message_id = ANY($2::bigint[]) "
+                               "AND user_id = $3", r["chat_id"], r["answer_msg_ids"], self.me.user_id)
+            await conn.execute(
+                """UPDATE messages SET raw = raw - 'quote'
+                   WHERE chat_id = $1 AND raw ? 'quote'
+                     AND raw->'reply_to_message'->>'message_id' = ANY($2::text[])""",
+                r["chat_id"], [str(i) for i in r["answer_msg_ids"]])
+        await conn.execute("UPDATE bot_requests SET answer = NULL WHERE $1 = ANY(quoted_user_ids) "
+                           "AND ($2::bigint IS NULL OR id = $2)", user_id, request_id)
+
+    async def _scrub_if_opted_out(self, conn, request_id: int, quoted: list[int] | None) -> None:
+        """A /forget_me that came while the answer was being written: scrub the row at once.
+        The lock waits for a /forget_me in flight to finish, so neither side misses the other."""
+        if not quoted:
+            return
+        rows = await conn.fetch("SELECT user_id, opted_out FROM users WHERE user_id = ANY($1::bigint[]) FOR SHARE",
+                                quoted)
+        for r in rows:
+            if r["opted_out"]:
+                await self._scrub_answers(conn, r["user_id"], request_id)
 
     # ---- reminders ----
 
@@ -282,34 +368,46 @@ class Answerer:
         try:
             parsed = reminders.parse(job.question, now, self.cfg.tz)
         except reminders.ReminderError as e:
-            return Outgoing(str(e))
+            return Outgoing(str(e), html=True)
         if parsed is None:
-            return Outgoing(prompts.REMINDER_NO_TIME)
+            return Outgoing(prompts.REMINDER_NO_TIME, html=True)
         chat_id, user_id = msg["chat"]["id"], msg["from"]["id"]
         async with self.pool.acquire() as conn:
             if await reminders.count_pending(conn, chat_id, user_id) >= self.cfg.max_reminders:
-                return Outgoing(prompts.REMINDERS_TOO_MANY.format(limit=self.cfg.max_reminders))
+                return Outgoing(prompts.REMINDERS_TOO_MANY.format(limit=self.cfg.max_reminders), html=True)
             rid = await reminders.create(conn, chat_id=chat_id, thread_id=_topic(msg), user_id=user_id,
                                          request_msg_id=msg["message_id"], text=parsed.text, due=parsed.due)
+        job.quoted.add(user_id)         # the confirmation repeats their words: /forget_me removes it too
         return Outgoing(prompts.REMINDER_SET.format(when=reminders.format_due(parsed.due, self.cfg.tz, now),
-                                                    about=reminders.about(parsed.text), id=rid))
+                                                    about=html.escape(reminders.about(parsed.text)), id=rid),
+                        html=True)
 
     async def _list_reminders(self, msg: dict) -> None:
         now = datetime.now(timezone.utc)
         async with self.pool.acquire() as conn:
             rows = await reminders.pending_for(conn, msg["chat"]["id"], msg["from"]["id"])
         if not rows:
-            await self._reply(msg, prompts.REMINDERS_EMPTY)
+            await self._say(msg, prompts.REMINDERS_EMPTY, save=False)
             return
-        items = "\n".join(prompts.REMINDER_ITEM.format(
-            id=r["id"], when=reminders.format_due(r["due_at"], self.cfg.tz, now), about=reminders.about(r["text"]))
-            for r in rows)
-        await self._reply(msg, prompts.REMINDERS_LIST.format(items=items))
+        items = [prompts.REMINDER_ITEM.format(id=r["id"], when=reminders.format_due(r["due_at"], self.cfg.tz, now),
+                                              about=html.escape(reminders.about(r["text"]))) for r in rows]
+        # Their own reminders, not archived: /forget_me deletes reminders. Many long ones go in
+        # several messages, the header with the first and the hint with the last.
+        chunks = markup.chunk_lines(items, TELEGRAM_LIMIT - len(prompts.REMINDERS_LIST))
+        for i, chunk in enumerate(chunks):
+            text = "\n".join(chunk)
+            if len(chunks) == 1:
+                text = prompts.REMINDERS_LIST.format(items=text)
+            elif i == 0:
+                text = prompts.REMINDERS_LIST_HEADER + "\n" + text
+            elif i == len(chunks) - 1:
+                text += "\n\n" + prompts.REMINDERS_LIST_FOOTER
+            await self._say(msg, text, save=False)
 
     async def _unremind(self, msg: dict, args: str) -> None:
         m = re.search(r"\d+", args or "")
         if not m:
-            await self._reply(msg, prompts.UNREMIND_USAGE)
+            await self._say(msg, prompts.UNREMIND_USAGE)
             return
         rid = int(m.group())
         async with self.pool.acquire() as conn:
@@ -317,7 +415,7 @@ class Answerer:
         if not done and await self._is_admin(msg):  # admins may cancel anyone's reminder in their group
             async with self.pool.acquire() as conn:
                 done = await reminders.cancel(conn, rid, msg["chat"]["id"], None)
-        await self._reply(msg, prompts.UNREMIND_DONE.format(id=rid) if done else prompts.UNREMIND_NOT_FOUND)
+        await self._say(msg, prompts.UNREMIND_DONE.format(id=rid) if done else prompts.UNREMIND_NOT_FOUND)
 
     async def send_due_reminders(self, now: datetime | None = None) -> int:
         """Called by the scheduler. A reminder is a reply to the request that set it."""
@@ -333,7 +431,7 @@ class Answerer:
             if now - r["due_at"] > timedelta(hours=1):
                 text += prompts.REMINDER_LATE.format(when=reminders.format_due(r["due_at"], self.cfg.tz, now))
             try:
-                sent = await self.bot.send_message(
+                await self.bot.send_message(
                     r["chat_id"], text, parse_mode="HTML", message_thread_id=r["thread_id"],
                     reply_parameters=ReplyParameters(message_id=r["request_msg_id"], allow_sending_without_reply=True),
                     link_preview_options=LinkPreviewOptions(is_disabled=True))
@@ -360,8 +458,7 @@ class Answerer:
                 continue
             async with self.pool.acquire() as conn:
                 await reminders.mark_sent(conn, r["id"])
-            await self._archive(sent, r["chat_id"])
-            delivered += 1
+            delivered += 1      # not archived: it repeats their words, and /forget_me deletes reminders
         return delivered
 
     # ---- /export ----
@@ -377,9 +474,9 @@ class Answerer:
             rows = [] if recent else await export.fetch(conn, user["id"])
         if recent:
             status = "rate_limited"
-            await self._reply(msg, prompts.EXPORT_TOO_OFTEN, save=not private)
+            await self._say(msg, prompts.EXPORT_TOO_OFTEN, save=not private)
         elif not rows:
-            await self._reply(msg, prompts.EXPORT_EMPTY, save=not private)
+            await self._say(msg, prompts.EXPORT_EMPTY, save=not private)
         else:
             now = datetime.now(timezone.utc)
             document = BufferedInputFile(export.render(rows, user, self.cfg.tz, now),
@@ -389,14 +486,14 @@ class Answerer:
                                              caption=prompts.EXPORT_CAPTION.format(count=len(rows)))
             except (TelegramForbiddenError, TelegramBadRequest):
                 status = "blocked"  # the person has not opened a private chat with the bot yet
-                await self._reply(msg, prompts.EXPORT_START.format(username=self.me.username), save=not private)
+                await self._say(msg, prompts.EXPORT_START.format(username=self.me.username), save=not private)
             except TelegramAPIError as e:
                 status = "error"
                 log.warning("export failed", extra={"chat_id": msg["chat"]["id"], "error": type(e).__name__})
-                await self._reply(msg, prompts.ERROR, save=not private)
+                await self._say(msg, prompts.ERROR, save=not private)
             else:
                 if not private:
-                    await self._reply(msg, prompts.EXPORT_SENT)
+                    await self._say(msg, prompts.EXPORT_SENT)
         async with self.pool.acquire() as conn:
             await self._log(conn, job, status)
 
@@ -426,12 +523,12 @@ class Answerer:
         return await conn.fetchval(
             """INSERT INTO bot_requests (chat_id, trigger_msg_id, user_id, thread_id, scenario, question,
                                          answer, model, input_tokens, output_tokens, latency_ms, status,
-                                         answer_msg_ids, parent_id, profile)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING id""",
+                                         answer_msg_ids, parent_id, profile, quoted_user_ids)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING id""",
             msg["chat"]["id"], msg["message_id"], msg["from"]["id"], msg.get("message_thread_id"),
             job.scenario, job.question, fields.get("answer"), fields.get("model"),
             fields.get("input_tokens"), fields.get("output_tokens"), fields.get("latency_ms"), status,
-            fields.get("answer_msg_ids"), fields.get("parent_id"), fields.get("profile"),
+            fields.get("answer_msg_ids"), fields.get("parent_id"), fields.get("profile"), fields.get("quoted_user_ids"),
         )
 
     async def _answer(self, job: Job) -> None:
@@ -441,7 +538,7 @@ class Answerer:
             if reason:
                 await self._log(conn, job, "rate_limited")
         if reason:
-            await self._reply(msg, reason)
+            await self._say(msg, reason)
             return
 
         await self._react(msg, "👀")
@@ -454,24 +551,28 @@ class Answerer:
             fields["parent_id"] = parent["id"] if parent else None
             out = await self._produce(job, parent, ticket)
             status = out.status
-            sent = await self._deliver(msg, out)
-            fields.update(answer=out.log_text or out.text, answer_msg_ids=[m.message_id for m in sent if m is not None])
+            # Counted before sending: tokens spent stay spent even if delivery fails.
+            fields.update(answer=out.log_text or out.text, quoted_user_ids=_quoted(out.refs, job.quoted))
             if out.completion is not None:
                 c = out.completion
                 fields.update(model=c.model, input_tokens=c.input_tokens, output_tokens=c.output_tokens,
                               profile=c.profile)
+            sent = await self._deliver(msg, out)
+            fields.update(answer_msg_ids=[m.message_id for m in sent if m is not None])
         except asyncio.TimeoutError:
             status = "timeout"
-            await self._reply(msg, prompts.TIMEOUT)
+            await self._say(msg, prompts.TIMEOUT)
         except Exception as e:  # noqa: BLE001 - LLMError, network, Hermes down: one short apology
             status = "error"
             log.warning("llm call failed", extra={"chat_id": msg["chat"]["id"], "error": type(e).__name__})
-            await self._reply(msg, prompts.ERROR)
+            await self._say(msg, prompts.ERROR)
         finally:
             fields["latency_ms"] = int((time.monotonic() - started) * 1000)
             async with self.pool.acquire() as conn:
                 await conn.execute("DELETE FROM request_tickets WHERE ticket = $1 OR expires_at < now()", ticket)
-                await self._log(conn, job, status, **fields)
+                async with conn.transaction():
+                    rid = await self._log(conn, job, status, **fields)
+                    await self._scrub_if_opted_out(conn, rid, fields.get("quoted_user_ids"))
             await self._react(msg, None)
         log.info("answered", extra={"chat_id": msg["chat"]["id"], "scenario": job.scenario, "status": status,
                                     "latency_ms": fields["latency_ms"], "input_tokens": fields.get("input_tokens"),
@@ -497,7 +598,7 @@ class Answerer:
         if scenario == "catchup":
             nothing = await self._start_catchup(job)
             if nothing:
-                return Outgoing(nothing)
+                return Outgoing(nothing, html=True)
 
         task = "think" if job.think else scenario if scenario in ("theses", "who_is_right") else "answer"
         async with self.pool.acquire() as conn:
@@ -510,21 +611,79 @@ class Answerer:
         completion = await self._complete_with_progress(job.msg, prompt, self.router.llm(task),
                                                         timeout=self._timeout(task))
         if prompts.WEB_MARKER in completion.text:
-            completion = await self._answer_from_web(job, completion)
-        return _out(completion)
+            return _out(await self._answer_from_web(job, completion))
+        refs, authors = await self._refs(job.msg["chat"]["id"], completion.text, job.seen)
+        job.quoted |= authors
+        return _out(completion, refs)
 
     async def _deliver(self, msg: dict, out: Outgoing) -> list[Message | None]:
         if out.html or out.keyboard or out.preview_url:
-            return [await self._reply(msg, out.text, html=out.html, preview_url=out.preview_url, keyboard=out.keyboard)]
+            plain = (out.log_text or markup.to_plain(out.text)) if out.html else None
+            return [await self._reply(msg, out.text, html=out.html, preview_url=out.preview_url, keyboard=out.keyboard,
+                                      plain=plain)]
+        if out.markdown:
+            try:
+                parts = markup.render(out.text, out.refs, msg["chat"]["id"])
+            except Exception as e:  # noqa: BLE001 - a formatting bug must not lose an answer already paid for
+                log.warning("formatting failed, sending plain text", extra={"chat_id": msg["chat"]["id"],
+                                                                         "error": type(e).__name__})
+                return [await self._reply(msg, part) for part in split_text(out.text)]
+            return [await self._reply(msg, part, html=True, plain=markup.to_plain(part)) for part in parts]
         return [await self._reply(msg, part) for part in split_text(out.text)]
+
+    async def _refs(self, chat_id: int, text: str,
+                    seen: dict[int, int | None] | None = None) -> tuple[dict[int, markup.Ref], set[int]]:
+        """The archive messages an answer refers to ([«…»](#id), t.me/c links, a bare #id), with
+        their links, a piece of their text and their author. Deleted messages and authors who used
+        /forget_me are not found, so their references stay without a link or quote. In a group
+        migrated from a basic group both chats number from 1: an id found in both is left as it
+        is, it cannot be told which message the model meant. A bare #id the prompt did not show
+        is not linked either («issue #1234» is a number; the archive tools show ids the prompt
+        does not, so the model may still mean a message), but its author is recorded all the same:
+        the words beside such a number are usually theirs.
+
+        Also returns the authors whose words the answer carries without a usable reference, so
+        that /forget_me still removes it: of such ambiguous ids, of messages gone since the prompt
+        was built (a /forget_me in flight), and of the people quoted in the bot's own answers it
+        refers to."""
+        ids = markup.ref_ids(text, chat_id)
+        if not ids:
+            return {}, set()
+        linked = markup.linked_ids(text, chat_id)
+        found: dict[int, list] = {}
+        refs, authors = {}, set()
+        async with self.pool.acquire() as conn:
+            for cid in await context.chat_lineage(conn, chat_id):
+                wanted = ids if cid == chat_id else [i for i in ids if i not in linked]
+                for r in await context.messages_by_id(conn, cid, wanted):
+                    found.setdefault(r["message_id"], []).append(r)
+            for mid in ids:
+                rows = found.get(mid, [])
+                if len(rows) == 1:
+                    r = rows[0]
+                    own = r["user_id"] == self.me.user_id
+                    refs[mid] = markup.Ref(
+                        context.message_link(r["chat_id"], r["message_id"], r["thread_id"], r["is_topic_message"]),
+                        markup.quote(r["text"]), None if own else r["user_id"],
+                        bare=seen is None or mid in seen)       # None: no prompt was built (tests, imports)
+                    if own:     # the bot's answer: whoever it quoted is quoted again
+                        authors |= set(await conn.fetchval(
+                            "SELECT quoted_user_ids FROM bot_requests WHERE chat_id = $1 AND $2 = ANY(answer_msg_ids)",
+                            r["chat_id"], mid) or [])
+                elif rows:
+                    authors |= {r["user_id"] for r in rows if r["user_id"] is not None}
+                elif (seen or {}).get(mid) is not None:
+                    authors.add(seen[mid])
+        return refs, authors - {self.me.user_id}
 
     async def _parent(self, conn, job: Job):
         """The earlier request whose answer this message replies to, if any."""
         if job.inv.replied_to_bot is None:
             return None
         return await conn.fetchrow(
-            "SELECT id, chat_id, trigger_msg_id, question, answer, scenario, parent_id FROM bot_requests "
-            "WHERE chat_id = $1 AND $2 = ANY(answer_msg_ids)", job.msg["chat"]["id"], job.inv.replied_to_bot)
+            "SELECT id, chat_id, trigger_msg_id, question, answer, scenario, parent_id, quoted_user_ids "
+            "FROM bot_requests WHERE chat_id = $1 AND $2 = ANY(answer_msg_ids)",
+            job.msg["chat"]["id"], job.inv.replied_to_bot)
 
     async def _start_catchup(self, job: Job) -> str | None:
         """«Что я пропустил»: the period starts at the asker's previous message here (at most a
@@ -577,13 +736,14 @@ class Answerer:
         """Reply «нестор, проверь» to a message: that one message goes to the web profile."""
         llm = self.router.llm("think_web" if job.think else "factcheck")
         if llm is None:
-            return Outgoing(prompts.NO_WEB)
+            return Outgoing(prompts.NO_WEB, html=True)
         if _reply_target(job.msg, job.inv) is None:
-            return Outgoing(prompts.FACTCHECK_HOW)
+            return Outgoing(prompts.FACTCHECK_HOW, html=True)
         async with self.pool.acquire() as conn:
             claim, opted_out = await self._replied_text(conn, job.msg)
         if claim is None:
-            return Outgoing(prompts.REPLIED_OPTED_OUT if opted_out else prompts.FACTCHECK_NO_TEXT)
+            return Outgoing(prompts.REPLIED_OPTED_OUT if opted_out else prompts.FACTCHECK_NO_TEXT, html=True)
+        job.quoted.add(_replied_author(job.msg))    # the verdict restates their claim
         now = datetime.now(self.cfg.tz).strftime("%Y-%m-%d %H:%M")
         user = (f"Сейчас {now} ({self.cfg.tz.key}). Утверждение из чата: «{claim}»\n"
                 f"Вопрос участника: {job.question or 'проверь'}")
@@ -595,18 +755,20 @@ class Answerer:
         """«нестор, включи …»: the smart profile finds the song, music.build_card checks the links."""
         llm = self.router.llm("music")
         if llm is None:
-            return Outgoing(prompts.NO_WEB)
+            return Outgoing(prompts.NO_WEB, html=True)
         extra = None
         async with self.pool.acquire() as conn:
             used = await conn.fetchval(
                 "SELECT count(*) FROM bot_requests WHERE scenario = 'music' AND status = 'ok' AND created_at >= $1",
                 self._day_start())
             if used >= self.cfg.music_daily_limit:
-                return Outgoing(prompts.MUSIC_LIMIT.format(limit=self.cfg.music_daily_limit), status="rate_limited")
+                return Outgoing(prompts.MUSIC_LIMIT.format(limit=self.cfg.music_daily_limit), status="rate_limited",
+                                html=True)
             if parent is None and music.needs_reply_text(job.question):
                 extra, opted_out = await self._replied_text(conn, job.msg)
                 if extra is None:
-                    return Outgoing(prompts.REPLIED_OPTED_OUT if opted_out else prompts.MUSIC_NO_TEXT)
+                    return Outgoing(prompts.REPLIED_OPTED_OUT if opted_out else prompts.MUSIC_NO_TEXT, html=True)
+                job.quoted.add(_replied_author(job.msg))
             history = await self._history(conn, job, ("music",))
         user = f"Запрос: {job.question}"
         if extra:
@@ -615,7 +777,7 @@ class Answerer:
         completion = await self._complete_with_progress(job.msg, prompt, llm, timeout=self._timeout("music"))
         pick = music.parse(completion.text)
         if pick is None:
-            return Outgoing(prompts.MUSIC_NOT_FOUND, completion, log_text=completion.text)
+            return Outgoing(prompts.MUSIC_NOT_FOUND, completion, html=True, log_text=completion.text)
         if isinstance(pick, music.Say):
             return Outgoing(pick.text, completion)
         card = await music.build_card(pick, self.checker,
@@ -636,7 +798,7 @@ class Answerer:
                      AND m.sent_at > $2
                    GROUP BY u.user_id ORDER BY n DESC LIMIT 10""", ids, since)
             if not activity:
-                return Outgoing(prompts.STATS_EMPTY)
+                return Outgoing(prompts.STATS_EMPTY, html=True)
             found = await context.top_branches(conn, ids, None, since)
             branches = []
             for b in found:
@@ -644,9 +806,11 @@ class Answerer:
                 rows = await context.messages_by_id(conn, b["chat_id"], [b["root"]] + members[:6] + members[-3:])
                 if rows:
                     branches.append((b, rows))
-        lines = [prompts.STATS_ACTIVITY] + [f"{i}. {context.author(r)} — {r['n']}" for i, r in enumerate(activity, 1)]
+        lines = [f"<b>{html.escape(prompts.STATS_ACTIVITY)}</b>"] + [
+            f"{i}. {html.escape(context.author(r))} — {r['n']}" for i, r in enumerate(activity, 1)]
         if not branches:
-            return Outgoing("\n".join(lines + ["", prompts.STATS_NO_TOPICS]))
+            text = "\n".join(lines + ["", html.escape(prompts.STATS_NO_TOPICS)])
+            return Outgoing(text, html=True, log_text=markup.to_plain(text))
 
         completion, names = None, []
         prompt = [{"role": "system", "content": prompts.TOPICS_SYSTEM},
@@ -658,17 +822,23 @@ class Answerer:
             names = _numbered(completion.text, len(branches))
         except Exception as e:  # noqa: BLE001 - the activity part is still worth sending
             log.warning("topic naming failed", extra={"chat_id": msg["chat"]["id"], "error": type(e).__name__})
-        lines += ["", prompts.STATS_TOPICS]
+        lines += ["", f"<b>{html.escape(prompts.STATS_TOPICS)}</b>"]
         for i, (b, rows) in enumerate(branches, 1):
             first = rows[0]
-            name = (names[i - 1] if i <= len(names) else None) or _snippet(first["text"])
+            name = names[i - 1] if i <= len(names) else None
+            if name is None:        # the first words of the branch: its author's own
+                name = _snippet(first["text"])
+                if first["user_id"] is not None:
+                    job.quoted.add(first["user_id"])
+            name = html.escape(name)
             size = b["size"]
-            lines.append(f"{i}. {name} — {size} {context.plural(size, ('сообщение', 'сообщения', 'сообщений'))}")
             link = context.message_link(first["chat_id"], first["message_id"], first["thread_id"],
                                         first["is_topic_message"])
             if link:
-                lines.append(link)
-        return Outgoing("\n".join(lines), completion)
+                name = f'<a href="{html.escape(link, quote=True)}">{name}</a>'
+            lines.append(f"{i}. {name} — {size} {context.plural(size, ('сообщение', 'сообщения', 'сообщений'))}")
+        text = "\n".join(lines)
+        return Outgoing(text, completion, html=True, log_text=markup.to_plain(text))
 
     async def _answer_from_web(self, job: Job, routed: Completion | None) -> Completion:
         """The archive model asked for the internet. The web profile gets the asker's question and
@@ -682,9 +852,11 @@ class Answerer:
                                       if routed else (None, None, None, None)))
         async with self.pool.acquire() as conn:
             history = await self._history(conn, job, ("web", "factcheck"))
+            style = await self._style(conn, job)
         now = datetime.now(self.cfg.tz).strftime("%Y-%m-%d %H:%M")
         prompt = [{"role": "system", "content": prompts.WEB_SYSTEM}, *history,
-                  {"role": "user", "content": f"Сейчас {now} ({self.cfg.tz.key}). Вопрос: {job.question}"}]
+                  {"role": "user", "content": f"Сейчас {now} ({self.cfg.tz.key}). Вопрос: {job.question}"
+                                              + (f"\n{style}" if style else "")}]
         web = await self._complete_with_progress(job.msg, prompt, llm, timeout=self._timeout(task))
         if routed is None:
             return web
@@ -701,10 +873,11 @@ class Answerer:
                 claim = await self._claim_of(conn, parent["chat_id"], parent["trigger_msg_id"])
                 question = f"Утверждение из чата: «{claim or '(сообщение недоступно)'}»\nВопрос участника: {question}"
             history[:0] = [{"role": "user", "content": question},
-                           {"role": "assistant", "content": parent["answer"] or ""}]
+                           {"role": "assistant", "content": parent["answer"] or "(ответ удалён)"}]
+            job.quoted |= set(parent["quoted_user_ids"] or [])     # a follow-up may repeat the quotes
             parent = await conn.fetchrow(
-                "SELECT id, chat_id, trigger_msg_id, question, answer, scenario, parent_id FROM bot_requests "
-                "WHERE id = $1", parent["parent_id"]) if parent["parent_id"] else None
+                "SELECT id, chat_id, trigger_msg_id, question, answer, scenario, parent_id, quoted_user_ids "
+                "FROM bot_requests WHERE id = $1", parent["parent_id"]) if parent["parent_id"] else None
         return history
 
     async def _complete_with_progress(self, msg: dict, prompt: list[dict], llm: LLM | None = None,
@@ -714,7 +887,7 @@ class Answerer:
         try:
             return await asyncio.wait_for(asyncio.shield(task), min(self.cfg.progress_after_s, total))
         except asyncio.TimeoutError:
-            note = await self._reply(msg, prompts.STILL_THINKING, save=False)
+            note = await self._say(msg, prompts.STILL_THINKING, save=False)
             try:
                 return await asyncio.wait_for(task, max(total - self.cfg.progress_after_s, 0.01))
             finally:
@@ -723,6 +896,15 @@ class Answerer:
                         await self.bot.delete_message(msg["chat"]["id"], note.message_id)
                     except TelegramAPIError:
                         pass
+
+    async def _style(self, conn, job: Job) -> str:
+        """How long the asker usually writes here, as one line for the prompt: answers match it.
+        Only for free questions: summaries, catch-ups, theses and searches keep their own format.
+        Only a length, never chat text, so the web profiles may get it too."""
+        if job.scenario not in ("other", "web"):
+            return ""
+        ids = await context.chat_lineage(conn, job.msg["chat"]["id"])
+        return context.style_hint(await context.typical_length(conn, ids, job.msg["from"]["id"]), job.question)
 
     def _timeout(self, task: str) -> float:
         """Bigger models and several web searches take longer."""
@@ -737,6 +919,11 @@ class Answerer:
         who = context.author({"first_name": msg["from"].get("first_name"), "last_name": msg["from"].get("last_name"),
                               "username": msg["from"].get("username")})
 
+        def show(rows, title: str) -> str:
+            """Rendered for the model, and remembered: these ids may be referred to."""
+            job.seen.update({r["message_id"]: r["user_id"] for r in rows})
+            return context.render(rows, tz, title=title)
+
         reply = msg.get("reply_to_message") or {}
         target = reply.get("message_id")
         if target and (msg.get("is_topic_message") and target == msg.get("message_thread_id")):
@@ -745,40 +932,42 @@ class Answerer:
             chain = await context.reply_chain(conn, chat_id, target)
             below = await context.replies_to(conn, chat_id, target)
             blocks.append(f"Запрос — ответ на сообщение #{target}; оно и его ветка:")
-            blocks.append(context.render(chain + [r for r in below if r["message_id"] != msg["message_id"]],
-                                         tz, title="ветка"))
+            blocks.append(show(chain + [r for r in below if r["message_id"] != msg["message_id"]], "ветка"))
+            if _replied_author(msg) is not None:    # the answer is about their message: theses, who is right
+                job.quoted.add(_replied_author(msg))
 
         for user in await context.mentioned_users(conn, msg, self.me.username):
             rows = await context.user_messages(conn, ids, thread, user["user_id"])
-            blocks.append(context.render(rows, tz, title=f"сообщения {context.author(user)} за сутки"))
+            blocks.append(show(rows, f"сообщения {context.author(user)} за сутки"))
 
         if job.since is not None:
             rows = await context.period_messages(conn, ids, thread, job.since, limit=500)
-            blocks.append(context.render([r for r in rows if r["message_id"] != msg["message_id"]], tz,
-                                         title="сообщения за период"))
+            blocks.append(show([r for r in rows if r["message_id"] != msg["message_id"]], "сообщения за период"))
             if job.scenario == "catchup":
                 rows = await context.addressed_to(conn, ids, thread, msg["from"]["id"], msg["from"].get("username"),
                                                   job.since)
-                blocks.append(context.render(rows, tz, title=f"ответы и упоминания для {who}"))
+                blocks.append(show(rows, f"ответы и упоминания для {who}"))
         else:
             rows = await context.recent(conn, ids, thread)
-            blocks.append(context.render([r for r in rows if r["message_id"] != msg["message_id"]], tz,
-                                         title="последние сообщения чата"))
+            blocks.append(show([r for r in rows if r["message_id"] != msg["message_id"]], "последние сообщения чата"))
 
         history: list[dict] = []
         depth = 0
         while parent and depth < 3:
             history[:0] = [{"role": "user", "content": parent["question"] or "(вопрос удалён)"},
-                           {"role": "assistant", "content": parent["answer"] or ""}]
-            parent = await conn.fetchrow("SELECT id, question, answer, scenario, parent_id FROM bot_requests "
-                                         "WHERE id = $1", parent["parent_id"]) if parent["parent_id"] else None
+                           {"role": "assistant", "content": parent["answer"] or "(ответ удалён)"}]
+            job.quoted |= set(parent["quoted_user_ids"] or [])     # a follow-up may repeat the quotes
+            parent = await conn.fetchrow("SELECT id, question, answer, scenario, parent_id, quoted_user_ids "
+                                         "FROM bot_requests WHERE id = $1",
+                                         parent["parent_id"]) if parent["parent_id"] else None
             depth += 1
 
         title = msg["chat"].get("title") or ""
         now = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
         question = job.question or ("Оцени тезисы в сообщении, на которое ответили." if target else "Что скажешь?")
+        style = await self._style(conn, job)
         user = (f"Чат «{title}», сейчас {now} ({tz.key}). Запрос от {who}: {question}\n"
-                f"Сценарий: {job.scenario}\n\n" + "\n\n".join(blocks))
+                + (f"{style}\n" if style else "") + f"Сценарий: {job.scenario}\n\n" + "\n\n".join(blocks))
         system = prompts.SYSTEM.format(ticket=ticket, web_marker=prompts.WEB_MARKER)
         return [{"role": "system", "content": system}, *history, {"role": "user", "content": user}]
 
@@ -846,11 +1035,15 @@ class Answerer:
         text = prompts.DIGEST_HEADER.format(date=daily.day_name(yesterday)) + "\n\n" + completion.text
         # Always one message, cut if the model overran its length limit: a post is then either
         # delivered whole or retried whole, never left half-sent.
-        parts = split_text(text, TELEGRAM_LIMIT - 1)
-        sent = await self._post(chat_id, parts[0] + ("…" if len(parts) > 1 else ""))
-        async with self.pool.acquire() as conn:
-            await self._log_scheduled(conn, chat_id, "digest", completion, [sent], started,
-                                      status="ok" if sent else "error")
+        refs, authors = await self._refs(chat_id, completion.text, {r["message_id"]: r["user_id"] for r in rows})
+        parts = markup.render(text, refs, chat_id, TELEGRAM_LIMIT - 1)
+        first = parts[0] + ("…" if len(parts) > 1 else "")
+        sent = await self._post(chat_id, first, html=True, plain=markup.to_plain(first))
+        async with self.pool.acquire() as conn, conn.transaction():
+            quoted = _quoted(refs, authors)
+            rid = await self._log_scheduled(conn, chat_id, "digest", completion, [sent], started,
+                                            status="ok" if sent else "error", quoted_user_ids=quoted)
+            await self._scrub_if_opted_out(conn, rid, quoted)
         if sent is None:
             return "failed", {}
         return "posted", {"message_id": sent.message_id}
@@ -891,7 +1084,8 @@ class Answerer:
             async with self.pool.acquire() as conn:
                 await self._log_scheduled(conn, chat_id, "wisdom", completion, [], started, status="error")
             return "failed", {"themes": themes}
-        sent = await self._post(chat_id, daily.format_wisdom(wisdom))
+        card = daily.format_wisdom(wisdom)
+        sent = await self._post(chat_id, card, html=True, plain=markup.to_plain(card))
         async with self.pool.acquire() as conn:
             await self._log_scheduled(conn, chat_id, "wisdom", completion, [sent], started,
                                       status="ok" if sent else "error")
@@ -953,42 +1147,63 @@ class Answerer:
             if s.key in stale:
                 line += f" — {prompts.NEWS_STATUS_STALE}"
             lines.append(line)
-        return "\n".join(lines)
+        return "\n".join(lines[:1] + [html.escape(line) for line in lines[1:]])
 
     async def _log_scheduled(self, conn, chat_id: int, scenario: str, completion: Completion,
-                             sent: list[Message | None], started: float, status: str = "ok") -> None:
+                             sent: list[Message | None], started: float, status: str = "ok",
+                             quoted_user_ids: list[int] | None = None) -> int:
         """Scheduled posts have no asker; their tokens still count toward the daily limit."""
-        await conn.execute(
+        return await conn.fetchval(
             """INSERT INTO bot_requests (chat_id, scenario, answer, model, input_tokens, output_tokens,
-                                         latency_ms, status, answer_msg_ids, profile)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)""",
+                                         latency_ms, status, answer_msg_ids, profile, quoted_user_ids)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id""",
             chat_id, scenario, completion.text, completion.model, completion.input_tokens, completion.output_tokens,
             int((time.monotonic() - started) * 1000), status, [m.message_id for m in sent if m is not None],
-            completion.profile)
+            completion.profile, quoted_user_ids)
 
     # ---- Telegram side ----
 
     async def _reply(self, msg: dict, text: str, *, save: bool = True, html: bool = False,
-                     preview_url: str | None = None, keyboard: InlineKeyboardMarkup | None = None) -> Message | None:
+                     preview_url: str | None = None, keyboard: InlineKeyboardMarkup | None = None,
+                     plain: str | None = None) -> Message | None:
         return await self._send(msg["chat"]["id"], text, reply_to=msg["message_id"], save=save, html=html,
-                                preview_url=preview_url, keyboard=keyboard)
+                                preview_url=preview_url, keyboard=keyboard, plain=plain)
 
-    async def _post(self, chat_id: int, text: str) -> Message | None:
+    async def _say(self, msg: dict, text: str, *, save: bool = True) -> Message | None:
+        """One of the bot's own texts (prompts): Telegram HTML, plain text if Telegram refuses it."""
+        return await self._reply(msg, text, save=save, html=True, plain=markup.to_plain(text))
+
+    async def _post(self, chat_id: int, text: str, *, html: bool = False, plain: str | None = None) -> Message | None:
         """A message of the bot's own, not a reply (scheduled posts)."""
-        return await self._send(chat_id, text)
+        return await self._send(chat_id, text, html=html, plain=plain)
 
     async def _send(self, chat_id: int, text: str, *, reply_to: int | None = None, save: bool = True,
                     html: bool = False, preview_url: str | None = None,
-                    keyboard: InlineKeyboardMarkup | None = None) -> Message | None:
+                    keyboard: InlineKeyboardMarkup | None = None, plain: str | None = None) -> Message | None:
+        """plain: the same text without formatting, sent if Telegram refuses the HTML."""
         preview = (LinkPreviewOptions(url=preview_url, prefer_large_media=True, show_above_text=True) if preview_url
                    else LinkPreviewOptions(is_disabled=True))
-        try:
-            sent = await self.bot.send_message(
-                chat_id, text,
+
+        async def send(body: str, formatted: bool) -> Message:
+            return await self.bot.send_message(
+                chat_id, body,
                 reply_parameters=(ReplyParameters(message_id=reply_to, allow_sending_without_reply=True)
                                   if reply_to is not None else None),
-                link_preview_options=preview, parse_mode="HTML" if html else None, reply_markup=keyboard,
+                link_preview_options=preview, parse_mode="HTML" if formatted else None, reply_markup=keyboard,
             )
+
+        try:
+            sent = await send(text, html)
+        except TelegramBadRequest as e:
+            if not (html and plain):
+                log.warning("send failed", extra={"chat_id": chat_id, "error": type(e).__name__})
+                return None
+            log.warning("formatting refused, sending plain text", extra={"chat_id": chat_id})
+            try:
+                sent = await send(plain, False)
+            except TelegramAPIError as e2:
+                log.warning("send failed", extra={"chat_id": chat_id, "error": type(e2).__name__})
+                return None
         except TelegramAPIError as e:
             log.warning("send failed", extra={"chat_id": chat_id, "error": type(e).__name__})
             return None
@@ -1020,8 +1235,20 @@ class Answerer:
                     pass
 
 
-def _out(completion: Completion) -> Outgoing:
-    return Outgoing(completion.text or "Мне нечего ответить по этим данным.", completion)
+def _out(completion: Completion, refs: dict[int, markup.Ref] | None = None) -> Outgoing:
+    """A model answer: its Markdown becomes Telegram formatting."""
+    return Outgoing(completion.text or "Мне нечего ответить по этим данным.", completion, markdown=True, refs=refs)
+
+
+_LINKS = re.compile(r"https?://\S+?(?=[.,;:!?)»\"']*(?:\s|$))")      # an address, without its trailing punctuation
+
+
+def _quoted(refs: dict[int, markup.Ref] | None, more: Collection[int] = ()) -> list[int] | None:
+    """People whose words an answer carries (quote-links and the rest): /forget_me removes the
+    answer with their messages."""
+    users = sorted({r.user_id for r in (refs or {}).values() if r.user_id is not None}
+                   | {u for u in more if u is not None})
+    return users or None
 
 
 def _numbered(text: str, n: int) -> list[str | None]:
@@ -1037,6 +1264,12 @@ def _numbered(text: str, n: int) -> list[str | None]:
 def _snippet(text: str | None, limit: int = 60) -> str:
     text = re.sub(r"\s+", " ", text or "").strip() or "без текста"
     return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+def _replied_author(msg: dict) -> int | None:
+    """Who wrote the message the request replies to."""
+    reply = _reply_target(msg)
+    return ((reply or {}).get("from") or {}).get("id")
 
 
 def _reply_target(msg: dict, inv: Invocation | None = None) -> dict | None:

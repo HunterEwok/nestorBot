@@ -7,6 +7,7 @@ search query.
 """
 from __future__ import annotations
 
+import html
 import ipaddress
 import re
 from dataclasses import dataclass
@@ -123,10 +124,14 @@ def wisdom_request(themes: list[str], recent: list, day: date) -> str:
 
 
 def format_wisdom(w: Wisdom) -> str:
-    lines = [prompts.WISDOM_HEADER, "", f"«{w.quote}»", f"— {w.author}", ""]
+    """The post in Telegram HTML: the quote as a quote block, the source as a link that shows its domain."""
+    host = (urlparse(w.source_url).hostname or "").removeprefix("www.")
+    lines = [f"<b>{html.escape(prompts.WISDOM_HEADER)}</b>", "",
+             f"<blockquote>«{html.escape(w.quote)}»\n— <i>{html.escape(w.author)}</i></blockquote>"]
     if w.theme:
-        lines.append(prompts.WISDOM_THEME.format(theme=w.theme))
-    lines.append(f"Источник: {w.source_url}")
+        lines.append(html.escape(prompts.WISDOM_THEME.format(theme=w.theme)))
+    lines.append(f'🔗 <a href="{html.escape(w.source_url, quote=True)}">{html.escape(prompts.WISDOM_SOURCE)}</a>'
+                 f" ({html.escape(host)})")
     return "\n".join(lines)
 
 

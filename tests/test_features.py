@@ -10,7 +10,7 @@ from aiogram.enums import ChatMemberStatus
 from aiogram.exceptions import TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter
 from aiogram.methods import SendMessage
 
-from nestor.bot import prompts
+from nestor.bot import markup, prompts
 from nestor.bot.context import classify
 from nestor.bot.scheduler import Scheduler
 from nestor.mcp import tools
@@ -58,10 +58,18 @@ def test_classify(question, reply, scenario):
 
 # ---- reminders ----
 
+async def test_reminder_texts_are_escaped(make_env):
+    bot, llm, feed = make_env()
+    await feed(update("message", message(1, "нестор, напомни через 2 часа про <b>торт</b> & чай", date=ago())))
+    assert bot.sent[-1]["parse_mode"] == "HTML" and "про &lt;b&gt;торт&lt;/b&gt; &amp; чай." in bot.sent[-1]["text"]
+    await feed(update("message", message(2, "/reminders", date=ago())))
+    assert "&lt;b&gt;торт&lt;/b&gt; &amp; чай" in bot.sent[-1]["text"] and "<b>Твои напоминания" in bot.sent[-1]["text"]
+
+
 async def test_reminder_set_listed_and_sent_once(make_env, conn):
     bot, llm, feed = make_env()
     await feed(update("message", message(1, "нестор, напомни через 2 часа позвонить маме", date=ago())))
-    assert bot.sent[-1]["text"].startswith("Напомню ")
+    assert bot.sent[-1]["text"].startswith("✅ Напомню ")
     assert bot.sent[-1]["text"].endswith(": позвонить маме. Отменить: /unremind "
                                          + str(await conn.fetchval("SELECT id FROM reminders")))
     row = await conn.fetchrow("SELECT * FROM reminders")
@@ -78,8 +86,28 @@ async def test_reminder_set_listed_and_sent_once(make_env, conn):
     assert fired["reply_to"] == 1 and fired["parse_mode"] == "HTML"
     assert fired["text"] == '⏰ <a href="tg://user?id=111">User111</a>, напоминаю: позвонить маме'
     assert await answerer.send_due_reminders(row["due_at"] + timedelta(minutes=5)) == 0
-    assert await conn.fetchval("SELECT count(*) FROM messages WHERE user_id = $1 AND text LIKE '⏰%'", BOT_ID) == 1
+    # Reminders repeat the person's own words and /forget_me deletes reminders: the fired one and
+    # the list are not archived, the confirmation is removed with the person's messages.
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE user_id = $1 AND text LIKE '⏰%'", BOT_ID) == 0
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE user_id = $1 AND text LIKE '🗓%'", BOT_ID) == 0
+    assert await conn.fetchval("SELECT quoted_user_ids FROM bot_requests WHERE scenario = 'reminder'") == [111]
+    await feed(update("message", message(3, "/forget_me", date=ago())))
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE user_id = $1 AND text LIKE '✅ Напомню%'",
+                               BOT_ID) == 0
     assert llm.calls == []
+
+
+async def test_a_long_list_of_reminders_comes_in_several_messages(make_env, conn):
+    bot, llm, feed = make_env(rate_limit=20)
+    for i in range(1, 10):
+        await feed(update("message", message(i, f"нестор, напомни завтра в 1{i}:00 про {'х' * 440} {i}", date=ago())))
+    await feed(update("message", message(20, "/reminders", date=ago())))
+    lists = [m["text"] for m in bot.sent
+             if m["text"].startswith(prompts.REMINDERS_LIST_HEADER) or m["text"].startswith("•")]
+    assert len(lists) >= 2 and all(markup.visible_len(t) <= markup.TELEGRAM_LIMIT for t in lists)
+    assert lists[0].startswith(prompts.REMINDERS_LIST_HEADER) and lists[-1].endswith(prompts.REMINDERS_LIST_FOOTER)
+    assert sum(t.count("• #") for t in lists) == 9
+    assert all(m["parse_mode"] == "HTML" for m in bot.sent)
 
 
 async def test_unremind_limits_and_forget_me(make_env, conn):
@@ -110,7 +138,8 @@ async def test_reminder_in_paused_chat_waits_and_comes_late(make_env, conn):
     assert await feed.answerer.send_due_reminders(due + timedelta(hours=2)) == 0
     await feed(update("message", message(3, "/resume", date=ago())))
     assert await feed.answerer.send_due_reminders(due + timedelta(hours=2)) == 1
-    assert "напоминаю про чайник\n(с опозданием: напоминание было на " in bot.sent[-1]["text"]
+    assert "напоминаю про чайник\n(с опозданием: напоминание было назначено " in bot.sent[-1]["text"]
+    assert " на в " not in bot.sent[-1]["text"]
 
 
 async def test_reminder_waits_out_flood_control_and_network_errors(make_env, conn):
@@ -186,7 +215,7 @@ async def test_catchup_with_nothing_new_skips_the_model(make_env):
     bot, llm, feed = make_env()
     await feed(update("message", message(1, "я тут", date=ago(minutes=5))))
     await feed(update("message", message(2, "/catchup", date=ago())))
-    assert llm.calls == [] and bot.sent[-1]["text"].startswith("С твоего последнего сообщения (")
+    assert llm.calls == [] and bot.sent[-1]["text"].startswith("👌 С твоего последнего сообщения (")
 
 
 # ---- fact-check by reply ----
@@ -204,7 +233,8 @@ async def test_factcheck_sends_only_the_replied_message(make_env, conn):
     sent = "\n".join(m["content"] for m in web.calls[0])
     assert "«Земля плоская, это доказано»" in sent and "Вопрос участника: проверь" in sent
     assert "секретный план" not in sent and "User222" not in sent
-    assert await conn.fetchval("SELECT scenario FROM bot_requests") == "factcheck"
+    # The verdict restates their claim: /forget_me of its author removes the verdict too.
+    assert await conn.fetchrow("SELECT scenario, quoted_user_ids FROM bot_requests") == ("factcheck", [222])
 
     # A follow-up stays with the web profile and carries the claim, read back from the archive.
     await feed(update("message", message(4, "а источник посвежее?", reply_to_message=bot_answer(bot.sent[-1]))))
@@ -270,11 +300,24 @@ async def test_stats_names_the_longest_branches(make_env, conn):
     await feed(update("message", message(7, "/stats", date=ago())))
 
     text = bot.sent[-1]["text"]
-    assert text.startswith(prompts.STATS_ACTIVITY)
-    assert text.endswith(f"{prompts.STATS_TOPICS}\n1. Налоги и бюджет — 4 сообщения\nhttps://t.me/c/1000000001/1")
+    assert text.startswith(f"<b>{prompts.STATS_ACTIVITY}</b>")
+    assert text.endswith(f'<b>{prompts.STATS_TOPICS}</b>\n1. <a href="https://t.me/c/1000000001/1">Налоги и бюджет</a>'
+                         " — 4 сообщения")
     naming = llm.calls[0]
     assert naming[0]["content"] == prompts.TOPICS_SYSTEM and "Бюджет пуст" in naming[1]["content"]
     assert await conn.fetchval("SELECT input_tokens FROM bot_requests WHERE scenario = 'stats'") == 1000
+    assert await conn.fetchval("SELECT quoted_user_ids FROM bot_requests WHERE scenario = 'stats'") is None
+
+    # Without a name from the model, a branch is called by its first words: its author's own,
+    # so their /forget_me removes that /stats answer from the archive.
+    llm.answer = ""
+    await feed(update("message", message(8, "/stats", date=ago())))
+    assert "1. <a href=\"https://t.me/c/1000000001/1\">Налоги надо снизить</a>" in bot.sent[-1]["text"]
+    stats_id = bot.sent[-1]["message_id"]
+    assert await conn.fetchval("SELECT quoted_user_ids FROM bot_requests WHERE answer_msg_ids = ARRAY[$1::bigint]",
+                               stats_id) == [222]
+    await feed(update("message", message(9, "/forget_me", uid=222, date=ago())))
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE message_id = $1", stats_id) == 0
 
 
 # ---- /export ----
@@ -396,7 +439,7 @@ async def test_digest_is_switched_on_by_an_admin_and_posted_once(make_env, conn)
     await feed(update("message", message(1, "/digest on", uid=222)))
     assert bot.sent[-1]["text"] == prompts.ADMINS_ONLY
     await feed(update("message", message(2, "/digest on")))
-    assert bot.sent[-1]["text"].startswith("Ежедневный дайджест включён")
+    assert markup.to_plain(bot.sent[-1]["text"]).startswith("☀️ Ежедневный дайджест включён")
     yesterday = int(local(-1, 12).timestamp())
     for i in range(10, 16):
         await feed(update("message", message(i, f"обсуждаем отпуск {i}", uid=200 + i, date=yesterday + i)))
@@ -408,8 +451,8 @@ async def test_digest_is_switched_on_by_an_admin_and_posted_once(make_env, conn)
     await answerer.run_daily_posts(local(0, 9, 30).astimezone(timezone.utc))
     await answerer.drain()
     post = bot.sent[-1]
-    assert post["reply_to"] is None and post["text"].startswith("Дайджест за вчера, ")
-    assert post["text"].endswith("решили ехать в Грецию")
+    assert post["reply_to"] is None and post["text"].startswith("☀️ <b>Дайджест за вчера, ")
+    assert post["text"].endswith("решили ехать в Грецию") and post["parse_mode"] == "HTML"
     assert llm.calls[0][0]["content"] == prompts.DIGEST_SYSTEM and "обсуждаем отпуск 10" in llm.calls[0][1]["content"]
     count = len(bot.sent)
     await answerer.run_daily_posts(local(0, 10).astimezone(timezone.utc))
@@ -441,7 +484,7 @@ async def test_long_digest_is_one_message_and_a_failed_send_is_retried(make_env,
     await answerer.drain()
     assert len(bot.sent) == count + 1
     post = bot.sent[-1]["text"]
-    assert len(post) <= 4096 and post.endswith("…") and post.startswith("Дайджест за вчера, ")
+    assert markup.visible_len(post) <= 4096 and post.endswith("…") and post.startswith("☀️ <b>Дайджест за вчера, ")
     assert await conn.fetchval("SELECT status FROM daily_posts") == "posted"
 
 
@@ -462,8 +505,8 @@ async def test_wisdom_sends_only_themes_to_the_web_model(make_env, conn):
     assert "Темы сегодняшних разговоров: дом, деньги." in to_web
     assert "секретный" not in to_web and "Пети" not in to_web
     post = bot.sent[-1]
-    assert post["reply_to"] is None and post["text"].startswith(prompts.WISDOM_HEADER)
-    assert "«Счастлив тот, кто счастлив у себя дома.»\n— Лев Толстой" in post["text"]
+    assert post["reply_to"] is None and post["text"].startswith(f"<b>{prompts.WISDOM_HEADER}</b>")
+    assert "«Счастлив тот, кто счастлив у себя дома.»\n— <i>Лев Толстой</i>" in post["text"]
     row = await conn.fetchrow("SELECT * FROM daily_posts")
     assert (row["status"], row["themes"], row["author"]) == ("posted", ["дом", "деньги"], "Лев Толстой")
     assert sorted(r["scenario"] for r in await conn.fetch("SELECT scenario FROM bot_requests")) == ["wisdom",
@@ -478,7 +521,7 @@ async def test_wisdom_sends_only_themes_to_the_web_model(make_env, conn):
 
     # A group admin switches it off: nothing is even tried.
     await feed(update("message", message(50, "/wisdom off")))
-    assert bot.sent[-1]["text"].startswith("Мудрость дня выключена")
+    assert markup.to_plain(bot.sent[-1]["text"]).startswith("🦉 Мудрость дня выключена")
     calls = len(smart.calls)
     await answerer.run_daily_posts(local(2, 21, 30).astimezone(timezone.utc))
     await answerer.drain()
@@ -513,3 +556,43 @@ async def test_scheduler_keeps_going_after_a_failing_step():
     with pytest.raises(asyncio.CancelledError):
         await task
     assert calls.count("daily") >= 2 and calls.count("reminders") >= 2
+
+
+async def test_follow_ups_to_a_verdict_or_a_song_go_with_the_quoted_author(make_env, conn):
+    # The web profile answers a follow-up with the claim in its history and may restate it; the
+    # smart profile answers a song follow-up with the song in its history. Both answers carry the
+    # author's words, so /forget_me removes them too, and a scrubbed turn reads as removed.
+    web = FakeLLM("Неверно: https://nasa.example")
+    bot, llm, feed = make_env(web=web)
+    claim = message(2, "Земля плоская, это доказано", uid=222)
+    await feed(update("message", claim))
+    await feed(update("message", message(3, "нестор, проверь", reply_to_message=claim)))
+    verdict = bot.sent[-1]
+    web.answer = "Нет, «Земля плоская, это доказано» ложно: https://nasa.example/2026"
+    await feed(update("message", message(4, "а источник посвежее?", reply_to_message=bot_answer(verdict))))
+    follow = bot.sent[-1]
+    assert "Земля плоская" in follow["text"]
+    rows = await conn.fetch("SELECT scenario, quoted_user_ids FROM bot_requests ORDER BY id")
+    assert [tuple(r) for r in rows] == [("factcheck", [222]), ("web", [222])]
+    await feed(update("message", message(5, "/forget_me", uid=222)))
+    gone = [verdict["message_id"], follow["message_id"]]
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE message_id = ANY($1::bigint[])", gone) == 0
+    assert await conn.fetchval("SELECT count(*) FROM bot_requests WHERE answer IS NOT NULL") == 0
+    # The asker goes on with the conversation: the removed turns are not empty messages.
+    await feed(update("message", message(6, "а ещё?", reply_to_message=bot_answer(follow))))
+    assert [m["content"] for m in web.calls[-1] if m["role"] == "assistant"] == ["(ответ удалён)", "(ответ удалён)"]
+    assert "Земля плоская" not in str(web.calls[-1])
+
+    smart = FakeLLM(SONG)
+    checker = FakeChecker(videos={"BBBBBBBBBBB": "КИНО - Группа крови"}, spotify={SPOTIFY: "Группа крови"})
+    bot, llm, feed = make_env(smart=smart, checker=checker)
+    favourite = message(12, "обожаю «Группа крови» Кино", uid=333)
+    await feed(update("message", favourite))
+    await feed(update("message", message(13, "нестор, включи эту песню", reply_to_message=favourite)))
+    card = bot.sent[-1]
+    await feed(update("message", message(14, "а концертную версию?", reply_to_message=bot_answer(card))))
+    songs = await conn.fetch("SELECT quoted_user_ids FROM bot_requests WHERE scenario = 'music' ORDER BY id")
+    assert [r["quoted_user_ids"] for r in songs] == [[333], [333]]
+    await feed(update("message", message(15, "/forget_me", uid=333)))
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE user_id = $1 AND text LIKE '%Группа крови%'",
+                               BOT_ID) == 0
