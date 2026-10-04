@@ -1,0 +1,32 @@
+[Unit]
+Description=nestor: nightly pg_dump of the archive to the microSD (7 daily + 4 weekly, none older than 35 days)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=nestor-backup
+Group=nestor-backup
+# No password in it: the one of the database role nestor_backup is in the pgpass file.
+EnvironmentFile=/etc/nestor-backup/backup.env
+Environment=PGPASSFILE=/etc/nestor-backup/pgpass
+WorkingDirectory=/
+ExecStart=/opt/nestor/.venv/bin/python -m nestor.backup
+# /var/lib/nestor-backup: dumps/ (0700), status.json (0644, the watchdog reads it), last-error.txt, lock.
+StateDirectory=nestor-backup
+StateDirectoryMode=0711
+UMask=0077
+TimeoutStartSec=2h
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+MemoryMax=300M

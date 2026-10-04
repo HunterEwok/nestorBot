@@ -102,3 +102,56 @@ async def test_bootstrap_into_existing_database_owned_by_someone_else(database):
         admin = await pg.connect(ADMIN_URL)
         await admin.execute("DROP DATABASE IF EXISTS nestor_preexisting")
         await admin.close()
+
+
+BACKUP_DENIED = [
+    "INSERT INTO public.messages (chat_id, message_id, sent_at, raw) VALUES (1, 1, now(), '{}')",
+    "BEGIN READ WRITE; INSERT INTO public.messages (chat_id, message_id, sent_at, raw) VALUES (1, 1, now(), '{}')",
+    "UPDATE public.users SET username = 'x'",
+    "DELETE FROM public.messages",
+    "CREATE TABLE public.evil (x int)",
+    "CREATE TABLE evil (x int)",
+    "CREATE ROLE evil",
+    "TRUNCATE public.messages",
+    "DROP TABLE public.messages",
+    "SELECT nextval('public.bot_requests_id_seq')",
+]
+
+
+@pytest.mark.parametrize("sql", BACKUP_DENIED)
+async def test_backup_role_reads_everything_and_writes_nothing(conn, backup_role, sql):
+    await save(conn, message(1, "секрет", uid=111))
+    await conn.execute("UPDATE users SET opted_out = TRUE WHERE user_id = 111")
+    # Everything a dump needs: the raw JSON and the opted-out names the reader may not see, every table.
+    assert await backup_role.fetchval("SELECT raw->>'text' FROM public.messages") == "секрет"
+    assert await backup_role.fetchval("SELECT opted_out FROM public.users") is True
+    for table in await conn.fetchval("SELECT array_agg(tablename) FROM pg_tables WHERE schemaname = 'public'"):
+        await backup_role.fetchval(f"SELECT count(*) FROM public.{table}")
+    assert await backup_role.fetchval("SELECT last_value FROM public.bot_requests_id_seq") >= 1
+    with pytest.raises(asyncpg.PostgresError) as e:
+        await backup_role.execute(sql)
+    assert isinstance(e.value, (asyncpg.InsufficientPrivilegeError, asyncpg.ReadOnlySQLTransactionError))
+    assert await conn.fetchval("SELECT count(*) FROM messages") == 1          # nothing was written
+
+
+async def test_backup_role_is_read_only_and_a_member_of_nothing(backup_role, conn):
+    assert await backup_role.fetchval("SHOW default_transaction_read_only") == "on"
+    members = await conn.fetch(
+        """SELECT g.rolname FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid
+           JOIN pg_roles u ON u.oid = m.member WHERE u.rolname = 'nestor_backup'""")
+    assert members == []                                                      # not pg_read_all_data: one database only
+    assert await conn.fetchval("SELECT rolconnlimit FROM pg_roles WHERE rolname = 'nestor_backup'") == 3
+
+
+async def test_a_table_created_by_a_later_migration_is_readable_by_backup(conn, backup_role):
+    """The owner creates tables in new migrations; the default privileges give the backup role SELECT on them,
+    so the nightly dump does not start failing the day a migration adds a table."""
+    await conn.execute("CREATE TABLE later_table (id serial PRIMARY KEY, x text)")
+    try:
+        await conn.execute("INSERT INTO later_table (x) VALUES ('новая таблица')")
+        assert await backup_role.fetchval("SELECT x FROM public.later_table") == "новая таблица"
+        assert await backup_role.fetchval("SELECT last_value FROM public.later_table_id_seq") == 1
+        with pytest.raises((asyncpg.InsufficientPrivilegeError, asyncpg.ReadOnlySQLTransactionError)):
+            await backup_role.execute("DELETE FROM public.later_table")
+    finally:
+        await conn.execute("DROP TABLE later_table")

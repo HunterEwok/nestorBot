@@ -1,0 +1,12 @@
+[Unit]
+Description=nestor: backup at 04:30 Moscow time, catch-up at 13:30 if the night failed
+
+[Timer]
+# The run itself decides whether it is due (BACKUP_AT in backup.env must be the first time).
+OnCalendar=*-*-* 04:30:00 Europe/Moscow
+OnCalendar=*-*-* 13:30:00 Europe/Moscow
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
