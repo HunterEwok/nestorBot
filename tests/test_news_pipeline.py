@@ -190,6 +190,62 @@ async def test_one_refusal_among_other_errors_keeps_the_usual_retries(pool, conn
         t += timedelta(minutes=wait)
 
 
+def _arctic_service(pool, http):
+    from nestor.news.adapters import arctic
+    from nestor.news.sources import SOURCES as REGISTRY
+    therapy = next(s for s in REGISTRY if s.key == "reddit_psychedelictherapy")
+
+    async def wanted():
+        return True
+    return therapy, NewsService(pool, (therapy,), triage_llm=None, is_wanted=wanted, tz=TZ, daily_token_limit=10**6,
+                                http_factory=lambda contact: http, adapters={"arctic": arctic.fetch})
+
+
+def _looks(post_id: str, created: int) -> tuple[dict, dict]:
+    """The archive's record of an approved post before and after its second look. In the records of
+    2026-10-04 the second look had the text, score 91 and _meta.was_initially_deleted; the first look is
+    taken to have had "[removed]" and score 1. The second look came at 36 h, once at 48 h."""
+    post = {"id": post_id, "title": "Looking for an integration therapist in Berlin",
+            "subreddit": "PsychedelicTherapy", "is_self": True, "created_utc": created, "removed_by_category": "reddit"}
+    first = {**post, "selftext": "[removed]", "score": 1, "num_comments": 0}
+    second = {**post, "selftext": "Been working through a hard night and want support.", "score": 91,
+              "num_comments": 32, "_meta": {"is_edited": True, "removal_type": "reddit",
+                                            "retrieved_2nd_on": created + 48 * 3600, "was_initially_deleted": True}}
+    return first, second
+
+
+async def test_a_reddit_post_the_archive_has_not_rechecked_waits_a_day(pool, conn):
+    """A post fetched before the archive's second look is not stored; the next day's run asks for it again."""
+    from nestor.news.sources import ARCTIC_SHIFT
+    day1 = NOW - timedelta(hours=24)
+    created = int((day1 - timedelta(hours=40)).timestamp())     # its second look comes 8 h after the day1 run
+    first, second = _looks("1wwtest", created)
+    answers = [{"data": []}, {"data": [first]}, {"data": [second]}]
+    http = FakeHttp([("GET", "^" + re.escape(ARCTIC_SHIFT), lambda call: json.dumps(answers.pop(0)).encode())])
+    therapy, service = _arctic_service(pool, http)
+    await service.collect(day1 - timedelta(hours=24))        # the first run only seeds
+    assert await service.collect(day1) == {therapy.key: "ok"}
+    assert await statuses(conn) == {}                         # dropped as unsettled, not stored
+    assert (await store.states(conn))[therapy.key]["cursor"] == {"until": created}
+    assert await service.collect(NOW) == {therapy.key: "ok"}
+    assert http.calls[-1]["params"]["after"] == created - 1
+    assert await statuses(conn) == {(therapy.key, "1wwtest"): ("new", None)}
+
+
+async def test_an_unsettled_reddit_post_of_the_first_run_stays_history(pool, conn):
+    from nestor.news.sources import ARCTIC_SHIFT
+    created = int((NOW - timedelta(hours=24 + 40)).timestamp())
+    first, second = _looks("1wwseed", created)
+    answers = [{"data": [first]}, {"data": [second]}]
+    http = FakeHttp([("GET", "^" + re.escape(ARCTIC_SHIFT), lambda call: json.dumps(answers.pop(0)).encode())])
+    therapy, service = _arctic_service(pool, http)
+    await service.collect(NOW - timedelta(hours=24))          # the first run: everything it sees is history
+    assert await statuses(conn) == {(therapy.key, "1wwseed"): ("seen", None)}
+    await service.collect(NOW)                                # asked for again, settled now, and deduped
+    assert http.calls[-1]["params"]["after"] == created - 1
+    assert await statuses(conn) == {(therapy.key, "1wwseed"): ("seen", None)}
+
+
 async def test_stale_sources_are_reported(pool, conn):
     adapter = FakeAdapter()
     service = make_service(pool, adapter)

@@ -75,6 +75,33 @@ async def test_verbose_shows_every_entry_with_its_verdict(fake, capsys):
     ]
 
 
+async def test_verbose_shows_the_archive_second_look(fake, capsys, monkeypatch):
+    monkeypatch.setitem(ITEMS, "arctic", [
+        _post("b1", "Integration after a hard trip", score=91, is_self=True, link=None, domain="self.Psychonaut",
+              removed=False, removed_by="reddit", restored=True, rechecked=True),
+        _post("b2", "Retreat spots left", score=12, is_self=True, link=None, domain="self.Psychonaut",
+              removed=True, removed_by="moderator", removed_later=True, rechecked=True),
+        _post("b3", "Psilocybin trial results", score=1, is_self=False, link="https://www.nature.com/articles/x",
+              domain="nature.com", removed=False, rechecked=False, unsettled=True),
+        _post("b4", "Text of the first look", score=30, is_self=True, link=None, domain="self.Psychonaut",
+              removed=True, removed_later=True, rechecked=True),
+    ])
+    assert await cli.check(["reddit_psychonaut"], verbose=True) == 0
+    out = capsys.readouterr().out.splitlines()
+    when = WHEN.astimezone().strftime("%Y-%m-%d %H:%M")
+    assert out[0].endswith("отброшено: removed 2, self_post 1, unsettled 1")
+    assert out[1:5] == [
+        f"    self_post    {when}  Integration after a hard trip  "
+        "[score 91, comments 3; self; removed_by reddit, approved later; domain self.psychonaut]",
+        f"    removed      {when}  Retreat spots left  "
+        "[score 12, comments 3; self; removed_by moderator, removed later; domain self.psychonaut]",
+        f"    unsettled    {when}  Psilocybin trial results  "
+        "[score 1, comments 3; link; not rechecked; domain nature.com]",
+        f"    removed      {when}  Text of the first look  [score 30, comments 3; self; removed later; "
+        "domain self.psychonaut]",
+    ]
+
+
 async def test_unknown_source(fake, capsys):
     assert await cli.check(["nope"], verbose=True) == 2
     assert "Нет таких источников: nope" in capsys.readouterr().out

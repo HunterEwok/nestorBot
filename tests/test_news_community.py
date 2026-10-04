@@ -139,6 +139,7 @@ def test_arctic_link_and_self_posts():
         "link": "https://www.psypost.org/psilocybin-therapy-lasting-benefit-five-year-follow-up/"
                 "?utm_source=reddit&utm_medium=social",
         "domain": "psypost.org", "over_18": False, "stickied": False, "removed": False, "flair": "Research",
+        "rechecked": True,
     }
 
     own = items["1ww2c9x"]
@@ -185,6 +186,128 @@ def test_arctic_removed_flags():
     assert drop_reason(therapy, SRC["reddit_psychedelictherapy"]) == "removed"
 
 
+def _second_look(**kw) -> dict:
+    """A post as the archive keeps it; _meta, when any, comes from the caller."""
+    created = kw.pop("created_utc", BEFORE - 3600)
+    return {"title": "Looking for an integration therapist", "subreddit": "PsychedelicTherapy", "is_self": True,
+            "created_utc": created, "retrieved_on": created and created + 20, "score": 1, "num_comments": 0, **kw}
+
+
+def test_arctic_second_look_of_the_archive():
+    later = BEFORE - 3600 + 36 * 3600
+    body = json.dumps({"data": [
+        # held back by Reddit's filter at first, approved by the moderators: the second look has the text
+        _second_look(id="c1", removed_by_category="reddit", selftext="Been working through a hard night.",
+                     score=91, num_comments=32, _meta={"is_edited": True, "removal_type": "reddit",
+                                                       "retrieved_2nd_on": later, "was_initially_deleted": True}),
+        # the same for a link post: no selftext at all
+        _second_look(id="c2", removed_by_category="reddit", is_self=False, url="https://www.nature.com/articles/x",
+                     selftext="", _meta={"removal_type": "reddit", "retrieved_2nd_on": later,
+                                         "was_initially_deleted": True}),
+        # filtered at both looks
+        _second_look(id="c3", removed_by_category="reddit", selftext="[removed]", _meta={"retrieved_2nd_on": later}),
+        _second_look(id="c4", removed_by_category="deleted", selftext="[removed]", _meta={"retrieved_2nd_on": later}),
+        # inferred, not seen live: removed between the two looks, the first look's text kept
+        _second_look(id="c5", selftext="Retreat spots left, DM me", _meta={"removal_type": "moderator",
+                                                                          "retrieved_2nd_on": later}),
+        _second_look(id="c6", selftext="Text of the first look", _meta={"was_deleted_later": True,  # inferred
+                                                                      "retrieved_2nd_on": later}),
+        # not looked at again yet, or flags the archive never writes
+        _second_look(id="c7", removed_by_category="reddit", selftext="[removed]"),
+        _second_look(id="c8", removed_by_category="reddit", selftext="Some text",
+                     _meta={"was_initially_deleted": True, "removal_type": "reddit"}),
+        _second_look(id="c9", removed_by_category="reddit", selftext="Some text",
+                     _meta={"was_initially_deleted": "true", "retrieved_2nd_on": later}),
+        _second_look(id="d1", removed_by_category="reddit", selftext="[removed]",
+                     _meta={"was_initially_deleted": True, "removal_type": "reddit", "retrieved_2nd_on": later}),
+        _second_look(id="d2", removed_by_category="reddit", selftext="Some text",  # inferred
+                     _meta={"was_initially_deleted": True, "was_deleted_later": True, "retrieved_2nd_on": later}),
+        _second_look(id="d3", selftext="live", _meta="not an object"),
+        # Reddit's longer notices hide the body as well; on the approved path they must not pass for text
+        _second_look(id="d6", removed_by_category="reddit", selftext="[ Removed by Reddit ]",
+                     _meta={"was_initially_deleted": True, "removal_type": "reddit", "retrieved_2nd_on": later}),
+        _second_look(id="d7", removed_by_category="reddit", selftext=" [deleted by user] ",
+                     _meta={"was_initially_deleted": True, "removal_type": "reddit", "retrieved_2nd_on": later}),
+        _second_look(id="d8", selftext="[ Removed by Reddit on account of violating the [content policy]"
+                                       "(/help/contentpolicy). ]"),
+        # the first look's category is shown, not the later removal's
+        _second_look(id="d9", removed_by_category="reddit", selftext="Some text",
+                     _meta={"removal_type": "moderator", "retrieved_2nd_on": later}),
+        _second_look(id="d4", selftext="live", _meta={"retrieved_2nd_on": True}),
+        _second_look(id="d5", selftext="live", _meta={"retrieved_2nd_on": str(later)}),
+    ]}).encode()
+    items = _by_id(arctic.parse_posts(body, "PsychedelicTherapy").items)
+    flags = {k: (i.meta["removed"], i.meta["rechecked"], i.meta.get("removed_by"), i.meta.get("restored"),
+                 i.meta.get("removed_later")) for k, i in items.items()}
+    assert flags == {
+        "c1": (False, True, "reddit", True, None),
+        "c2": (False, True, "reddit", True, None),
+        "c3": (True, True, "reddit", None, None),
+        "c4": (True, True, "deleted", None, None),
+        "c5": (True, True, "moderator", None, True),
+        "c6": (True, True, None, None, True),
+        "c7": (True, False, "reddit", None, None),
+        "c8": (True, False, "reddit", None, None),       # approved, but the second look is not recorded
+        "c9": (True, True, "reddit", None, None),
+        "d1": (True, True, "reddit", None, None),        # "approved" and still no text: never seen, never checked
+        "d2": (True, True, "reddit", None, True),
+        "d3": (False, False, None, None, None),
+        "d6": (True, True, "reddit", None, None),
+        "d7": (True, True, "reddit", None, None),
+        "d8": (True, False, None, None, None),
+        "d9": (True, True, "reddit", None, True),
+        "d4": (False, False, None, None, None),
+        "d5": (False, True, None, None, None),           # numbers in strings are read as elsewhere
+    }
+    assert items["c1"].summary == "Been working through a hard night." and items["c5"].summary.endswith("DM me")
+    assert items["d6"].summary == items["d7"].summary == items["d8"].summary == ""
+    # The approved post goes through the usual filters: it passes where self posts are kept.
+    assert drop_reason(items["c1"], SRC["reddit_psychedelictherapy"]) is None
+    psychonaut = dataclasses.replace(items["c1"], meta={**items["c1"].meta, "subreddit": "Psychonaut"})
+    assert drop_reason(psychonaut, SRC["reddit_psychonaut"]) == "self_post"
+    assert drop_reason(items["c5"], SRC["reddit_psychedelictherapy"]) == "removed"
+
+
+async def test_arctic_unsettled_posts_are_asked_for_again():
+    """A post the archive has not looked at again has the first look's score and removal mark: it is
+    dropped unstored this run and asked for again the next day, when it is taken as it is."""
+    e2_at, e3_at = BEFORE - 4 * 3600, AFTER         # 40 h old (the archive's second look came at 48 h once), 60 h
+    settled = _second_look(id="e1", created_utc=BEFORE - 600, selftext="Settled", score=40,
+                           _meta={"retrieved_2nd_on": BEFORE - 600 + 36 * 3600})
+    undated = _second_look(id="e4", created_utc=None, selftext="No date")   # cannot be placed, never holds the cursor
+    pending = [_second_look(id="e3", created_utc=e3_at, selftext="First look", score=1),      # oldest first
+               _second_look(id="e2", created_utc=e2_at, selftext="[removed]", removed_by_category="reddit")]
+    http = FakeHttp([("GET", ARCTIC_URL, json.dumps({"data": [settled, undated, *pending]}).encode())])
+    source = SRC["reddit_psychedelictherapy"]
+    result = await arctic.fetch(http, source, {"until": AFTER}, NOW)
+    items = _by_id(result.items)
+    assert {k: i.meta.get("unsettled") for k, i in items.items()} == {"e1": None, "e4": None, "e2": True, "e3": True}
+    assert [drop_reason(items[k], source) for k in ("e1", "e2", "e3")] == [None, "unsettled", "unsettled"]
+    assert result.cursor == {"until": e3_at}    # the oldest of them, created right at the window's start
+
+    # The next day the archive still has not looked at e2 and e3: older than the usual window now, they are
+    # taken as they are.
+    tomorrow = NOW + timedelta(hours=24)
+    http = FakeHttp([("GET", ARCTIC_URL, json.dumps({"data": pending}).encode())])
+    result = await arctic.fetch(http, source, result.cursor, tomorrow)
+    assert http.calls[0]["params"]["after"] == e3_at - 1
+    items = _by_id(result.items)
+    assert not any(i.meta.get("unsettled") for i in items.values())
+    assert [drop_reason(items[k], source) for k in ("e2", "e3")] == ["removed", "low_score"]
+    assert result.cursor == {"until": int((tomorrow - timedelta(hours=36)).timestamp())}
+
+
+async def test_arctic_unsettled_posts_and_the_page_cap():
+    # The page cap already keeps the window's start; an unsettled post cannot be older than that.
+    def answer(call):
+        page = json.loads(_page(call["params"]["before"] - 1, 100, step=10))
+        page["data"][0].pop("_meta")
+        return json.dumps(page).encode()
+    result = await arctic.fetch(FakeHttp([("GET", ARCTIC_URL, answer)]), SRC["reddit_dub"], {}, NOW)
+    assert sum(1 for i in result.items if i.meta.get("unsettled")) == arctic.MAX_PAGES
+    assert result.cursor == {"until": AFTER}
+
+
 def test_arctic_fallback_url_and_malformed_posts():
     page = arctic.parse_posts(fixture("arctic_psychonaut.json"), "Psychonaut")
     assert page.posts == 7 and page.oldest == 1790940000  # the oldest post counts even though it is skipped
@@ -229,7 +352,8 @@ def _page(newest: int, count: int, step: int = 60) -> bytes:
     return json.dumps({"data": [
         {"id": f"p{newest - k * step:x}", "title": f"post {newest - k * step}", "subreddit": "dub",
          "created_utc": newest - k * step, "permalink": f"/r/dub/comments/p{newest - k * step:x}/post/",
-         "is_self": False, "url": "https://youtu.be/x", "domain": "youtu.be", "score": 1, "num_comments": 0}
+         "is_self": False, "url": "https://youtu.be/x", "domain": "youtu.be", "score": 1, "num_comments": 0,
+         "_meta": {"retrieved_2nd_on": newest - k * step + 36 * 3600}}
         for k in range(count)]}).encode()
 
 

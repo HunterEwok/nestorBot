@@ -422,6 +422,8 @@ def _curated(item: Item, source: Source, full: str) -> str | None:
 
 
 def _community(item: Item, source: Source, meta: dict[str, Any], full: str) -> str | None:
+    if meta.get("unsettled"):
+        return "unsettled"      # the archive's score and removal state are not final yet; asked for again
     if meta.get("removed"):
         return "removed"
     if meta.get("over_18"):
