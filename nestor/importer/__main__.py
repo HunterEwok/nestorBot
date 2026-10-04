@@ -35,8 +35,12 @@ BATCH = 200
 
 
 async def last_imported_id(conn: asyncpg.Connection, chat_id: int) -> int:
+    """Where to resume: after the last imported message, and after the newest one the nightly purge
+    removed (nestor.retention), so history that already left the archive does not come back."""
     return await conn.fetchval(
-        "SELECT coalesce(max(message_id), 0) FROM messages WHERE chat_id = $1 AND raw ? 'import_source'",
+        """SELECT greatest(
+               (SELECT coalesce(max(message_id), 0) FROM messages WHERE chat_id = $1 AND raw ? 'import_source'),
+               (SELECT coalesce(max(message_id), 0) FROM retention_marks WHERE chat_id = $1))""",
         chat_id,
     )
 

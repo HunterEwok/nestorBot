@@ -10,8 +10,9 @@ import asyncpg
 
 from . import reminders
 
+# stored_at: when the message entered the archive. An answer built on it leaves with it (nestor.retention).
 _COLUMNS = """m.chat_id, m.message_id, m.thread_id, m.is_topic_message, m.user_id, m.sent_at,
-              m.reply_to_id, m.kind, m.text, m.edited_at,
+              m.reply_to_id, m.kind, m.text, m.edited_at, m.stored_at,
               u.first_name, u.last_name, u.username, u.is_bot"""
 _FROM = "FROM messages m LEFT JOIN users u ON u.user_id = m.user_id"
 _VISIBLE = "m.kind <> 'service' AND (u.user_id IS NULL OR NOT u.opted_out)"
@@ -170,6 +171,12 @@ async def messages_by_id(conn, chat_id: int, message_ids: list[int]) -> list[asy
         f"""SELECT {_COLUMNS} {_FROM}
             WHERE m.chat_id = $1 AND m.message_id = ANY($2::bigint[]) AND {_VISIBLE}
             ORDER BY m.sent_at, m.message_id""", chat_id, message_ids))
+
+
+async def stored_at(conn, chat_id: int, message_id: int) -> datetime | None:
+    """When the message entered the archive; None if it is not there."""
+    return await conn.fetchval("SELECT stored_at FROM messages WHERE chat_id = $1 AND message_id = $2",
+                               chat_id, message_id)
 
 
 async def typical_length(conn, chat_ids: list[int], user_id: int, limit: int = 30) -> int | None:

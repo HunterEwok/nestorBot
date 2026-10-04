@@ -16,7 +16,7 @@ import asyncpg
 from . import prompts
 
 DEFAULT_TIME = time(10, 0)          # «напомни завтра» without a time
-MAX_AHEAD = timedelta(days=366)     # the archive keeps 12 months, so do reminders
+MAX_AHEAD = timedelta(days=366)     # year-ahead reminders are kept until they fire, see nestor.retention
 MIN_AHEAD = timedelta(seconds=30)
 
 MONTHS = ("января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября",

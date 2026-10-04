@@ -5,6 +5,7 @@ import pytest
 t = pytest.importorskip("telethon.tl.types")
 
 from nestor.collector.parse import parse_message  # noqa: E402
+from nestor.importer.__main__ import last_imported_id
 from nestor.importer.convert import chat_dict, to_bot_api  # noqa: E402
 
 from .test_store import save  # noqa: E402
@@ -107,3 +108,15 @@ async def test_imported_rows_respect_live_data(conn):
     rows = await conn.fetch("SELECT message_id, text FROM messages ORDER BY message_id")
     assert [(r["message_id"], r["text"]) for r in rows] == [(4, "старое"), (5, "живое")]
     assert await conn.fetchval("SELECT first_name FROM users WHERE user_id = 222") == "Петр"
+
+
+async def test_importer_resumes_after_purged_history(conn):
+    await save(conn, to_bot_api(msg(4, "старое", from_id=t.PeerUser(222)), CHAT, None))
+    assert await last_imported_id(conn, CHAT["id"]) == 4
+    # The nightly purge took everything up to #70, the imported messages with it: a new import
+    # does not bring that history back with a fresh archive date.
+    await conn.execute("DELETE FROM messages")
+    await conn.execute("INSERT INTO retention_marks (chat_id, message_id) VALUES ($1, 70)", CHAT["id"])
+    assert await last_imported_id(conn, CHAT["id"]) == 70
+    await save(conn, to_bot_api(msg(90, "новое", from_id=t.PeerUser(222)), CHAT, None))
+    assert await last_imported_id(conn, CHAT["id"]) == 90

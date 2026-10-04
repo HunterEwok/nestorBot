@@ -26,6 +26,7 @@ from aiogram.exceptions import (TelegramAPIError, TelegramBadRequest, TelegramFo
 from aiogram.types import (BufferedInputFile, InlineKeyboardMarkup, LinkPreviewOptions, Message, ReactionTypeEmoji,
                            ReplyParameters)
 
+from .. import forget, promises
 from ..collector.app import dump
 from . import context, daily, export, markup, music, prompts, reactions, reminders, routing
 from .llm import LLM, Completion
@@ -45,7 +46,7 @@ class AnswerConfig:
     daily_token_limit: int = 250_000    # all chats together; soft: a started answer finishes
     timeout_s: float = 120
     progress_after_s: float = 60
-    retention_months: int = 12
+    retention_months: int = promises.RETENTION_MONTHS
     tz: ZoneInfo = ZoneInfo("Europe/Moscow")
     smart_timeout_s: float = 240        # songs and the wisdom: a bigger model and several web searches
     music_daily_limit: int = 10         # songs per day, all chats together
@@ -72,6 +73,14 @@ class Job:
     think: bool = False                 # «нестор, подумай …»: the bigger model
     seen: dict[int, int | None] = field(default_factory=dict)   # messages shown to the model: id -> author
     quoted: set[int] = field(default_factory=set)   # people whose words the answer carries besides its refs
+    # When the oldest message whose words the answer may carry entered the archive: the answer
+    # leaves the archive with it (bot_requests.oldest_source_at, nestor.retention).
+    sources_at: datetime | None = None
+
+    def saw(self, rows=(), *, at: datetime | None = None) -> None:
+        """The answer may carry the words of these archive rows, or of something that entered the
+        archive at `at` (an earlier turn's own oldest_source_at)."""
+        self.sources_at = _oldest([self.sources_at, at, *(r["stored_at"] for r in rows)])
 
 
 @dataclass
@@ -183,10 +192,11 @@ class Answerer:
         if cmd in ("help", "start"):
             await self._say(msg, prompts.HELP.format(username=self.me.username))
         elif cmd == "privacy":
-            await self._say(msg, prompts.PRIVACY.format(retention=self.cfg.retention_months))
+            await self._say(msg, prompts.PRIVACY.format(retention=promises.RETENTION_MONTHS,
+                                                        backup_weeks=promises.BACKUP_WEEKS))
         elif cmd == "forget_me":
             count = await self.forget_user(user_id)
-            await self._say(msg, prompts.FORGOTTEN.format(count=count), save=False)
+            await self._say(msg, prompts.FORGOTTEN.format(count=count, backup_weeks=promises.BACKUP_WEEKS), save=False)
         elif cmd == "stats":
             self.submit(Job(msg, inv, "stats", "/stats"))
         elif cmd == "summary":
@@ -319,47 +329,13 @@ class Answerer:
     async def forget_user(self, user_id: int) -> int:
         """/forget_me: delete the user's messages and reminders everywhere and stop storing new ones."""
         async with self.pool.acquire() as conn, conn.transaction():
-            await conn.execute(
-                """INSERT INTO users (user_id, opted_out) VALUES ($1, TRUE)
-                   ON CONFLICT (user_id) DO UPDATE SET opted_out = TRUE, updated_at = now()""", user_id)
-            status = await conn.execute("DELETE FROM messages WHERE user_id = $1", user_id)
-            # Quotes of their words inside other people's replies.
-            await conn.execute(
-                """UPDATE messages SET raw = raw - 'quote'
-                   WHERE raw ? 'quote' AND raw->'reply_to_message'->'from'->>'id' = $1::text""", str(user_id))
-            await conn.execute("UPDATE bot_requests SET question = NULL WHERE user_id = $1", user_id)
-            await conn.execute("DELETE FROM reminders WHERE user_id = $1", user_id)
-            await self._scrub_answers(conn, user_id)
-        return int(status.split()[-1])
+            return await forget.forget(conn, user_id, self.me.user_id)
 
     async def _scrub_answers(self, conn, user_id: int, request_id: int | None = None) -> None:
-        """The bot's answers that carried the user's words (quote-links and the rest that
-        bot_requests.quoted_user_ids records): out of the archive, and out of the conversation
-        history that goes back to the model. All of them, or one request's."""
-        for r in await conn.fetch(
-                """SELECT chat_id, answer_msg_ids FROM bot_requests
-                   WHERE $1 = ANY(quoted_user_ids) AND answer_msg_ids IS NOT NULL
-                     AND ($2::bigint IS NULL OR id = $2)""", user_id, request_id):
-            await conn.execute("DELETE FROM messages WHERE chat_id = $1 AND message_id = ANY($2::bigint[]) "
-                               "AND user_id = $3", r["chat_id"], r["answer_msg_ids"], self.me.user_id)
-            await conn.execute(
-                """UPDATE messages SET raw = raw - 'quote'
-                   WHERE chat_id = $1 AND raw ? 'quote'
-                     AND raw->'reply_to_message'->>'message_id' = ANY($2::text[])""",
-                r["chat_id"], [str(i) for i in r["answer_msg_ids"]])
-        await conn.execute("UPDATE bot_requests SET answer = NULL WHERE $1 = ANY(quoted_user_ids) "
-                           "AND ($2::bigint IS NULL OR id = $2)", user_id, request_id)
+        await forget.scrub_answers(conn, user_id, self.me.user_id, request_id)
 
     async def _scrub_if_opted_out(self, conn, request_id: int, quoted: list[int] | None) -> None:
-        """A /forget_me that came while the answer was being written: scrub the row at once.
-        The lock waits for a /forget_me in flight to finish, so neither side misses the other."""
-        if not quoted:
-            return
-        rows = await conn.fetch("SELECT user_id, opted_out FROM users WHERE user_id = ANY($1::bigint[]) FOR SHARE",
-                                quoted)
-        for r in rows:
-            if r["opted_out"]:
-                await self._scrub_answers(conn, r["user_id"], request_id)
+        await forget.scrub_if_opted_out(conn, request_id, quoted, self.me.user_id)
 
     # ---- reminders ----
 
@@ -523,12 +499,14 @@ class Answerer:
         return await conn.fetchval(
             """INSERT INTO bot_requests (chat_id, trigger_msg_id, user_id, thread_id, scenario, question,
                                          answer, model, input_tokens, output_tokens, latency_ms, status,
-                                         answer_msg_ids, parent_id, profile, quoted_user_ids)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING id""",
+                                         answer_msg_ids, parent_id, profile, quoted_user_ids, oldest_source_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+                       least(now(), coalesce($17::timestamptz, now()))) RETURNING id""",
             msg["chat"]["id"], msg["message_id"], msg["from"]["id"], msg.get("message_thread_id"),
             job.scenario, job.question, fields.get("answer"), fields.get("model"),
             fields.get("input_tokens"), fields.get("output_tokens"), fields.get("latency_ms"), status,
             fields.get("answer_msg_ids"), fields.get("parent_id"), fields.get("profile"), fields.get("quoted_user_ids"),
+            fields.get("oldest_source_at"),
         )
 
     async def _answer(self, job: Job) -> None:
@@ -548,6 +526,10 @@ class Answerer:
         try:
             async with self.pool.acquire() as conn:
                 parent = await self._parent(conn, job)
+                # The asker's own words may come back in the answer (a reminder repeats them).
+                job.saw(at=await context.stored_at(conn, msg["chat"]["id"], msg["message_id"]))
+            if parent is not None:      # a follow-up may repeat what the earlier turns carried
+                job.saw(at=parent["oldest_source_at"])
             fields["parent_id"] = parent["id"] if parent else None
             out = await self._produce(job, parent, ticket)
             status = out.status
@@ -568,9 +550,12 @@ class Answerer:
             await self._say(msg, prompts.ERROR)
         finally:
             fields["latency_ms"] = int((time.monotonic() - started) * 1000)
+            fields["oldest_source_at"] = job.sources_at
             async with self.pool.acquire() as conn:
                 await conn.execute("DELETE FROM request_tickets WHERE ticket = $1 OR expires_at < now()", ticket)
                 async with conn.transaction():
+                    if fields.get("quoted_user_ids"):   # it may erase: the lock comes before the insert's row locks
+                        await forget.erase_lock(conn)
                     rid = await self._log(conn, job, status, **fields)
                     await self._scrub_if_opted_out(conn, rid, fields.get("quoted_user_ids"))
             await self._react(msg, None)
@@ -612,8 +597,9 @@ class Answerer:
                                                         timeout=self._timeout(task))
         if prompts.WEB_MARKER in completion.text:
             return _out(await self._answer_from_web(job, completion))
-        refs, authors = await self._refs(job.msg["chat"]["id"], completion.text, job.seen)
+        refs, authors, oldest = await self._refs(job.msg["chat"]["id"], completion.text, job.seen)
         job.quoted |= authors
+        job.saw(at=oldest)
         return _out(completion, refs)
 
     async def _deliver(self, msg: dict, out: Outgoing) -> list[Message | None]:
@@ -631,8 +617,8 @@ class Answerer:
             return [await self._reply(msg, part, html=True, plain=markup.to_plain(part)) for part in parts]
         return [await self._reply(msg, part) for part in split_text(out.text)]
 
-    async def _refs(self, chat_id: int, text: str,
-                    seen: dict[int, int | None] | None = None) -> tuple[dict[int, markup.Ref], set[int]]:
+    async def _refs(self, chat_id: int, text: str, seen: dict[int, int | None] | None = None
+                    ) -> tuple[dict[int, markup.Ref], set[int], datetime | None]:
         """The archive messages an answer refers to ([«…»](#id), t.me/c links, a bare #id), with
         their links, a piece of their text and their author. Deleted messages and authors who used
         /forget_me are not found, so their references stay without a link or quote. In a group
@@ -645,13 +631,17 @@ class Answerer:
         Also returns the authors whose words the answer carries without a usable reference, so
         that /forget_me still removes it: of such ambiguous ids, of messages gone since the prompt
         was built (a /forget_me in flight), and of the people quoted in the bot's own answers it
-        refers to."""
+        refers to.
+
+        And when the oldest of the messages it refers to entered the archive, ambiguous ones
+        included (and for the bot's own answers, their own oldest_source_at): the answer leaves the
+        archive with them."""
         ids = markup.ref_ids(text, chat_id)
         if not ids:
-            return {}, set()
+            return {}, set(), None
         linked = markup.linked_ids(text, chat_id)
         found: dict[int, list] = {}
-        refs, authors = {}, set()
+        refs, authors, times = {}, set(), []
         async with self.pool.acquire() as conn:
             for cid in await context.chat_lineage(conn, chat_id):
                 wanted = ids if cid == chat_id else [i for i in ids if i not in linked]
@@ -659,6 +649,16 @@ class Answerer:
                     found.setdefault(r["message_id"], []).append(r)
             for mid in ids:
                 rows = found.get(mid, [])
+                for r in rows:
+                    times.append(r["stored_at"])
+                    # The bot's answer: whoever it quoted is quoted again, and it carries what that one did.
+                    if r["user_id"] == self.me.user_id:
+                        req = await conn.fetchrow(
+                            "SELECT quoted_user_ids, oldest_source_at FROM bot_requests "
+                            "WHERE chat_id = $1 AND $2 = ANY(answer_msg_ids)", r["chat_id"], mid)
+                        if req is not None:
+                            authors |= set(req["quoted_user_ids"] or [])
+                            times.append(req["oldest_source_at"])
                 if len(rows) == 1:
                     r = rows[0]
                     own = r["user_id"] == self.me.user_id
@@ -666,23 +666,18 @@ class Answerer:
                         context.message_link(r["chat_id"], r["message_id"], r["thread_id"], r["is_topic_message"]),
                         markup.quote(r["text"]), None if own else r["user_id"],
                         bare=seen is None or mid in seen)       # None: no prompt was built (tests, imports)
-                    if own:     # the bot's answer: whoever it quoted is quoted again
-                        authors |= set(await conn.fetchval(
-                            "SELECT quoted_user_ids FROM bot_requests WHERE chat_id = $1 AND $2 = ANY(answer_msg_ids)",
-                            r["chat_id"], mid) or [])
                 elif rows:
                     authors |= {r["user_id"] for r in rows if r["user_id"] is not None}
                 elif (seen or {}).get(mid) is not None:
                     authors.add(seen[mid])
-        return refs, authors - {self.me.user_id}
+        return refs, authors - {self.me.user_id}, _oldest(times)
 
     async def _parent(self, conn, job: Job):
         """The earlier request whose answer this message replies to, if any."""
         if job.inv.replied_to_bot is None:
             return None
         return await conn.fetchrow(
-            "SELECT id, chat_id, trigger_msg_id, question, answer, scenario, parent_id, quoted_user_ids "
-            "FROM bot_requests WHERE chat_id = $1 AND $2 = ANY(answer_msg_ids)",
+            f"SELECT {_TURN} FROM bot_requests WHERE chat_id = $1 AND $2 = ANY(answer_msg_ids)",
             job.msg["chat"]["id"], job.inv.replied_to_bot)
 
     async def _start_catchup(self, job: Job) -> str | None:
@@ -741,6 +736,8 @@ class Answerer:
             return Outgoing(prompts.FACTCHECK_HOW, html=True)
         async with self.pool.acquire() as conn:
             claim, opted_out = await self._replied_text(conn, job.msg)
+            if claim is not None:
+                job.saw(at=await context.stored_at(conn, job.msg["chat"]["id"], _reply_target(job.msg)["message_id"]))
         if claim is None:
             return Outgoing(prompts.REPLIED_OPTED_OUT if opted_out else prompts.FACTCHECK_NO_TEXT, html=True)
         job.quoted.add(_replied_author(job.msg))    # the verdict restates their claim
@@ -769,6 +766,7 @@ class Answerer:
                 if extra is None:
                     return Outgoing(prompts.REPLIED_OPTED_OUT if opted_out else prompts.MUSIC_NO_TEXT, html=True)
                 job.quoted.add(_replied_author(job.msg))
+                job.saw(at=await context.stored_at(conn, job.msg["chat"]["id"], _reply_target(job.msg)["message_id"]))
             history = await self._history(conn, job, ("music",))
         user = f"Запрос: {job.question}"
         if extra:
@@ -806,6 +804,7 @@ class Answerer:
                 rows = await context.messages_by_id(conn, b["chat_id"], [b["root"]] + members[:6] + members[-3:])
                 if rows:
                     branches.append((b, rows))
+                    job.saw(rows)       # the model names the branch from these, its name may be their words
         lines = [f"<b>{html.escape(prompts.STATS_ACTIVITY)}</b>"] + [
             f"{i}. {html.escape(context.author(r))} — {r['n']}" for i, r in enumerate(activity, 1)]
         if not branches:
@@ -877,9 +876,9 @@ class Answerer:
             history[:0] = [{"role": "user", "content": question},
                            {"role": "assistant", "content": parent["answer"] or "(ответ удалён)"}]
             job.quoted |= set(parent["quoted_user_ids"] or [])     # a follow-up may repeat the quotes
-            parent = await conn.fetchrow(
-                "SELECT id, chat_id, trigger_msg_id, question, answer, scenario, parent_id, quoted_user_ids "
-                "FROM bot_requests WHERE id = $1", parent["parent_id"]) if parent["parent_id"] else None
+            job.saw(at=parent["oldest_source_at"])
+            parent = await conn.fetchrow(f"SELECT {_TURN} FROM bot_requests WHERE id = $1",
+                                         parent["parent_id"]) if parent["parent_id"] else None
         return history
 
     async def _complete_with_progress(self, msg: dict, prompt: list[dict], llm: LLM | None = None,
@@ -922,8 +921,10 @@ class Answerer:
                               "username": msg["from"].get("username")})
 
         def show(rows, title: str) -> str:
-            """Rendered for the model, and remembered: these ids may be referred to."""
+            """Rendered for the model, and remembered: these ids may be referred to, these words
+            may be repeated."""
             job.seen.update({r["message_id"]: r["user_id"] for r in rows})
+            job.saw(rows)
             return context.render(rows, tz, title=title)
 
         reply = msg.get("reply_to_message") or {}
@@ -959,8 +960,8 @@ class Answerer:
             history[:0] = [{"role": "user", "content": parent["question"] or "(вопрос удалён)"},
                            {"role": "assistant", "content": parent["answer"] or "(ответ удалён)"}]
             job.quoted |= set(parent["quoted_user_ids"] or [])     # a follow-up may repeat the quotes
-            parent = await conn.fetchrow("SELECT id, question, answer, scenario, parent_id, quoted_user_ids "
-                                         "FROM bot_requests WHERE id = $1",
+            job.saw(at=parent["oldest_source_at"])
+            parent = await conn.fetchrow(f"SELECT {_TURN} FROM bot_requests WHERE id = $1",
                                          parent["parent_id"]) if parent["parent_id"] else None
             depth += 1
 
@@ -1037,14 +1038,18 @@ class Answerer:
         text = prompts.DIGEST_HEADER.format(date=daily.day_name(yesterday)) + "\n\n" + completion.text
         # Always one message, cut if the model overran its length limit: a post is then either
         # delivered whole or retried whole, never left half-sent.
-        refs, authors = await self._refs(chat_id, completion.text, {r["message_id"]: r["user_id"] for r in rows})
+        refs, authors, oldest = await self._refs(chat_id, completion.text,
+                                                 {r["message_id"]: r["user_id"] for r in rows})
         parts = markup.render(text, refs, chat_id, TELEGRAM_LIMIT - 1)
         first = parts[0] + ("…" if len(parts) > 1 else "")
         sent = await self._post(chat_id, first, html=True, plain=markup.to_plain(first))
         async with self.pool.acquire() as conn, conn.transaction():
             quoted = _quoted(refs, authors)
+            if quoted:      # it may erase: the lock comes before the insert's row locks
+                await forget.erase_lock(conn)
             rid = await self._log_scheduled(conn, chat_id, "digest", completion, [sent], started,
-                                            status="ok" if sent else "error", quoted_user_ids=quoted)
+                                            status="ok" if sent else "error", quoted_user_ids=quoted,
+                                            oldest_source_at=_oldest([oldest, *(r["stored_at"] for r in rows)]))
             await self._scrub_if_opted_out(conn, rid, quoted)
         if sent is None:
             return "failed", {}
@@ -1075,8 +1080,9 @@ class Answerer:
                 log.warning("theme extraction failed", extra={"chat_id": chat_id, "error": type(e).__name__})
             else:
                 themes = daily.parse_themes(found.text)
-                async with self.pool.acquire() as conn:
-                    await self._log_scheduled(conn, chat_id, "wisdom_themes", found, [], started)
+                async with self.pool.acquire() as conn:     # the model's reply read the day's messages
+                    await self._log_scheduled(conn, chat_id, "wisdom_themes", found, [], started,
+                                              oldest_source_at=_oldest(r["stored_at"] for r in rows))
         started = time.monotonic()
         prompt = [{"role": "system", "content": prompts.WISDOM_SYSTEM},
                   {"role": "user", "content": daily.wisdom_request(themes, recent, day)}]
@@ -1153,15 +1159,18 @@ class Answerer:
 
     async def _log_scheduled(self, conn, chat_id: int, scenario: str, completion: Completion,
                              sent: list[Message | None], started: float, status: str = "ok",
-                             quoted_user_ids: list[int] | None = None) -> int:
+                             quoted_user_ids: list[int] | None = None,
+                             oldest_source_at: datetime | None = None) -> int:
         """Scheduled posts have no asker; their tokens still count toward the daily limit."""
         return await conn.fetchval(
             """INSERT INTO bot_requests (chat_id, scenario, answer, model, input_tokens, output_tokens,
-                                         latency_ms, status, answer_msg_ids, profile, quoted_user_ids)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id""",
+                                         latency_ms, status, answer_msg_ids, profile, quoted_user_ids,
+                                         oldest_source_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                       least(now(), coalesce($12::timestamptz, now()))) RETURNING id""",
             chat_id, scenario, completion.text, completion.model, completion.input_tokens, completion.output_tokens,
             int((time.monotonic() - started) * 1000), status, [m.message_id for m in sent if m is not None],
-            completion.profile, quoted_user_ids)
+            completion.profile, quoted_user_ids, oldest_source_at)
 
     # ---- Telegram side ----
 
@@ -1235,6 +1244,15 @@ class Answerer:
                                                     message_thread_id=_topic(msg))
                 except TelegramAPIError:
                     pass
+
+
+# An earlier turn of a conversation, as the follow-ups read it.
+_TURN = "id, chat_id, trigger_msg_id, question, answer, scenario, parent_id, quoted_user_ids, oldest_source_at"
+
+
+def _oldest(times) -> datetime | None:
+    """The earliest of the times that are known."""
+    return min((t for t in times if t is not None), default=None)
 
 
 def _out(completion: Completion, refs: dict[int, markup.Ref] | None = None) -> Outgoing:

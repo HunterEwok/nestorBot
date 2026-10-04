@@ -9,6 +9,7 @@ from aiogram.enums import ChatMemberStatus
 from aiogram.exceptions import TelegramForbiddenError
 from aiogram.types import Message, Update
 
+from nestor import retention
 from nestor.bot import prompts
 from nestor.bot.answerer import AnswerConfig, Answerer
 from nestor.bot.llm import Completion
@@ -582,3 +583,105 @@ async def test_thanks_for_an_answer_with_a_link_is_a_reaction_even_when_the_link
     telegram_view["text"] = "Ты про https://example.com/search?q=налоги?"
     await feed(update("message", message(3, "угу", uid=222, reply_to_message=telegram_view)))
     assert len(llm.calls) == 2
+
+
+# ---- retention: an answer leaves the archive with the oldest message it may carry ----
+
+async def test_an_answer_records_the_oldest_message_it_was_shown(make_env, pool, conn):
+    bot, llm, feed = make_env()
+    await feed(update("message", message(1, "старая мысль Пети", uid=222)))
+    await conn.execute("UPDATE messages SET stored_at = now() - interval '300 days' WHERE message_id = 1")
+    await feed(update("message", message(2, "нестор, что думаешь?", uid=111)))
+    assert "старая мысль Пети" in llm.calls[0][-1]["content"]
+    shown = await conn.fetchval("SELECT stored_at FROM messages WHERE message_id = 1")
+    assert await conn.fetchval("SELECT oldest_source_at FROM bot_requests") == shown
+
+    # The night message 1 leaves, the answer goes with it, though the answer itself is a day old.
+    answer_id = bot.sent[-1]["message_id"]
+    got = await retention.purge(pool, shown + timedelta(seconds=1), pause_s=0)
+    assert {k: got[k] for k in ("answers", "answer_messages", "messages")} == \
+        {"answers": 1, "answer_messages": 1, "messages": 1}
+    req = await conn.fetchrow("SELECT question, answer FROM bot_requests")
+    assert (req["question"], req["answer"]) == ("что думаешь?", None)
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE message_id = ANY($1::bigint[])",
+                               [1, answer_id]) == 0
+
+
+def _telegram_view(sent: dict) -> dict:
+    """The bot's answer as Telegram shows it in a reply."""
+    return {"message_id": sent["message_id"], "date": 1_790_000_000, "chat": {"id": CHAT_ID, "type": "supergroup"},
+            "from": {"id": BOT_ID, "is_bot": True, "first_name": "Нестор"}, "text": sent["text"]}
+
+
+async def test_a_follow_up_carries_the_oldest_source_of_its_conversation(make_env, conn):
+    bot, _, feed = make_env()
+    await feed(update("message", message(1, "нестор, кто прав?")))
+    await conn.execute("UPDATE bot_requests SET oldest_source_at = now() - interval '400 days'")
+    earlier = await conn.fetchval("SELECT oldest_source_at FROM bot_requests")
+    await feed(update("message", message(2, "а подробнее?", reply_to_message=_telegram_view(bot.sent[-1]))))
+    child = await conn.fetchrow("SELECT parent_id, oldest_source_at FROM bot_requests ORDER BY id DESC LIMIT 1")
+    assert child["parent_id"] is not None and child["oldest_source_at"] == earlier
+
+
+async def test_a_reference_to_the_bots_own_answer_carries_what_that_answer_did(make_env, conn):
+    bot, llm, feed = make_env()
+    await feed(update("message", message(1, "нестор, кто что берёт?")))
+    first = bot.sent[-1]
+    await conn.execute("UPDATE bot_requests SET oldest_source_at = now() - interval '400 days'")
+    earlier = await conn.fetchval("SELECT oldest_source_at FROM bot_requests")
+    llm.answer = f"Я уже отвечал: [«Ответ модели»](#{first['message_id']})"
+    await feed(update("message", message(2, "нестор, повтори", uid=333)))
+    assert await conn.fetchval("SELECT oldest_source_at FROM bot_requests ORDER BY id DESC LIMIT 1") == earlier
+
+
+async def test_a_reply_to_a_scrubbed_answer_continues_with_answer_removed(make_env, pool, conn):
+    bot, llm, feed = make_env()
+    await feed(update("message", message(1, "нестор, кто прав?")))
+    first = bot.sent[-1]
+    await conn.execute("UPDATE bot_requests SET oldest_source_at = now() - interval '400 days'")
+    _, cutoff = await retention.db_times(conn)
+    assert (await retention.purge(pool, cutoff, pause_s=0))["answers"] == 1
+    # Telegram still shows the answer; the archive no longer has its words.
+    await feed(update("message", message(2, "а подробнее?", reply_to_message=_telegram_view(first))))
+    assert [(m["role"], m["content"]) for m in llm.calls[1][1:3]] == [("user", "кто прав?"),
+                                                                      ("assistant", "(ответ удалён)")]
+    assert "Ответ модели" not in str(llm.calls[1][1:])
+
+
+async def test_privacy_says_from_when_and_backup_weeks(make_env):
+    bot, _, feed = make_env()
+    await feed(update("message", message(1, "/privacy")))
+    text = bot.sent[-1]["text"]
+    assert "12 месяцев с того дня" in text and "до 5 недель" in text and "{" not in text
+    assert "не дольше суток" not in text     # the model server's history is not pruned yet: no such promise
+
+
+async def test_forget_me_strips_imported_quotes_forwards_and_names(make_env, conn):
+    bot, _, feed = make_env()
+    petya = message(1, "моё личное", uid=222)
+    petya["from"] |= {"last_name": "Петров", "username": "petya"}
+    await feed(update("message", petya))
+    # Вася forwards Петя's message from elsewhere: the row is Вася's, the words are Петя's.
+    forward = message(3, "секрет Пети", uid=111, entities=[{"type": "bold", "offset": 0, "length": 6}],
+                      forward_origin={"type": "user", "date": 1_789_000_000,
+                                      "sender_user": {"id": 222, "is_bot": False, "first_name": "User222",
+                                                      "last_name": "Петров", "username": "petya"}})
+    await feed(update("message", forward))
+    # An imported reply: Telegram's export does not say who wrote the replied message.
+    await conn.execute(
+        "INSERT INTO messages (chat_id, message_id, user_id, sent_at, reply_to_id, text, raw) "
+        "VALUES ($1, 2, 111, now(), 1, 'согласен', $2)", CHAT_ID,
+        {"message_id": 2, "text": "согласен", "reply_to_message": {"message_id": 1},
+         "quote": {"text": "моё личное"}, "import_source": "telegram_import"})
+    await feed(update("message", message(4, "/forget_me", uid=222)))
+    assert bot.sent[-1]["text"].startswith("🧹 Готово: удалил из архива твои сообщения (2)")
+
+    rows = {r["message_id"]: r for r in await conn.fetch("SELECT * FROM messages WHERE message_id IN (2, 3)")}
+    assert "quote" not in rows[2]["raw"] and "личное" not in str(rows[2]["raw"])
+    fwd = rows[3]
+    assert (fwd["user_id"], fwd["text"], fwd["entities"]) == (111, None, None)
+    assert fwd["forward_origin"] == {"type": "user", "sender_user": {"id": 222}}
+    assert fwd["raw"]["forward_origin"] == {"type": "user", "sender_user": {"id": 222}}
+    assert not {"text", "entities"} & set(fwd["raw"]) and "Петров" not in str(fwd["raw"])
+    names = await conn.fetchrow("SELECT username, first_name, last_name, opted_out FROM users WHERE user_id = 222")
+    assert tuple(names) == (None, None, None, True)

@@ -598,3 +598,45 @@ async def test_follow_ups_to_a_verdict_or_a_song_go_with_the_quoted_author(make_
     await feed(update("message", message(15, "/forget_me", uid=333)))
     assert await conn.fetchval("SELECT count(*) FROM messages WHERE user_id = $1 AND text LIKE '%Группа крови%'",
                                BOT_ID) == 0
+
+
+# ---- retention: what an answer carries decides when it leaves ----
+
+async def _aged(conn, message_id: int, days: int):
+    """The message entered the archive `days` ago; returns that time."""
+    return await conn.fetchval(
+        "UPDATE messages SET stored_at = now() - make_interval(days => $3) WHERE chat_id = $1 AND message_id = $2 "
+        "RETURNING stored_at", CHAT_ID, message_id, days)
+
+
+async def test_the_digest_leaves_with_the_oldest_of_yesterdays_messages(make_env, conn):
+    bot, _, feed = make_env(FakeLLM("• отпуск: решили ехать в Грецию"))
+    yesterday = int(local(-1, 12).timestamp())
+    for i in range(10, 16):
+        await feed(update("message", message(i, f"обсуждаем отпуск {i}", uid=200 + i, date=yesterday + i)))
+    oldest = await _aged(conn, 12, 200)         # imported late: its archive time is not its Telegram date
+    await conn.execute("UPDATE chats SET settings = settings || jsonb_build_object('digest', true) WHERE chat_id = $1",
+                       CHAT_ID)
+    await feed.answerer.run_daily_posts(local(0, 9, 30))
+    await feed.answerer.drain()
+    assert bot.sent[-1]["text"].startswith("☀️ <b>Дайджест за вчера, ")
+    assert await conn.fetchval("SELECT oldest_source_at FROM bot_requests WHERE scenario = 'digest'") == oldest
+
+
+async def test_a_verdict_and_a_song_leave_with_the_replied_message(make_env, conn):
+    web = FakeLLM("Неверно: https://nasa.example")
+    bot, _, feed = make_env(web=web)
+    claim = message(1, "Земля плоская, это доказано", uid=222)
+    await feed(update("message", claim))
+    claimed = await _aged(conn, 1, 300)
+    await feed(update("message", message(2, "нестор, проверь", reply_to_message=claim)))
+    assert await conn.fetchval("SELECT oldest_source_at FROM bot_requests WHERE scenario = 'factcheck'") == claimed
+
+    smart = FakeLLM('{"question": "Какую версию: студийную или концертную?"}')
+    bot, _, feed = make_env(smart=smart)
+    favourite = message(3, "обожаю «Хочешь» Земфиры", uid=333)
+    await feed(update("message", favourite))
+    loved = await _aged(conn, 3, 250)
+    await feed(update("message", message(4, "нестор, включи эту песню", reply_to_message=favourite)))
+    assert bot.sent[-1]["text"] == "Какую версию: студийную или концертную?"
+    assert await conn.fetchval("SELECT oldest_source_at FROM bot_requests WHERE scenario = 'music'") == loved

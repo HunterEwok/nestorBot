@@ -4,6 +4,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import time
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 
@@ -53,6 +54,8 @@ class Settings:
     rate_window_min: int = 10
     daily_token_limit: int = 250_000
     timezone: str = "Europe/Moscow"
+    # The nightly purge of what entered the archive more than 12 months ago (nestor.retention), local time.
+    retention_time: time = time(3, 30)
 
 
 _COMMENT = re.compile(r"(?:^|\s)#.*\Z", re.S)
@@ -82,6 +85,15 @@ def _parse_time(name: str, default: str) -> time:
         return time.fromisoformat(value)
     except ValueError:
         raise SystemExit(f"{name} must look like 21:00, got {value!r}") from None
+
+
+def _timezone() -> str:
+    value = _env("TIMEZONE", "Europe/Moscow")
+    try:
+        ZoneInfo(value)
+    except (ZoneInfoNotFoundError, ValueError, OSError):   # unknown name, a path, a directory
+        raise SystemExit(f"TIMEZONE must be an IANA name like Europe/Moscow, got {value!r}") from None
+    return value
 
 
 def _routes() -> dict[str, str]:
@@ -145,7 +157,8 @@ def load_settings() -> Settings:
             rate_limit=_int("RATE_LIMIT_PER_USER", 5),
             rate_window_min=_int("RATE_LIMIT_WINDOW_MIN", 10),
             daily_token_limit=_int("DAILY_TOKEN_LIMIT", 250_000),
-            timezone=_env("TIMEZONE", "Europe/Moscow"),
+            timezone=_timezone(),
+            retention_time=_parse_time("RETENTION_TIME", "03:30"),
         )
     except KeyError as e:
         raise SystemExit(f"missing required environment variable {e.args[0]}") from None

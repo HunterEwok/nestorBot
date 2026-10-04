@@ -67,3 +67,43 @@ async def test_group_to_supergroup_migration(conn):
     assert await conn.fetchval("SELECT migrated_to_chat_id FROM chats WHERE chat_id = $1", old_id) == new_id
     assert await store.allowed_by_migration(conn, new_id, allowed)
     assert not await store.allowed_by_migration(conn, -100999, allowed)
+
+
+async def test_upsert_keeps_opted_out_names_empty(conn):
+    await save(conn, message(1))
+    await conn.execute("UPDATE users SET opted_out = TRUE, username = NULL, first_name = NULL WHERE user_id = 111")
+    # Their own next message, and someone adding them back to the group, carry their name again.
+    again = message(2, "снова я") | {"from": user(111, username="petya")}
+    assert await save(conn, again) is Result.OPTED_OUT
+    added = message(3, None, uid=222, new_chat_members=[user(111, username="petya", last_name="Петров")])
+    assert await save(conn, added) is Result.INSERTED
+    row = await conn.fetchrow("SELECT username, first_name, last_name, opted_out FROM users WHERE user_id = 111")
+    assert tuple(row) == (None, None, None, True)
+
+
+async def test_new_reply_quoting_an_opted_out_author_is_stored_without_quote(conn):
+    await save(conn, message(1, "моё личное", uid=222))
+    await conn.execute("UPDATE users SET opted_out = TRUE WHERE user_id = 222")
+    reply = message(2, "согласен", uid=111, reply_to_message=message(1, "моё личное", uid=222),
+                    quote={"text": "моё личное", "position": 0})
+    assert await save(conn, reply) is Result.INSERTED
+    raw = await conn.fetchval("SELECT raw FROM messages WHERE message_id = 2")
+    assert "quote" not in raw and "личное" not in str(raw) and raw["text"] == "согласен"
+    # A quote of someone who did not opt out stays.
+    await save(conn, message(3, "мой текст", uid=333))
+    await save(conn, message(4, "да", uid=111, reply_to_message=message(3, "мой текст", uid=333),
+                             quote={"text": "мой текст", "position": 0}))
+    assert (await conn.fetchval("SELECT raw FROM messages WHERE message_id = 4"))["quote"]["text"] == "мой текст"
+
+
+async def test_forward_of_an_opted_out_author_is_stored_without_text(conn):
+    await save(conn, message(1, "до", uid=222))
+    await conn.execute("UPDATE users SET opted_out = TRUE WHERE user_id = 222")
+    origin = {"type": "user", "date": 1_700_000_000, "sender_user": user(222, last_name="Петров")}
+    forward = message(2, "секрет Пети", uid=111, forward_origin=origin,
+                      entities=[{"type": "bold", "offset": 0, "length": 6}])
+    assert await save(conn, forward) is Result.INSERTED
+    row = await conn.fetchrow("SELECT user_id, text, entities, forward_origin, raw FROM messages WHERE message_id = 2")
+    assert (row["user_id"], row["text"], row["entities"]) == (111, None, None)
+    assert row["forward_origin"] == row["raw"]["forward_origin"] == {"type": "user", "sender_user": {"id": 222}}
+    assert "секрет" not in str(row["raw"]) and "Петров" not in str(row["raw"])

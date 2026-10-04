@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import logging
 from typing import Any, Awaitable, Callable, TypeVar
+from zoneinfo import ZoneInfo
 
 import asyncpg
 from aiogram import Bot, Dispatcher, Router
@@ -19,6 +20,7 @@ from aiogram.exceptions import TelegramAPIError, TelegramNetworkError, TelegramR
 from aiogram.types import ChatMemberUpdated, Message
 
 from ..config import Settings
+from ..retention import Retention
 from . import store
 from .parse import parse_chat, parse_message
 
@@ -251,19 +253,21 @@ async def run(settings: Settings) -> None:
     bot = Bot(settings.bot_token)
     dp = Dispatcher()
     collector = Collector(settings, pool)
-    if settings.hermes_url:
-        collector.answerer = await make_answerer(settings, bot, pool, collector)
-    else:
-        log.warning("HERMES_URL is not set: archiving only, the bot will not answer")
-    dp.include_router(collector.router())
-    background: list[asyncio.Task] = []
-    if collector.answerer is not None:
-        from ..bot.scheduler import Scheduler
-
-        background.append(asyncio.create_task(Scheduler(collector.answerer).run()))
-        if collector.answerer.news is not None:
-            background.append(asyncio.create_task(collector.answerer.news.run()))
+    # The nightly purge keeps the promise of /privacy whether or not the bot answers.
+    background: list[asyncio.Task] = [asyncio.create_task(
+        Retention(pool, tz=ZoneInfo(settings.timezone), at=settings.retention_time).run())]
     try:
+        if settings.hermes_url:
+            collector.answerer = await make_answerer(settings, bot, pool, collector)
+        else:
+            log.warning("HERMES_URL is not set: archiving only, the bot will not answer")
+        dp.include_router(collector.router())
+        if collector.answerer is not None:
+            from ..bot.scheduler import Scheduler
+
+            background.append(asyncio.create_task(Scheduler(collector.answerer).run()))
+            if collector.answerer.news is not None:
+                background.append(asyncio.create_task(collector.answerer.news.run()))
         await dp.start_polling(bot, handle_as_tasks=False, allowed_updates=ALLOWED_UPDATES)
     finally:
         for task in background:

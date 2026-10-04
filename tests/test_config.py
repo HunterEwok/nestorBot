@@ -6,7 +6,8 @@ import pytest
 from nestor import config
 
 NAMES = ("ALLOWED_CHAT_IDS", "MODEL_ROUTES", "MUSIC_DAILY_LIMIT", "MUSIC_PLAYER_APP", "NEWS_CHAT_IDS", "NEWS_TIME",
-         "NEWS_MAX_TOPICS", "NEWS_CONTACT_EMAIL", "NEWS_TELEGRAM_CHANNELS", "WISDOM_TIME", "DIGEST_TIME", "TIMEZONE")
+         "NEWS_MAX_TOPICS", "NEWS_CONTACT_EMAIL", "NEWS_TELEGRAM_CHANNELS", "WISDOM_TIME", "DIGEST_TIME", "TIMEZONE",
+         "RETENTION_TIME")
 
 
 @pytest.fixture
@@ -45,3 +46,20 @@ def test_defaults_and_bad_values(env):
     env.setenv("MODEL_ROUTES", "theses:web")
     with pytest.raises(SystemExit, match="MODEL_ROUTES"):
         config.load_settings()
+
+
+def test_retention_time_and_timezone_validation(env):
+    assert config.load_settings().retention_time == time(3, 30)
+    env.setenv("RETENTION_TIME", "04:15   # ночная чистка архива")
+    env.setenv("TIMEZONE", "Europe/Tallinn")
+    s = config.load_settings()
+    assert (s.retention_time, s.timezone) == (time(4, 15), "Europe/Tallinn")
+    env.setenv("RETENTION_TIME", "в полчетвёртого")
+    with pytest.raises(SystemExit, match="RETENTION_TIME must look like 21:00"):
+        config.load_settings()
+    env.setenv("RETENTION_TIME", "03:30")
+    # A wrong zone would move every nightly job and every local time; the service does not start.
+    for bad in ("Moscow", "Europe/Atlantis", "../etc/passwd", "МСК"):
+        env.setenv("TIMEZONE", bad)
+        with pytest.raises(SystemExit, match="TIMEZONE must be an IANA name like Europe/Moscow"):
+            config.load_settings()
