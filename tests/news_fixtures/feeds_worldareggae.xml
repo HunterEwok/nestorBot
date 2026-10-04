@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"
+	xmlns:content="http://purl.org/rss/1.0/modules/content/"
+	xmlns:wfw="http://wellformedweb.org/CommentAPI/"
+	xmlns:dc="http://purl.org/dc/elements/1.1/"
+	xmlns:atom="http://www.w3.org/2005/Atom"
+	xmlns:sy="http://purl.org/rss/1.0/modules/syndication/"
+	xmlns:slash="http://purl.org/rss/1.0/modules/slash/"
+	>
+
+<channel>
+	<title>World A Reggae Entertainment</title>
+	<atom:link href="https://www.worldareggae.com/feed" rel="self" type="application/rss+xml" />
+	<link>https://www.worldareggae.com</link>
+	<description>Reggae news, releases and videos</description>
+	<lastBuildDate>Fri, 02 Oct 2026 11:54:16 +0000</lastBuildDate>
+	<language>en-US</language>
+	<item>
+		<title>Perfect Creation &#8211; Micah Shemaiah w/ Rapha Pico</title>
+		<link>https://www.worldareggae.com/releases/new-tracks/perfect-creation-micah-shemaiah/</link>
+		<dc:creator><![CDATA[World A Reggae]]></dc:creator>
+		<pubDate>Fri, 02 Oct 2026 11:54:16 +0000</pubDate>
+				<category><![CDATA[New tracks]]></category>
+		<category><![CDATA[Micah Shemaiah]]></category>
+		<category><![CDATA[perfect creation]]></category>
+		<category><![CDATA[Rapha Pico]]></category>
+		<guid isPermaLink="false">https://www.worldareggae.com/?p=82304</guid>
+
+					<description><![CDATA[<p>Micah Shemaiah teams up with French singjay Rapha Pico on a roots riddim from Irie Ites.</p>]]></description>
+		</item>
+	<item>
+		<title>Mortimer &amp; Lila Ike announce European tour dates</title>
+		<link>https://www.worldareggae.com/news/mortimer-lila-ike-european-tour/</link>
+		<dc:creator><![CDATA[World A Reggae]]></dc:creator>
+		<pubDate>Mon, 28 Sep 2026 13:07:28 +0000</pubDate>
+				<category><![CDATA[News]]></category>
+		<category><![CDATA[Tour]]></category>
+		<guid isPermaLink="false">https://www.worldareggae.com/?p=82211</guid>
+
+					<description><![CDATA[<p>Twelve dates in November, starting in Paris.</p>]]></description>
+		</item>
+	</channel>
+</rss>

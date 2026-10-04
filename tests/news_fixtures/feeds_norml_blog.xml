@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"
+	xmlns:content="http://purl.org/rss/1.0/modules/content/"
+	xmlns:wfw="http://wellformedweb.org/CommentAPI/"
+	xmlns:dc="http://purl.org/dc/elements/1.1/"
+	xmlns:atom="http://www.w3.org/2005/Atom"
+	xmlns:sy="http://purl.org/rss/1.0/modules/syndication/"
+	xmlns:slash="http://purl.org/rss/1.0/modules/slash/"
+	>
+
+<channel>
+	<title>NORML</title>
+	<atom:link href="https://norml.org/feed/" rel="self" type="application/rss+xml" />
+	<link>https://norml.org/</link>
+	<description>Working to reform marijuana laws</description>
+	<lastBuildDate>Tue, 29 Sep 2026 17:25:55 +0000</lastBuildDate>
+	<language>en-US</language>
+	<item>
+		<title>NORML Op-Ed: Vote This November To Keep Marijuana Legal in Massachusetts</title>
+		<link>https://norml.org/blog/2026/09/29/norml-op-ed-vote-this-november-to-keep-marijuana-legal-in-massachusetts/</link>
+		<dc:creator><![CDATA[Paul Armentano, NORML Deputy Director]]></dc:creator>
+		<pubDate>Tue, 29 Sep 2026 17:25:55 +0000</pubDate>
+				<category><![CDATA[Blog]]></category>
+		<category><![CDATA[Elections]]></category>
+		<category><![CDATA[Massachusetts]]></category>
+		<guid isPermaLink="false">https://norml.org/?p=80761</guid>
+
+					<description><![CDATA[<p><img width="730" height="411" src="https://i0.wp.com/norml.org/wp-content/uploads/2026/09/ma-ballot.jpg?fit=730%2C411&amp;ssl=1" class="attachment-large size-large wp-post-image" alt="" style="margin-bottom: 15px;" decoding="async" /></p>Voters in Massachusetts will decide in November whether to repeal the state&#8217;s retail marijuana market. Here is why they should vote no on Question 2&#8230;]]></description>
+		</item>
+	<item>
+		<title>What I Learned From My Summer With NORML</title>
+		<link>https://norml.org/blog/2026/08/28/what-i-learned-from-my-summer-with-norml/</link>
+		<dc:creator><![CDATA[NORML Intern]]></dc:creator>
+		<pubDate>Fri, 28 Aug 2026 15:00:00 +0000</pubDate>
+				<category><![CDATA[Blog]]></category>
+		<guid isPermaLink="false">https://norml.org/?p=80410</guid>
+
+					<description><![CDATA[<p><img width="730" height="411" src="https://i0.wp.com/norml.org/wp-content/uploads/2026/08/intern.jpg?fit=730%2C411&amp;ssl=1" alt="" /></p>Three months of lobby days, data entry and phone banking taught me how reform actually happens.]]></description>
+		</item>
+	</channel>
+</rss>

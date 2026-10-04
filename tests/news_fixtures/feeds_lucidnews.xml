@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"
+	xmlns:content="http://purl.org/rss/1.0/modules/content/"
+	xmlns:wfw="http://wellformedweb.org/CommentAPI/"
+	xmlns:dc="http://purl.org/dc/elements/1.1/"
+	xmlns:atom="http://www.w3.org/2005/Atom"
+	xmlns:sy="http://purl.org/rss/1.0/modules/syndication/"
+	xmlns:slash="http://purl.org/rss/1.0/modules/slash/"
+	>
+
+<channel>
+	<title>Lucid News</title>
+	<atom:link href="https://www.lucid.news/feed/" rel="self" type="application/rss+xml" />
+	<link>https://www.lucid.news</link>
+	<description>Psychedelics, Consciousness Technology, and the Future of Wellness</description>
+	<lastBuildDate>Tue, 22 Sep 2026 23:46:51 +0000</lastBuildDate>
+	<language>en-US</language>
+	<generator>https://wordpress.org/?v=7.0</generator>
+	<item>
+		<title>FDA Holds Historic Public Hearing on Psychedelic Therapies</title>
+		<link>https://www.lucid.news/fda-holds-historic-public-hearing-on-psychedelic-therapies/</link>
+		<dc:creator><![CDATA[Jack Gorsline]]></dc:creator>
+		<pubDate>Tue, 22 Sep 2026 23:46:51 +0000</pubDate>
+				<category><![CDATA[Research]]></category>
+		<category><![CDATA[drug policy]]></category>
+		<category><![CDATA[lsd]]></category>
+		<category><![CDATA[MDMA]]></category>
+		<category><![CDATA[psychedelic research]]></category>
+		<category><![CDATA[psychedelic therapy]]></category>
+		<category><![CDATA[psychedelics]]></category>
+		<guid isPermaLink="false">https://www.lucid.news/?p=11245</guid>
+
+					<description><![CDATA[<p>Researchers, veterans and patients testified for two days as the agency weighed how to regulate psychedelic-assisted therapy.</p>]]></description>
+										<content:encoded><![CDATA[<h2>A first for the agency</h2>
+<p>Researchers, veterans and patients testified for two days as the agency weighed how to regulate psychedelic-assisted therapy.</p>
+<blockquote><p>&#8220;This is the first time the FDA has asked the public about a whole class of drugs,&#8221; one panelist said.</p></blockquote>
+<ul><li>Day one: safety monitoring</li><li>Day two: training of facilitators</li></ul>]]></content:encoded>
+		</item>
+	<item>
+		<title>Psychedelic Policy Briefing: September 2026</title>
+		<link>https://www.lucid.news/psychedelic-policy-briefing-september-2026/</link>
+		<dc:creator><![CDATA[Lucid News Staff]]></dc:creator>
+		<pubDate>Tue, 08 Sep 2026 16:20:00 +0000</pubDate>
+				<category><![CDATA[drug policy]]></category>
+		<guid isPermaLink="false">https://www.lucid.news/?p=11190</guid>
+
+					<description><![CDATA[<p>State bills, ballot measures and court cases to watch this month.</p>]]></description>
+										<content:encoded><![CDATA[<p>State bills, ballot measures and court cases to watch this month.</p>]]></content:encoded>
+		</item>
+	</channel>
+</rss>

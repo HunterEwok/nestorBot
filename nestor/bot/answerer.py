@@ -27,7 +27,7 @@ from aiogram.types import (BufferedInputFile, InlineKeyboardMarkup, LinkPreviewO
                            ReplyParameters)
 
 from ..collector.app import dump
-from . import context, daily, export, music, prompts, reminders
+from . import context, daily, export, music, prompts, reminders, routing
 from .llm import LLM, Completion
 from .triggers import BotIdentity, Invocation, detect
 
@@ -49,11 +49,15 @@ class AnswerConfig:
     tz: ZoneInfo = ZoneInfo("Europe/Tallinn")
     smart_timeout_s: float = 240        # songs and the wisdom: a bigger model and several web searches
     music_daily_limit: int = 10         # songs per day, all chats together
+    music_player_app: str = ""          # short name of the player Mini App in BotFather; empty: none
     max_reminders: int = 20             # pending reminders per person and chat
     allowed_chat_ids: frozenset[int] = frozenset()   # scheduled posts go only to these chats
     wisdom_chat_ids: frozenset[int] = frozenset()    # wisdom of the day on by default; /wisdom on|off overrides
     digest_time: dtime = dtime(9, 0)
     wisdom_time: dtime = dtime(21, 0)
+    news_chat_ids: frozenset[int] = frozenset()      # news digest on by default; /news on|off overrides
+    news_time: dtime = dtime(20, 0)
+    news_max_topics: int = 10
 
 
 @dataclass
@@ -63,6 +67,7 @@ class Job:
     scenario: str
     question: str
     since: datetime | None = None       # /summary period, «что я пропустил»
+    think: bool = False                 # «нестор, подумай …»: the bigger model
 
 
 @dataclass
@@ -99,12 +104,15 @@ SaveOutgoing = Callable[[dict], Awaitable[object]]
 class Answerer:
     def __init__(self, bot: Bot, pool: asyncpg.Pool, llm: LLM, me: BotIdentity,
                  save_outgoing: SaveOutgoing, cfg: AnswerConfig = AnswerConfig(), web_llm: LLM | None = None,
-                 smart_llm: LLM | None = None, checker: music.Checker | None = None):
+                 smart_llm: LLM | None = None, checker: music.Checker | None = None, deep_llm: LLM | None = None,
+                 news_llm: LLM | None = None, routes: dict[str, str] | None = None, news=None):
         self.bot, self.pool, self.llm, self.me, self.cfg = bot, pool, llm, me, cfg
-        # Profiles with web search and no archive tools. They see the asker's own words, plus
-        # the one replied message for «проверь»/«включи» and the wisdom themes, never the archive.
-        self.web_llm = web_llm
-        self.smart_llm = smart_llm      # a bigger model for songs and the wisdom of the day
+        # Which profile does which task (nestor.bot.routing). Profiles with web search have no
+        # archive tools: they see the asker's own words, plus the one replied message for
+        # «проверь»/«включи», the wisdom themes and public news items, never the archive.
+        self.router = routing.Router({"group": llm, "deep": deep_llm, "web": web_llm, "smart": smart_llm,
+                                      "news": news_llm}, routes)
+        self.news = news                # nestor.news.service.NewsService, None without the news digest
         self.checker = checker or music.HttpChecker()
         self.save_outgoing = save_outgoing
         self._queues: dict[int, asyncio.Queue[Callable[[], Awaitable[None]]]] = {}
@@ -124,9 +132,9 @@ class Answerer:
         if inv.kind == "command":
             await self._command(msg, inv)
             return
-        question = inv.text
+        think, question = routing.split_think(inv.text)
         scenario = context.classify(question, reply_target=_reply_target(msg, inv) is not None)
-        self.submit(Job(msg, inv, scenario, question))
+        self.submit(Job(msg, inv, scenario, question, think=think))
 
     async def on_private(self, msg: dict) -> None:
         """Private chats are never archived. Only /export works there (also through the
@@ -191,11 +199,14 @@ class Answerer:
             await self._list_reminders(msg)
         elif cmd == "unremind":
             await self._unremind(msg, inv.args)
-        elif cmd in ("pause", "resume", "bot_word", "digest", "wisdom"):
+        elif cmd in ("pause", "resume", "bot_word", "digest", "wisdom", "news"):
             if not await self._is_admin(msg):
                 await self._reply(msg, prompts.ADMINS_ONLY)
                 return
-            if cmd in ("digest", "wisdom"):
+            if cmd == "news" and inv.args.strip().lower() in ("status", "статус"):
+                await self._reply(msg, await self._news_status())
+                return
+            if cmd in ("digest", "wisdom", "news"):
                 await self._toggle(msg, cmd, inv.args)
                 return
             async with self.pool.acquire() as conn:
@@ -210,7 +221,7 @@ class Answerer:
             await self._reply(msg, prompts.RESUMED if cmd == "resume" else prompts.PAUSED)
 
     async def _toggle(self, msg: dict, key: str, args: str) -> None:
-        """/digest on|off, /wisdom on|off; without an argument shows the current state."""
+        """/digest, /wisdom, /news on|off; without an argument shows the current state."""
         chat_id, arg = msg["chat"]["id"], args.strip().lower()
         async with self.pool.acquire() as conn:
             if arg:
@@ -222,6 +233,10 @@ class Answerer:
             on = bool(settings.get("digest", False))
             text = prompts.DIGEST_STATE.format(state="включён" if on else "выключен",
                                                time=self.cfg.digest_time.strftime("%H:%M"))
+        elif key == "news":
+            on = self._news_on(chat_id, settings)
+            text = prompts.NEWS_STATE.format(state="включена" if on else "выключена",
+                                             time=self.cfg.news_time.strftime("%H:%M"), topics=self.cfg.news_max_topics)
         else:
             on = self._wisdom_on(chat_id, settings)
             text = prompts.WISDOM_STATE.format(state="включена" if on else "выключена",
@@ -231,6 +246,10 @@ class Answerer:
     def _wisdom_on(self, chat_id: int, settings: dict) -> bool:
         value = (settings or {}).get("wisdom")
         return bool(value) if value is not None else chat_id in self.cfg.wisdom_chat_ids
+
+    def _news_on(self, chat_id: int, settings: dict) -> bool:
+        value = (settings or {}).get("news")
+        return bool(value) if value is not None else chat_id in self.cfg.news_chat_ids
 
     async def _is_admin(self, msg: dict) -> bool:
         if msg["from"]["id"] == ANONYMOUS_ADMIN_ID and (msg.get("sender_chat") or {}).get("id") == msg["chat"]["id"]:
@@ -407,12 +426,12 @@ class Answerer:
         return await conn.fetchval(
             """INSERT INTO bot_requests (chat_id, trigger_msg_id, user_id, thread_id, scenario, question,
                                          answer, model, input_tokens, output_tokens, latency_ms, status,
-                                         answer_msg_ids, parent_id)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id""",
+                                         answer_msg_ids, parent_id, profile)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING id""",
             msg["chat"]["id"], msg["message_id"], msg["from"]["id"], msg.get("message_thread_id"),
             job.scenario, job.question, fields.get("answer"), fields.get("model"),
             fields.get("input_tokens"), fields.get("output_tokens"), fields.get("latency_ms"), status,
-            fields.get("answer_msg_ids"), fields.get("parent_id"),
+            fields.get("answer_msg_ids"), fields.get("parent_id"), fields.get("profile"),
         )
 
     async def _answer(self, job: Job) -> None:
@@ -439,7 +458,8 @@ class Answerer:
             fields.update(answer=out.log_text or out.text, answer_msg_ids=[m.message_id for m in sent if m is not None])
             if out.completion is not None:
                 c = out.completion
-                fields.update(model=c.model, input_tokens=c.input_tokens, output_tokens=c.output_tokens)
+                fields.update(model=c.model, input_tokens=c.input_tokens, output_tokens=c.output_tokens,
+                              profile=c.profile)
         except asyncio.TimeoutError:
             status = "timeout"
             await self._reply(msg, prompts.TIMEOUT)
@@ -470,7 +490,8 @@ class Answerer:
             return await self._music(job, parent)
         if scenario == "factcheck":
             return await self._factcheck(job)
-        if self.web_llm is not None and (scenario == "web" or followed in ("web", "factcheck")):
+        web_task = "think_web" if job.think else "web"
+        if self.router.llm(web_task) is not None and (scenario == "web" or followed in ("web", "factcheck")):
             # Plain web question or a follow-up to a web answer: the archive model is not needed.
             return _out(await self._answer_from_web(job, None))
         if scenario == "catchup":
@@ -478,13 +499,16 @@ class Answerer:
             if nothing:
                 return Outgoing(nothing)
 
+        task = "think" if job.think else scenario if scenario in ("theses", "who_is_right") else "answer"
         async with self.pool.acquire() as conn:
             prompt = await self._build_prompt(conn, job, ticket, parent)
+            # The ticket outlives the call: a bigger model has a longer timeout and reads the archive till the end.
             await conn.execute(
                 "INSERT INTO request_tickets (ticket, chat_id, thread_id, expires_at) VALUES ($1, $2, $3, $4)",
                 ticket, job.msg["chat"]["id"], _topic(job.msg),
-                datetime.now(timezone.utc) + timedelta(seconds=self.cfg.timeout_s + 30))
-        completion = await self._complete_with_progress(job.msg, prompt)
+                datetime.now(timezone.utc) + timedelta(seconds=self._timeout(task) + 30))
+        completion = await self._complete_with_progress(job.msg, prompt, self.router.llm(task),
+                                                        timeout=self._timeout(task))
         if prompts.WEB_MARKER in completion.text:
             completion = await self._answer_from_web(job, completion)
         return _out(completion)
@@ -551,7 +575,8 @@ class Answerer:
 
     async def _factcheck(self, job: Job) -> Outgoing:
         """Reply «нестор, проверь» to a message: that one message goes to the web profile."""
-        if self.web_llm is None:
+        llm = self.router.llm("think_web" if job.think else "factcheck")
+        if llm is None:
             return Outgoing(prompts.NO_WEB)
         if _reply_target(job.msg, job.inv) is None:
             return Outgoing(prompts.FACTCHECK_HOW)
@@ -563,11 +588,12 @@ class Answerer:
         user = (f"Сейчас {now} ({self.cfg.tz.key}). Утверждение из чата: «{claim}»\n"
                 f"Вопрос участника: {job.question or 'проверь'}")
         prompt = [{"role": "system", "content": prompts.FACTCHECK_SYSTEM}, {"role": "user", "content": user}]
-        return _out(await self._complete_with_progress(job.msg, prompt, self.web_llm))
+        return _out(await self._complete_with_progress(job.msg, prompt, llm,
+                                                       timeout=self._timeout("think_web" if job.think else "factcheck")))
 
     async def _music(self, job: Job, parent) -> Outgoing:
         """«нестор, включи …»: the smart profile finds the song, music.build_card checks the links."""
-        llm = self.smart_llm or self.web_llm
+        llm = self.router.llm("music")
         if llm is None:
             return Outgoing(prompts.NO_WEB)
         extra = None
@@ -586,13 +612,14 @@ class Answerer:
         if extra:
             user += f"\nПесня из сообщения, на которое ответили: «{extra[:500]}»"
         prompt = [{"role": "system", "content": prompts.MUSIC_SYSTEM}, *history, {"role": "user", "content": user}]
-        completion = await self._complete_with_progress(job.msg, prompt, llm, timeout=self.cfg.smart_timeout_s)
+        completion = await self._complete_with_progress(job.msg, prompt, llm, timeout=self._timeout("music"))
         pick = music.parse(completion.text)
         if pick is None:
             return Outgoing(prompts.MUSIC_NOT_FOUND, completion, log_text=completion.text)
         if isinstance(pick, music.Say):
             return Outgoing(pick.text, completion)
-        card = await music.build_card(pick, self.checker)
+        card = await music.build_card(pick, self.checker,
+                                      player=music.player_link(self.me.username, self.cfg.music_player_app))
         return Outgoing(card.html, completion, html=True, preview_url=card.preview_url, keyboard=card.keyboard,
                         log_text=card.plain)
 
@@ -626,7 +653,8 @@ class Answerer:
                   {"role": "user", "content": "\n\n".join(
                       context.render(rows, tz, title=f"ветка {i}") for i, (_, rows) in enumerate(branches, 1))}]
         try:
-            completion = await self._complete_with_progress(msg, prompt)
+            completion = await self._complete_with_progress(msg, prompt, self.router.llm("topics"),
+                                                            timeout=self._timeout("topics"))
             names = _numbered(completion.text, len(branches))
         except Exception as e:  # noqa: BLE001 - the activity part is still worth sending
             log.warning("topic naming failed", extra={"chat_id": msg["chat"]["id"], "error": type(e).__name__})
@@ -646,20 +674,22 @@ class Answerer:
         """The archive model asked for the internet. The web profile gets the asker's question and
         earlier web turns of this conversation only: no archive text can reach a search engine."""
         job.scenario = "web"
-        if self.web_llm is None or not job.question.strip():
-            text = prompts.NO_WEB if self.web_llm is None else prompts.EMPTY_WEB_QUESTION
-            return Completion(text, *((routed.model, routed.input_tokens, routed.output_tokens) if routed
-                                      else (None, None, None)))
+        task = "think_web" if job.think else "web"
+        llm = self.router.llm(task)
+        if llm is None or not job.question.strip():
+            text = prompts.NO_WEB if llm is None else prompts.EMPTY_WEB_QUESTION
+            return Completion(text, *((routed.model, routed.input_tokens, routed.output_tokens, routed.profile)
+                                      if routed else (None, None, None, None)))
         async with self.pool.acquire() as conn:
             history = await self._history(conn, job, ("web", "factcheck"))
         now = datetime.now(self.cfg.tz).strftime("%Y-%m-%d %H:%M")
         prompt = [{"role": "system", "content": prompts.WEB_SYSTEM}, *history,
                   {"role": "user", "content": f"Сейчас {now} ({self.cfg.tz.key}). Вопрос: {job.question}"}]
-        web = await self._complete_with_progress(job.msg, prompt, self.web_llm)
+        web = await self._complete_with_progress(job.msg, prompt, llm, timeout=self._timeout(task))
         if routed is None:
             return web
         return Completion(web.text, web.model, _add(routed.input_tokens, web.input_tokens),
-                          _add(routed.output_tokens, web.output_tokens))
+                          _add(routed.output_tokens, web.output_tokens), web.profile)
 
     async def _history(self, conn, job: Job, scenarios: tuple[str, ...]) -> list[dict]:
         """Earlier turns of a reply chain, as long as they belong to the given scenarios."""
@@ -693,6 +723,10 @@ class Answerer:
                         await self.bot.delete_message(msg["chat"]["id"], note.message_id)
                     except TelegramAPIError:
                         pass
+
+    def _timeout(self, task: str) -> float:
+        """Bigger models and several web searches take longer."""
+        return self.cfg.smart_timeout_s if self.router.is_big(task) else self.cfg.timeout_s
 
     async def _build_prompt(self, conn, job: Job, ticket: str, parent) -> list[dict]:
         msg, tz = job.msg, self.cfg.tz
@@ -748,7 +782,7 @@ class Answerer:
         system = prompts.SYSTEM.format(ticket=ticket, web_marker=prompts.WEB_MARKER)
         return [{"role": "system", "content": system}, *history, {"role": "user", "content": user}]
 
-    # ---- scheduled posts: the morning digest and the wisdom of the day ----
+    # ---- scheduled posts: the morning digest, the wisdom of the day, the evening news ----
 
     async def run_daily_posts(self, now: datetime | None = None) -> None:
         """Called by the scheduler every tick: queue today's posts that are due and not made yet."""
@@ -764,14 +798,17 @@ class Answerer:
                     due.append("digest")
                 if self._wisdom_on(chat_id, settings) and local.time() >= self.cfg.wisdom_time:
                     due.append("wisdom")
+                if self.news is not None and self._news_on(chat_id, settings) and local.time() >= self.cfg.news_time:
+                    due.append("news")
                 for kind in due:
                     post_id = await daily.claim(conn, chat_id, kind, local.date())
                     if post_id is not None:
                         self._enqueue(chat_id, functools.partial(self._daily_post, chat_id, kind, local.date(), post_id))
 
     async def _daily_post(self, chat_id: int, kind: str, day: date, post_id: int) -> None:
+        make = {"digest": self._digest, "wisdom": self._wisdom, "news": self._news}[kind]
         try:
-            status, fields = await (self._digest(chat_id, day) if kind == "digest" else self._wisdom(chat_id, day))
+            status, fields = await make(chat_id, day)
         except Exception as e:  # noqa: BLE001 - retried by a later tick, see daily.claim
             log.warning("scheduled post failed", extra={"chat_id": chat_id, "kind": kind, "error": type(e).__name__})
             status, fields = "failed", {}
@@ -805,7 +842,7 @@ class Answerer:
         prompt = [{"role": "system", "content": prompts.DIGEST_SYSTEM},
                   {"role": "user", "content": f"Чат «{title}», дайджест за {daily.day_name(yesterday)}.\n\n"
                                               + context.render(rows, tz, title="сообщения за вчера")}]
-        completion = await asyncio.wait_for(self.llm.complete(prompt), self.cfg.timeout_s)
+        completion = await asyncio.wait_for(self.router.llm("digest").complete(prompt), self._timeout("digest"))
         text = prompts.DIGEST_HEADER.format(date=daily.day_name(yesterday)) + "\n\n" + completion.text
         # Always one message, cut if the model overran its length limit: a post is then either
         # delivered whole or retried whole, never left half-sent.
@@ -821,7 +858,7 @@ class Answerer:
     async def _wisdom(self, chat_id: int, day: date) -> tuple[str, dict]:
         """A real quote for today's themes. The archive model picks themes from a fixed list;
         only those words reach the web-capable model, never the chat itself."""
-        smart = self.smart_llm or self.web_llm
+        smart = self.router.llm("wisdom")
         if smart is None or not await self._bot_is_member(chat_id):
             return "skipped", {}
         tz = self.cfg.tz
@@ -838,7 +875,7 @@ class Answerer:
             prompt = [{"role": "system", "content": prompts.THEMES_SYSTEM.format(themes=", ".join(daily.THEMES))},
                       {"role": "user", "content": context.render(rows, tz, title="сообщения за сегодня")}]
             try:
-                found = await asyncio.wait_for(self.llm.complete(prompt), self.cfg.timeout_s)
+                found = await asyncio.wait_for(self.router.llm("topics").complete(prompt), self._timeout("topics"))
             except Exception as e:  # noqa: BLE001 - a quote without themes is still fine
                 log.warning("theme extraction failed", extra={"chat_id": chat_id, "error": type(e).__name__})
             else:
@@ -848,7 +885,7 @@ class Answerer:
         started = time.monotonic()
         prompt = [{"role": "system", "content": prompts.WISDOM_SYSTEM},
                   {"role": "user", "content": daily.wisdom_request(themes, recent, day)}]
-        completion = await asyncio.wait_for(smart.complete(prompt), self.cfg.smart_timeout_s)
+        completion = await asyncio.wait_for(smart.complete(prompt), self._timeout("wisdom"))
         wisdom = daily.parse_wisdom(completion.text, themes)
         if wisdom is None or daily.is_repeat(wisdom, recent):
             async with self.pool.acquire() as conn:
@@ -863,15 +900,71 @@ class Answerer:
         return "posted", {"message_id": sent.message_id, "themes": themes, "quote": wisdom.quote,
                           "author": wisdom.author, "source_url": wisdom.source_url}
 
+    async def _news(self, chat_id: int, day: date) -> tuple[str, dict]:
+        """The evening news digest: written once a day from public sources (nestor.news), the
+        same text for every group that has it on. No chat text is involved."""
+        llm = self.router.llm("news")
+        if self.news is None or llm is None or not await self._bot_is_member(chat_id):
+            return "skipped", {}
+        from ..news.service import NotEnoughNews
+
+        try:
+            text = await self.news.digest(day, llm, max_topics=self.cfg.news_max_topics,
+                                          timeout_s=self._timeout("news"))
+        except NotEnoughNews:
+            # Sources not read yet (first start, or /news on after NEWS_TIME): a later tick tries again.
+            return "waiting", {}
+        if text is None:
+            return "skipped", {}
+        sent = await self._send(chat_id, text, html=True)
+        if sent is None:
+            return "failed", {}
+        return "posted", {"message_id": sent.message_id}
+
+    async def news_wanted(self) -> bool:
+        """Whether any group gets the news digest: until then nothing is fetched."""
+        async with self.pool.acquire() as conn:
+            chats = await conn.fetch(
+                "SELECT chat_id, settings FROM chats WHERE enabled AND migrated_to_chat_id IS NULL "
+                "AND chat_id = ANY($1::bigint[])", list(self.cfg.allowed_chat_ids))
+        return any(self._news_on(c["chat_id"], c["settings"] or {}) for c in chats)
+
+    async def _news_status(self) -> str:
+        """/news status: per source, when it was last read and what came of it over 7 days."""
+        if self.news is None:
+            return prompts.NEWS_STATE.format(state="не настроена", time=self.cfg.news_time.strftime("%H:%M"),
+                                             topics=self.cfg.news_max_topics)
+        from ..news import store as news_store
+
+        now = datetime.now(timezone.utc)
+        async with self.pool.acquire() as conn:
+            states = await news_store.states(conn)
+            counts = await news_store.counts_since(conn, now - timedelta(days=7))
+            stale = set(await self.news.stale(conn, now))
+        lines = [prompts.NEWS_STATUS_HEADER]
+        for s in self.news.sources:
+            st, c = states.get(s.key), counts.get(s.key, {})
+            if st is None or st["last_run_at"] is None:
+                lines.append(f"{s.key}: {prompts.NEWS_STATUS_NEVER}")
+                continue
+            when = (st["last_ok_at"] or st["last_run_at"]).astimezone(self.cfg.tz).strftime("%d.%m %H:%M")
+            new = sum(c.get(k, 0) for k in ("new", "kept", "rejected", "used"))
+            line = f"{s.key}: {st['status']}, {when}, {new} / {c.get('used', 0)} / {c.get('dropped', 0)}"
+            if s.key in stale:
+                line += f" — {prompts.NEWS_STATUS_STALE}"
+            lines.append(line)
+        return "\n".join(lines)
+
     async def _log_scheduled(self, conn, chat_id: int, scenario: str, completion: Completion,
                              sent: list[Message | None], started: float, status: str = "ok") -> None:
         """Scheduled posts have no asker; their tokens still count toward the daily limit."""
         await conn.execute(
             """INSERT INTO bot_requests (chat_id, scenario, answer, model, input_tokens, output_tokens,
-                                         latency_ms, status, answer_msg_ids)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)""",
+                                         latency_ms, status, answer_msg_ids, profile)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)""",
             chat_id, scenario, completion.text, completion.model, completion.input_tokens, completion.output_tokens,
-            int((time.monotonic() - started) * 1000), status, [m.message_id for m in sent if m is not None])
+            int((time.monotonic() - started) * 1000), status, [m.message_id for m in sent if m is not None],
+            completion.profile)
 
     # ---- Telegram side ----
 
@@ -887,7 +980,7 @@ class Answerer:
     async def _send(self, chat_id: int, text: str, *, reply_to: int | None = None, save: bool = True,
                     html: bool = False, preview_url: str | None = None,
                     keyboard: InlineKeyboardMarkup | None = None) -> Message | None:
-        preview = (LinkPreviewOptions(url=preview_url, prefer_large_media=True) if preview_url
+        preview = (LinkPreviewOptions(url=preview_url, prefer_large_media=True, show_above_text=True) if preview_url
                    else LinkPreviewOptions(is_disabled=True))
         try:
             sent = await self.bot.send_message(

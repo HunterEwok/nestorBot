@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:atom="http://www.w3.org/2005/Atom">
+  <channel>
+    <title>Meduza.io</title>
+    <link>https://meduza.io/</link>
+    <description>Meduza — настоящая журналистика</description>
+    <language>ru</language>
+    <atom:link href="https://meduza.io/rss/all" rel="self" type="application/rss+xml"/>
+    <item>
+      <title><![CDATA[В Германии разрешили продажу каннабиса в аптеках по рецепту врача общей практики]]></title>
+      <link>https://meduza.io/news/2026/10/03/v-germanii-razreshili-prodazhu-kannabisa-v-aptekah</link>
+      <guid>https://meduza.io/news/2026/10/03/v-germanii-razreshili-prodazhu-kannabisa-v-aptekah</guid>
+      <pubDate>Sat, 03 Oct 2026 15:27:17 +0300</pubDate>
+      <description><![CDATA[<p>Бундестаг принял поправки к закону о&nbsp;медицинском каннабисе. Теперь рецепт сможет выписать любой врач общей практики, а&nbsp;не&nbsp;только специалист.</p>]]></description>
+      <content:encoded><![CDATA[<p>Бундестаг принял поправки к закону о&nbsp;медицинском каннабисе. Теперь рецепт сможет выписать любой врач общей практики, а&nbsp;не&nbsp;только специалист.</p><p>Закон вступит в силу с&nbsp;1&nbsp;января 2027 года, <a href="https://www.bundestag.de/">сообщает</a> пресс-служба парламента.</p>]]></content:encoded>
+      <enclosure url="https://meduza.io/image/attachments/images/000/123/456/large/cannabis.png" length="0" type="image/png"/>
+    </item>
+    <item>
+      <title><![CDATA[«Европа — самый быстро нагревающийся континент»: доклад Copernicus]]></title>
+      <link>https://meduza.io/feature/2026/10/03/evropa-samyy-bystro-nagrevayuschiysya-kontinent</link>
+      <guid>https://meduza.io/feature/2026/10/03/evropa-samyy-bystro-nagrevayuschiysya-kontinent</guid>
+      <pubDate>Sat, 03 Oct 2026 09:32:05 +0300</pubDate>
+      <description><![CDATA[<p>Европа&nbsp;— самый быстро нагревающийся континент в&nbsp;мире, следует из&nbsp;нового доклада.</p>]]></description>
+      <content:encoded><![CDATA[<p>Европа&nbsp;— самый быстро нагревающийся континент в&nbsp;мире, следует из&nbsp;нового доклада.</p>]]></content:encoded>
+    </item>
+  </channel>
+</rss>

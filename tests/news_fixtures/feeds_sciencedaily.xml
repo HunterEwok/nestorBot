@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+<channel>
+<title>Marijuana News -- ScienceDaily</title>
+<link>https://www.sciencedaily.com/news/mind_brain/marijuana/</link>
+<description>Marijuana research. Read the latest news about the effects of marijuana, including cannabis use and health, medical marijuana and more.</description>
+<language>en-us</language>
+<lastBuildDate>Sat, 03 Oct 2026 09:58:06 EDT</lastBuildDate>
+<ttl>60</ttl>
+<image>
+<title>ScienceDaily</title>
+<url>https://www.sciencedaily.com/images/sd-logo.png</url>
+<link>https://www.sciencedaily.com/news/mind_brain/marijuana/</link>
+</image>
+<atom:link href="https://www.sciencedaily.com/rss/mind_brain/marijuana.xml" rel="self" type="application/rss+xml" />
+<item>
+<title>Cannabis users were twice as likely to commit violence, review finds</title>
+<link>https://www.sciencedaily.com/releases/2026/09/260930020255.htm</link>
+<description>A systematic review of 30 studies found that people who used cannabis were about twice as likely to be violent towards others, with the strongest link among young men and frequent users.</description>
+<pubDate>Wed, 30 Sep 2026 08:49:01 EDT</pubDate>
+<guid isPermaLink="true">https://www.sciencedaily.com/releases/2026/09/260930020255.htm</guid>
+</item>
+<item>
+<title>Frequent cannabis users wake up with their &apos;stress hormone&apos; already elevated</title>
+<link>https://www.sciencedaily.com/releases/2026/08/260808234953.htm</link>
+<description>People who use cannabis daily have higher cortisol levels on waking than non-users, a new study shows.</description>
+<pubDate>Sun, 09 Aug 2026 08:40:58 EDT</pubDate>
+<guid isPermaLink="true">https://www.sciencedaily.com/releases/2026/08/260808234953.htm</guid>
+</item>
+<item>
+<title>Is cannabis safe after 65?</title>
+<link>https://www.sciencedaily.com/releases/2026/02/260205101233.htm</link>
+<description>Older adults are the fastest-growing group of cannabis users, but research on how it interacts with common medications is scarce.</description>
+<pubDate>Thu, 05 Feb 2026 10:12:33 EST</pubDate>
+<guid isPermaLink="true">https://www.sciencedaily.com/releases/2026/02/260205101233.htm</guid>
+</item>
+</channel>
+</rss>

@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"
+	xmlns:content="http://purl.org/rss/1.0/modules/content/"
+	xmlns:wfw="http://wellformedweb.org/CommentAPI/"
+	xmlns:dc="http://purl.org/dc/elements/1.1/"
+	xmlns:atom="http://www.w3.org/2005/Atom"
+	xmlns:sy="http://purl.org/rss/1.0/modules/syndication/"
+	xmlns:slash="http://purl.org/rss/1.0/modules/slash/"
+	>
+
+<channel>
+	<title>Psychedelic Alpha</title>
+	<atom:link href="https://psychedelicalpha.com/feed" rel="self" type="application/rss+xml" />
+	<link>https://psychedelicalpha.com</link>
+	<description>Psychedelic drug development, policy and business</description>
+	<lastBuildDate>Fri, 02 Oct 2026 12:00:18 +0000</lastBuildDate>
+	<language>en-US</language>
+	<generator>https://wordpress.org/?v=7.1.2</generator>
+	<item>
+		<title>Quarterly Psychedelics Briefing: Q3 2026</title>
+		<link>https://psychedelicalpha.com/news/quarterly-psychedelics-briefing-q3-2026/</link>
+		<dc:creator><![CDATA[Evander]]></dc:creator>
+		<pubDate>Fri, 02 Oct 2026 12:00:18 +0000</pubDate>
+				<category><![CDATA[Analysis]]></category>
+		<category><![CDATA[News]]></category>
+		<category><![CDATA[Pα+]]></category>
+		<category><![CDATA[Video]]></category>
+		<guid isPermaLink="false">https://psychedelicalpha.com/?p=11246</guid>
+
+					<description><![CDATA[<p>Our quarterly briefing covers the FDA&#8217;s public hearing, two Phase 3 readouts and the state of psychedelic financing.</p>]]></description>
+										<content:encoded><![CDATA[<p>Our quarterly briefing covers the FDA&#8217;s public hearing, two Phase 3 readouts and the state of psychedelic financing. Subscribers can watch the full video below.</p>]]></content:encoded>
+		</item>
+	<item>
+		<title>Pα+ Psychedelic Bulletin #232: DEA Proposes Scheduling Five Tryptamines; Oregon Program Data</title>
+		<link>https://psychedelicalpha.com/news/psychedelic-bulletin-232/</link>
+		<dc:creator><![CDATA[Josh Hardman]]></dc:creator>
+		<pubDate>Fri, 25 Sep 2026 09:30:00 +0000</pubDate>
+				<category><![CDATA[News]]></category>
+		<guid isPermaLink="false">https://psychedelicalpha.com/?p=11201</guid>
+
+					<description><![CDATA[<p>This week: the DEA&#8217;s tryptamine proposal and new data from Oregon&#8217;s psilocybin services.</p>]]></description>
+		</item>
+	<item>
+		<title>Interview: Building the Evidence Base for Group Psilocybin Therapy</title>
+		<link>https://psychedelicalpha.com/news/interview-group-psilocybin-therapy/</link>
+		<dc:creator><![CDATA[Josh Hardman]]></dc:creator>
+		<pubDate>Thu, 11 Sep 2026 15:45:00 +0000</pubDate>
+				<category><![CDATA[Interview]]></category>
+		<guid isPermaLink="false">https://psychedelicalpha.com/?p=11108</guid>
+
+					<description><![CDATA[<p>We spoke with a trial investigator about running psilocybin sessions in groups.</p>]]></description>
+		</item>
+	</channel>
+</rss>

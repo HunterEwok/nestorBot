@@ -1,10 +1,11 @@
-# Hermes profile `smart` for songs and the wisdom of the day: ~/.hermes/profiles/smart/config.yaml
+# Hermes profile `smart` for songs, the wisdom of the day and the news digest: ~/.hermes/profiles/smart/config.yaml
 # (hermes profile create smart, then copy this file and smart/SOUL.md into it).
 #
 # Same principle as `web`: this profile can search the web, so it must never see the
 # archive. It has no MCP servers; nestor-collector sends it only a song request in the
-# asker's own words (or the one replied message for «включи»), or, once a day, themes from
-# a fixed list of words. Without this profile the collector falls back to `web`.
+# asker's own words (or the one replied message for «включи»), once a day themes from a fixed
+# list of words, and once a day public news items for the digest. Without this profile the
+# collector falls back to `web`.
 # Verify after every Hermes update (deploy/hermes/README.md, "Проверка").
 
 model:

@@ -1,0 +1,282 @@
+<?xml version="1.0" ?>
+<!DOCTYPE PubmedArticleSet PUBLIC "-//NLM//DTD PubMedArticle, 1st January 2025//EN" "https://dtd.nlm.nih.gov/ncbi/pubmed/out/pubmed_250101.dtd">
+<PubmedArticleSet>
+<PubmedArticle>
+    <MedlineCitation Status="Publisher" Owner="NLM" IndexingMethod="Automated">
+        <PMID Version="1">41234567</PMID>
+        <DateRevised>
+            <Year>2026</Year>
+            <Month>10</Month>
+            <Day>02</Day>
+        </DateRevised>
+        <Article PubModel="Print-Electronic">
+            <Journal>
+                <ISSN IssnType="Electronic">1461-7285</ISSN>
+                <JournalIssue CitedMedium="Internet">
+                    <PubDate>
+                        <Year>2026</Year>
+                        <Month>Oct</Month>
+                        <Day>01</Day>
+                    </PubDate>
+                </JournalIssue>
+                <Title>Journal of psychopharmacology (Oxford, England)</Title>
+                <ISOAbbreviation>J Psychopharmacol</ISOAbbreviation>
+            </Journal>
+            <ArticleTitle>Psilocybin-assisted therapy for <i>treatment-resistant</i> depression: a randomized, placebo-controlled trial.</ArticleTitle>
+            <Pagination>
+                <StartPage>2698811261234567</StartPage>
+                <MedlinePgn>2698811261234567</MedlinePgn>
+            </Pagination>
+            <ELocationID EIdType="doi" ValidYN="Y">10.1177/02698811261234567</ELocationID>
+            <Abstract>
+                <AbstractText Label="BACKGROUND" NlmCategory="BACKGROUND">Treatment-resistant depression (TRD) affects about one third of patients with major depressive disorder.</AbstractText>
+                <AbstractText Label="METHODS" NlmCategory="METHODS">We randomly assigned 120 adults with TRD to psilocybin or an active placebo, each with psychological support. The primary outcome was the change in MADRS score at week&#xa0;6.</AbstractText>
+                <AbstractText Label="RESULTS" NlmCategory="RESULTS">MADRS scores fell more with psilocybin (difference &#x2212;7.4 points; 95% CI &#x2212;10.9 to &#x2212;3.9; <i>p</i> &lt; 0.001). Headache and nausea were the most common adverse events.</AbstractText>
+                <AbstractText Label="CONCLUSIONS" NlmCategory="CONCLUSIONS">Psilocybin with psychological support reduced depressive symptoms over 6 weeks.</AbstractText>
+                <CopyrightInformation>&#xa9; The Author(s) 2026.</CopyrightInformation>
+            </Abstract>
+            <AuthorList CompleteYN="Y">
+                <Author ValidYN="Y">
+                    <LastName>Moreau</LastName>
+                    <ForeName>Claire</ForeName>
+                    <Initials>C</Initials>
+                    <AffiliationInfo>
+                        <Affiliation>Department of Psychiatry, Example University, Lyon, France.</Affiliation>
+                    </AffiliationInfo>
+                </Author>
+            </AuthorList>
+            <Language>eng</Language>
+            <PublicationTypeList>
+                <PublicationType UI="D016428">Journal Article</PublicationType>
+                <PublicationType UI="D016449">Randomized Controlled Trial</PublicationType>
+            </PublicationTypeList>
+            <ArticleDate DateType="Electronic">
+                <Year>2026</Year>
+                <Month>10</Month>
+                <Day>01</Day>
+            </ArticleDate>
+        </Article>
+        <MedlineJournalInfo>
+            <Country>United States</Country>
+            <MedlineTA>J Psychopharmacol</MedlineTA>
+            <NlmUniqueID>8907828</NlmUniqueID>
+            <ISSNLinking>0269-8811</ISSNLinking>
+        </MedlineJournalInfo>
+        <KeywordList Owner="NOTNLM">
+            <Keyword MajorTopicYN="N">psilocybin</Keyword>
+            <Keyword MajorTopicYN="N">treatment-resistant depression</Keyword>
+        </KeywordList>
+    </MedlineCitation>
+    <PubmedData>
+        <History>
+            <PubMedPubDate PubStatus="received">
+                <Year>2026</Year>
+                <Month>4</Month>
+                <Day>12</Day>
+            </PubMedPubDate>
+            <PubMedPubDate PubStatus="accepted">
+                <Year>2026</Year>
+                <Month>8</Month>
+                <Day>30</Day>
+            </PubMedPubDate>
+            <PubMedPubDate PubStatus="medline">
+                <Year>2026</Year>
+                <Month>10</Month>
+                <Day>2</Day>
+                <Hour>6</Hour>
+                <Minute>42</Minute>
+            </PubMedPubDate>
+            <PubMedPubDate PubStatus="pubmed">
+                <Year>2026</Year>
+                <Month>10</Month>
+                <Day>2</Day>
+                <Hour>6</Hour>
+                <Minute>42</Minute>
+            </PubMedPubDate>
+            <PubMedPubDate PubStatus="entrez">
+                <Year>2026</Year>
+                <Month>10</Month>
+                <Day>2</Day>
+                <Hour>3</Hour>
+                <Minute>12</Minute>
+            </PubMedPubDate>
+        </History>
+        <PublicationStatus>aheadofprint</PublicationStatus>
+        <ArticleIdList>
+            <ArticleId IdType="pubmed">41234567</ArticleId>
+            <ArticleId IdType="doi">10.1177/02698811261234567</ArticleId>
+        </ArticleIdList>
+        <ReferenceList>
+            <Reference>
+                <Citation>Carhart-Harris R, et al. Trial of psilocybin versus escitalopram for depression. N Engl J Med. 2021.</Citation>
+                <ArticleIdList>
+                    <ArticleId IdType="doi">10.1056/NEJMoa2032994</ArticleId>
+                    <ArticleId IdType="pubmed">33852780</ArticleId>
+                </ArticleIdList>
+            </Reference>
+        </ReferenceList>
+    </PubmedData>
+</PubmedArticle>
+<PubmedArticle>
+    <MedlineCitation Status="In-Data-Review" Owner="NLM">
+        <PMID Version="1">41234568</PMID>
+        <Article PubModel="Electronic-eCollection">
+            <Journal>
+                <ISSN IssnType="Print">1664-0640</ISSN>
+                <JournalIssue CitedMedium="Print">
+                    <Volume>17</Volume>
+                    <PubDate>
+                        <Year>2026</Year>
+                    </PubDate>
+                </JournalIssue>
+                <Title>Frontiers in psychiatry</Title>
+            </Journal>
+            <ArticleTitle>Cannabidiol and &#x394;<sup>9</sup>-tetrahydrocannabinol in cannabis use disorder:
+                a systematic review</ArticleTitle>
+            <Pagination>
+                <StartPage>1612345</StartPage>
+                <MedlinePgn>1612345</MedlinePgn>
+            </Pagination>
+            <ELocationID EIdType="pii" ValidYN="Y">1612345</ELocationID>
+            <ELocationID EIdType="doi" ValidYN="Y">10.3389/FPSYT.2026.1612345</ELocationID>
+            <Abstract>
+                <AbstractText>We reviewed 24 trials of cannabidiol (CBD) and &#x394;<sup>9</sup>-THC
+                    for cannabis use disorder.   Evidence for withdrawal relief was moderate.</AbstractText>
+            </Abstract>
+            <Language>eng</Language>
+            <PublicationTypeList>
+                <PublicationType UI="D016428">Journal Article</PublicationType>
+                <PublicationType UI="D000078182">Systematic Review</PublicationType>
+            </PublicationTypeList>
+        </Article>
+        <MedlineJournalInfo>
+            <Country>Switzerland</Country>
+            <MedlineTA>Front Psychiatry</MedlineTA>
+            <NlmUniqueID>101545006</NlmUniqueID>
+            <ISSNLinking>1664-0640</ISSNLinking>
+        </MedlineJournalInfo>
+    </MedlineCitation>
+    <PubmedData>
+        <History>
+            <PubMedPubDate PubStatus="pubmed">
+                <Year>2026</Year>
+                <Month>10</Month>
+                <Day>3</Day>
+            </PubMedPubDate>
+            <PubMedPubDate PubStatus="entrez">
+                <Year>2026</Year>
+                <Month>10</Month>
+                <Day>3</Day>
+                <Hour>4</Hour>
+                <Minute>5</Minute>
+            </PubMedPubDate>
+        </History>
+        <PublicationStatus>epublish</PublicationStatus>
+        <ArticleIdList>
+            <ArticleId IdType="pubmed">41234568</ArticleId>
+            <ArticleId IdType="pmc">PMC12900001</ArticleId>
+        </ArticleIdList>
+    </PubmedData>
+</PubmedArticle>
+<PubmedArticle>
+    <MedlineCitation Status="Publisher" Owner="NLM">
+        <PMID Version="1">41234569</PMID>
+        <Article PubModel="Print">
+            <Journal>
+                <ISSN IssnType="Electronic">1439-4413</ISSN>
+                <JournalIssue CitedMedium="Internet">
+                    <PubDate>
+                        <Year>2026</Year>
+                        <Month>Oct</Month>
+                    </PubDate>
+                </JournalIssue>
+                <Title>Gesundheitswesen (Bundesverband der Arzte des Offentlichen Gesundheitsdienstes (Germany))</Title>
+                <ISOAbbreviation>Gesundheitswesen</ISOAbbreviation>
+            </Journal>
+            <ArticleTitle>[Medical cannabis prescriptions in Germany: a survey of general practitioners].</ArticleTitle>
+            <Abstract>
+                <AbstractText Label="ZIEL DER STUDIE">Wir befragten Hausärzte zur Verordnung von Medizinalcannabis.</AbstractText>
+            </Abstract>
+            <Language>ger</Language>
+            <PublicationTypeList>
+                <PublicationType UI="D016428">Journal Article</PublicationType>
+                <PublicationType UI="D004740">English Abstract</PublicationType>
+            </PublicationTypeList>
+        </Article>
+    </MedlineCitation>
+    <PubmedData>
+        <History>
+            <PubMedPubDate PubStatus="pubmed">
+                <Year>2026</Year>
+                <Month>10</Month>
+                <Day>3</Day>
+                <Hour>12</Hour>
+                <Minute>30</Minute>
+            </PubMedPubDate>
+        </History>
+        <PublicationStatus>ppublish</PublicationStatus>
+        <ArticleIdList>
+            <ArticleId IdType="pubmed">41234569</ArticleId>
+        </ArticleIdList>
+    </PubmedData>
+</PubmedArticle>
+<PubmedArticle>
+    <MedlineCitation Status="Publisher" Owner="NLM">
+        <PMID Version="1">41234570</PMID>
+        <Article PubModel="Electronic">
+            <Journal>
+                <Title>Psychedelic medicine (New Rochelle, N.Y.)</Title>
+                <ISOAbbreviation>Psychedelic Med (New Rochelle)</ISOAbbreviation>
+            </Journal>
+            <ArticleTitle></ArticleTitle>
+            <Language>eng</Language>
+            <PublicationTypeList>
+                <PublicationType UI="D016428">Journal Article</PublicationType>
+            </PublicationTypeList>
+        </Article>
+    </MedlineCitation>
+    <PubmedData>
+        <History>
+            <PubMedPubDate PubStatus="pubmed">
+                <Year>2026</Year>
+                <Month>10</Month>
+                <Day>3</Day>
+            </PubMedPubDate>
+        </History>
+        <ArticleIdList>
+            <ArticleId IdType="pubmed">41234570</ArticleId>
+        </ArticleIdList>
+    </PubmedData>
+</PubmedArticle>
+<PubmedBookArticle>
+    <BookDocument>
+        <PMID Version="1">41234571</PMID>
+        <ArticleIdList>
+            <ArticleId IdType="bookaccession">NBK612345</ArticleId>
+        </ArticleIdList>
+        <Book>
+            <Publisher>
+                <PublisherName>StatPearls Publishing</PublisherName>
+            </Publisher>
+            <BookTitle book="statpearls">StatPearls</BookTitle>
+        </Book>
+        <ArticleTitle book="statpearls" part="article-41234">Cannabinoid Hyperemesis Syndrome</ArticleTitle>
+        <Abstract>
+            <AbstractText>Cannabinoid hyperemesis syndrome is a condition of cyclic vomiting in chronic cannabis users.</AbstractText>
+        </Abstract>
+    </BookDocument>
+    <PubmedBookData>
+        <History>
+            <PubMedPubDate PubStatus="pubmed">
+                <Year>2026</Year>
+                <Month>10</Month>
+                <Day>2</Day>
+            </PubMedPubDate>
+        </History>
+        <PublicationStatus>ppublish</PublicationStatus>
+        <ArticleIdList>
+            <ArticleId IdType="pubmed">41234571</ArticleId>
+        </ArticleIdList>
+    </PubmedBookData>
+</PubmedBookArticle>
+</PubmedArticleSet>

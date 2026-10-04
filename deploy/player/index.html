@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Only the official YouTube embed, no other scripts, frames or requests. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' https://telegram.org; style-src 'self'; frame-src https://www.youtube-nocookie.com; base-uri 'none'; form-action 'none'">
+<!-- YouTube refuses embeds without a Referer; it gets the origin only, never the page URL. -->
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<title>Нестор: плеер</title>
+<link rel="stylesheet" href="player.css">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+<main id="player"><p>Загружаю…</p></main>
+<script src="player.js"></script>
+</body>
+</html>

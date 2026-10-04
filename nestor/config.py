@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from datetime import time
 
 from dotenv import load_dotenv
@@ -24,11 +25,27 @@ class Settings:
     # the wisdom of the day. Empty: those use the `web` profile.
     hermes_smart_url: str | None = None
     hermes_smart_api_key: str = ""
+    # Profile `deep`: the archive tools on a bigger model, for disputes and «нестор, подумай». Empty: `group`.
+    hermes_deep_url: str | None = None
+    hermes_deep_api_key: str = ""
+    # Profile `news`: no tools, a cheap model, sorts news items. Empty: `web`.
+    hermes_news_url: str | None = None
+    hermes_news_api_key: str = ""
+    model_routes: dict[str, str] = field(default_factory=dict)   # MODEL_ROUTES, see nestor.bot.routing
     music_daily_limit: int = 10
+    # Short name of the player Mini App (BotFather /newapp, page in deploy/player): songs get a button
+    # that plays the video inside Telegram on a computer too. Empty: no button.
+    music_player_app: str = ""
     # Groups with the wisdom of the day; group admins can switch it with /wisdom on|off.
     wisdom_chat_ids: frozenset[int] = frozenset()
     wisdom_time: time = time(21, 0)
     digest_time: time = time(9, 0)      # the digest itself is switched on by group admins: /digest on
+    # Groups with the evening news digest; group admins can switch it with /news on|off.
+    news_chat_ids: frozenset[int] = frozenset()
+    news_time: time = time(20, 0)
+    news_max_topics: int = 10
+    news_contact_email: str = ""        # for NCBI's email= and the User-Agent of the news fetcher
+    news_telegram_channels: tuple[str, ...] = ("psychedelicsocietyvienna",)
     bot_keywords: tuple[str, ...] = ("нестор", "бот")
     rate_limit: int = 5
     rate_window_min: int = 10
@@ -36,16 +53,58 @@ class Settings:
     timezone: str = "Europe/Tallinn"
 
 
+_COMMENT = re.compile(r"(?:^|\s)#.*\Z", re.S)
+
+
+def _env(name: str, default: str = "") -> str:
+    """A setting without a trailing «# comment»: systemd's EnvironmentFile keeps it in the value."""
+    value = _COMMENT.sub("", os.environ.get(name, "")).strip()
+    return value or default
+
+
+def _int(name: str, default: int) -> int:
+    value = _env(name, str(default))
+    try:
+        return int(value)
+    except ValueError:
+        raise SystemExit(f"{name} must be a whole number, got {value!r}") from None
+
+
 def _parse_ids(value: str) -> frozenset[int]:
     return frozenset(int(part) for part in value.replace(" ", "").split(",") if part)
 
 
 def _parse_time(name: str, default: str) -> time:
-    value = os.environ.get(name) or default
+    value = _env(name, default)
     try:
         return time.fromisoformat(value)
     except ValueError:
         raise SystemExit(f"{name} must look like 21:00, got {value!r}") from None
+
+
+def _routes() -> dict[str, str]:
+    from .bot.routing import parse_routes
+
+    try:
+        return parse_routes(_env("MODEL_ROUTES"))
+    except ValueError as e:
+        raise SystemExit(f"MODEL_ROUTES: {e}") from None
+
+
+def _channels() -> tuple[str, ...]:
+    from .news.sources import parse_channels
+
+    try:
+        return parse_channels(_env("NEWS_TELEGRAM_CHANNELS", "psychedelicsocietyvienna"))
+    except ValueError as e:
+        raise SystemExit(f"NEWS_TELEGRAM_CHANNELS: {e}") from None
+
+
+def _player_app() -> str:
+    value = _env("MUSIC_PLAYER_APP")
+    if value and not re.fullmatch(r"[A-Za-z0-9_]{3,30}", value):
+        raise SystemExit("MUSIC_PLAYER_APP: the Mini App short name from BotFather, 3-30 letters, digits or _")
+    return value
 
 
 def load_settings() -> Settings:
@@ -54,25 +113,36 @@ def load_settings() -> Settings:
         return Settings(
             bot_token=os.environ["BOT_TOKEN"],
             database_url=os.environ["DATABASE_URL"],
-            allowed_chat_ids=_parse_ids(os.environ.get("ALLOWED_CHAT_IDS", "")),
-            log_level=os.environ.get("LOG_LEVEL", "INFO"),
+            allowed_chat_ids=_parse_ids(_env("ALLOWED_CHAT_IDS")),
+            log_level=_env("LOG_LEVEL", "INFO"),
             hermes_url=os.environ.get("HERMES_URL") or None,
             hermes_api_key=os.environ.get("HERMES_API_KEY", ""),
-            hermes_model=os.environ.get("HERMES_MODEL", "hermes-agent"),
+            hermes_model=_env("HERMES_MODEL", "hermes-agent"),
             hermes_web_url=os.environ.get("HERMES_WEB_URL") or None,
             hermes_web_api_key=os.environ.get("HERMES_WEB_API_KEY", ""),
             hermes_smart_url=os.environ.get("HERMES_SMART_URL") or None,
             hermes_smart_api_key=os.environ.get("HERMES_SMART_API_KEY", ""),
-            music_daily_limit=int(os.environ.get("MUSIC_DAILY_LIMIT", 10)),
-            wisdom_chat_ids=_parse_ids(os.environ.get("WISDOM_CHAT_IDS", "")),
+            hermes_deep_url=os.environ.get("HERMES_DEEP_URL") or None,
+            hermes_deep_api_key=os.environ.get("HERMES_DEEP_API_KEY", ""),
+            hermes_news_url=os.environ.get("HERMES_NEWS_URL") or None,
+            hermes_news_api_key=os.environ.get("HERMES_NEWS_API_KEY", ""),
+            model_routes=_routes(),
+            music_daily_limit=_int("MUSIC_DAILY_LIMIT", 10),
+            music_player_app=_player_app(),
+            wisdom_chat_ids=_parse_ids(_env("WISDOM_CHAT_IDS")),
             wisdom_time=_parse_time("WISDOM_TIME", "21:00"),
             digest_time=_parse_time("DIGEST_TIME", "09:00"),
-            bot_keywords=tuple(w.strip().lower() for w in os.environ.get("BOT_KEYWORDS", "нестор,бот").split(",")
+            news_chat_ids=_parse_ids(_env("NEWS_CHAT_IDS")),
+            news_time=_parse_time("NEWS_TIME", "20:00"),
+            news_max_topics=_int("NEWS_MAX_TOPICS", 10),
+            news_contact_email=_env("NEWS_CONTACT_EMAIL"),
+            news_telegram_channels=_channels(),
+            bot_keywords=tuple(w.strip().lower() for w in _env("BOT_KEYWORDS", "нестор,бот").split(",")
                                if w.strip()),
-            rate_limit=int(os.environ.get("RATE_LIMIT_PER_USER", 5)),
-            rate_window_min=int(os.environ.get("RATE_LIMIT_WINDOW_MIN", 10)),
-            daily_token_limit=int(os.environ.get("DAILY_TOKEN_LIMIT", 250_000)),
-            timezone=os.environ.get("TIMEZONE", "Europe/Tallinn"),
+            rate_limit=_int("RATE_LIMIT_PER_USER", 5),
+            rate_window_min=_int("RATE_LIMIT_WINDOW_MIN", 10),
+            daily_token_limit=_int("DAILY_TOKEN_LIMIT", 250_000),
+            timezone=_env("TIMEZONE", "Europe/Tallinn"),
         )
     except KeyError as e:
         raise SystemExit(f"missing required environment variable {e.args[0]}") from None

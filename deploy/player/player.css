@@ -1,0 +1,12 @@
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--tg-theme-bg-color, #000);
+  color: var(--tg-theme-text-color, #fff);
+  font: 16px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+main { display: flex; flex-direction: column; justify-content: center; min-height: 100%; }
+/* 16:9, but never taller than the window minus the link under it. */
+iframe { display: block; width: 100%; height: min(56.25vw, calc(100vh - 56px)); border: 0; }
+p { margin: 16px; text-align: center; }
+a { color: var(--tg-theme-link-color, #6ab3f3); }

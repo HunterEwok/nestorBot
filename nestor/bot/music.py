@@ -1,11 +1,14 @@
 """Songs on request: the model names the song and finds YouTube candidates; this module
 checks them against public endpoints and builds the message.
 
-No audio is downloaded or re-uploaded. The message carries a YouTube link whose preview
-plays inside Telegram, and buttons to Apple Music, YouTube Music, Spotify and Yandex
-Music: a direct track link where one could be verified, a search on that service
-otherwise. Buttons are built here from validated ids on fixed hosts, never copied from
-the model, so a prompt injection cannot turn the card into a phishing link.
+No audio is downloaded or re-uploaded. The message carries the preview of a YouTube video,
+which plays inside Telegram on phones. Telegram on a computer opens YouTube in the browser
+instead, so where the owner has set up the player Mini App (deploy/player), a «▶️ Плеер»
+button opens the same video in the official YouTube embed inside Telegram. Below are buttons
+to Apple Music, YouTube Music, Spotify and Yandex Music: a direct track link where one could
+be verified, a search on that service otherwise. Buttons are built here from validated ids
+on fixed hosts, never copied from the model, so a prompt injection cannot turn the card into
+a phishing link.
 """
 from __future__ import annotations
 
@@ -25,6 +28,7 @@ from .llm import extract_json
 
 _YT_ID = re.compile(r"[A-Za-z0-9_-]{11}")
 _SPOTIFY_ID = re.compile(r"[A-Za-z0-9]{22}")
+_APP_NAME = re.compile(r"[A-Za-z0-9_]{3,30}")   # a Mini App short name in BotFather
 _YT_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"}
 APPLE_STOREFRONTS = ("ru", "us")    # the first one is also used for the search link
 
@@ -253,7 +257,15 @@ async def _none() -> None:
     return None
 
 
-async def build_card(pick: Pick, checker: Checker) -> Card:
+def player_link(bot_username: str, app: str) -> str | None:
+    """t.me link of the bot's player Mini App, or None when it is not set up."""
+    if not app or not bot_username or not _APP_NAME.fullmatch(app):
+        return None
+    return f"https://t.me/{bot_username}/{app}"
+
+
+async def build_card(pick: Pick, checker: Checker, player: str | None = None) -> Card:
+    """player: the Mini App link from player_link(); the video id goes to it as startapp."""
     checks = await asyncio.gather(
         *(checker.youtube(vid) for vid in pick.youtube_ids),
         checker.spotify(pick.spotify_id) if pick.spotify_id else _none(),
@@ -281,12 +293,16 @@ async def build_card(pick: Pick, checker: Checker) -> Card:
         url, direct = links[key]
         return InlineKeyboardButton(text=labels[key] if direct else f"🔎 {labels[key]}", url=url)
 
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[button("apple"), button("youtube_music")],
-                                                     [button("spotify"), button("yandex")]])
+    rows = [[button("apple"), button("youtube_music")], [button("spotify"), button("yandex")]]
+    if video and player:    # the id is [A-Za-z0-9_-]{11}, exactly what startapp allows
+        rows.insert(0, [InlineKeyboardButton(text=prompts.MUSIC_PLAYER_BUTTON, url=f"{player}?startapp={video}")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
     name = html.escape(pick.name)
     preview = f"https://www.youtube.com/watch?v={video}" if video else None
     if preview:
-        text = f'🎵 <b>{name}</b>\n<a href="{preview}">{prompts.MUSIC_PLAY}</a>'
+        # No link in the text: tapping a text link opens YouTube outside Telegram, while
+        # tapping the preview above the text plays the video inside it.
+        text = f"🎵 <b>{name}</b>\n{prompts.MUSIC_PLAY_APP if player else prompts.MUSIC_PLAY}"
     else:
         text = f"🎵 <b>{name}</b>\n{prompts.MUSIC_NO_PLAYER}"
     plain = "\n".join([pick.name, f"YouTube: {preview or '-'}"]

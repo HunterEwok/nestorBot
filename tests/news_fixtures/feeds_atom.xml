@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en">
+  <title>Psychedelic Science Notes</title>
+  <link rel="self" href="https://notes.example.org/feed.atom"/>
+  <link rel="alternate" type="text/html" href="https://notes.example.org/"/>
+  <id>tag:notes.example.org,2026:feed</id>
+  <updated>2026-10-03T10:00:00Z</updated>
+  <author><name>Notes</name></author>
+  <entry>
+    <title type="html">MDMA &amp;amp; PTSD: what the &amp;#8220;confirmatory&amp;#8221; trial changed</title>
+    <link rel="alternate" type="text/html" href="https://notes.example.org/2026/10/mdma-ptsd?utm_source=atom&amp;ref=feed#more"/>
+    <link rel="related" href="https://doi.org/10.1038/S41591-026-04012-X"/>
+    <id>tag:notes.example.org,2026:post-118</id>
+    <published>2026-10-02T21:30:00+02:00</published>
+    <updated>2026-10-03T08:00:00+02:00</updated>
+    <category term="MDMA" label="MDMA"/>
+    <category term=" PTSD "/>
+    <summary type="html">&lt;p&gt;A short teaser.&lt;/p&gt;</summary>
+    <content type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml"><p>The second Phase 3 trial <b>replicated</b> the first.</p><p>Remission rates stayed similar across sites.</p></div></content>
+  </entry>
+  <entry>
+    <title>Only an updated date</title>
+    <link href="https://notes.example.org/2026/09/updated-only"/>
+    <id>tag:notes.example.org,2026:post-117</id>
+    <updated>2026-09-30T12:00:00Z</updated>
+    <summary>Plain text summary.</summary>
+  </entry>
+  <entry>
+    <title>No date at all</title>
+    <link href="https://notes.example.org/2026/09/no-date"/>
+    <id>tag:notes.example.org,2026:post-116</id>
+  </entry>
+</feed>

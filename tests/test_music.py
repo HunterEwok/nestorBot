@@ -75,6 +75,29 @@ async def test_card_prefers_verified_matching_video_and_direct_links():
     ]
 
 
+async def test_card_adds_the_player_mini_app_for_computers():
+    pick = music.Pick("Браво", "Ветер знает", ("BBBBBBBBBBB",), None)
+    checker = FakeChecker(videos={"BBBBBBBBBBB": "Браво - Ветер знает"})
+    player = music.player_link("ewok_nestor_bot", "play")
+    assert player == "https://t.me/ewok_nestor_bot/play"
+    card = await music.build_card(pick, checker, player=player)
+    first = card.keyboard.inline_keyboard[0]
+    assert [(b.text, b.url) for b in first] == [
+        (prompts.MUSIC_PLAYER_BUTTON, "https://t.me/ewok_nestor_bot/play?startapp=BBBBBBBBBBB")]
+    assert prompts.MUSIC_PLAY_APP in card.html and "href" not in card.html
+    assert len(card.keyboard.inline_keyboard) == 3
+
+    # No playable video: no player button, whatever the settings.
+    card = await music.build_card(music.Pick("Браво", "Ветер знает", (), None), FakeChecker(), player=player)
+    assert len(card.keyboard.inline_keyboard) == 2 and prompts.MUSIC_NO_PLAYER in card.html
+
+
+@pytest.mark.parametrize("username, app", [("ewok_nestor_bot", ""), ("", "play"), ("ewok_nestor_bot", "pl"),
+                                           ("ewok_nestor_bot", "play/../x"), ("ewok_nestor_bot", "a" * 31)])
+def test_player_link_needs_a_valid_short_name(username, app):
+    assert music.player_link(username, app) is None
+
+
 @pytest.mark.parametrize("found, wanted, same", [
     ("КИНО - Группа крови (Official Video)", "Группа крови", True),
     ("Kino - Gruppa Krovi", "Группа крови", True),
