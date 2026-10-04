@@ -52,7 +52,7 @@ class Settings:
     rate_limit: int = 5
     rate_window_min: int = 10
     daily_token_limit: int = 250_000
-    timezone: str = "Europe/Tallinn"
+    timezone: str = "Europe/Moscow"
 
 
 _COMMENT = re.compile(r"(?:^|\s)#.*\Z", re.S)
@@ -145,7 +145,7 @@ def load_settings() -> Settings:
             rate_limit=_int("RATE_LIMIT_PER_USER", 5),
             rate_window_min=_int("RATE_LIMIT_WINDOW_MIN", 10),
             daily_token_limit=_int("DAILY_TOKEN_LIMIT", 250_000),
-            timezone=_env("TIMEZONE", "Europe/Tallinn"),
+            timezone=_env("TIMEZONE", "Europe/Moscow"),
         )
     except KeyError as e:
         raise SystemExit(f"missing required environment variable {e.args[0]}") from None

@@ -3,11 +3,12 @@ to one chat (and its pre-migration predecessor), so injected text cannot reach o
 groups. The role behind the connection can only SELECT from reader.* views."""
 from __future__ import annotations
 
+import os
 from zoneinfo import ZoneInfo
 
 import asyncpg
 
-TZ = ZoneInfo("Europe/Tallinn")
+TZ = ZoneInfo(os.environ.get("TIMEZONE") or "Europe/Moscow")     # the bot's time zone, see nestor.config
 MAX_LIMIT = 100
 
 

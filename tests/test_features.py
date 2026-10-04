@@ -58,10 +58,18 @@ def test_classify(question, reply, scenario):
 
 # ---- reminders ----
 
+async def test_reminder_texts_are_escaped(make_env):
+    bot, llm, feed = make_env()
+    await feed(update("message", message(1, "нестор, напомни через 2 часа про <b>торт</b> & чай", date=ago())))
+    assert bot.sent[-1]["parse_mode"] == "HTML" and "про &lt;b&gt;торт&lt;/b&gt; &amp; чай." in bot.sent[-1]["text"]
+    await feed(update("message", message(2, "/reminders", date=ago())))
+    assert "&lt;b&gt;торт&lt;/b&gt; &amp; чай" in bot.sent[-1]["text"] and "<b>Твои напоминания" in bot.sent[-1]["text"]
+
+
 async def test_reminder_set_listed_and_sent_once(make_env, conn):
     bot, llm, feed = make_env()
     await feed(update("message", message(1, "нестор, напомни через 2 часа позвонить маме", date=ago())))
-    assert bot.sent[-1]["text"].startswith("Напомню ")
+    assert bot.sent[-1]["text"].startswith("✅ Напомню ")
     assert bot.sent[-1]["text"].endswith(": позвонить маме. Отменить: /unremind "
                                          + str(await conn.fetchval("SELECT id FROM reminders")))
     row = await conn.fetchrow("SELECT * FROM reminders")
@@ -186,7 +194,7 @@ async def test_catchup_with_nothing_new_skips_the_model(make_env):
     bot, llm, feed = make_env()
     await feed(update("message", message(1, "я тут", date=ago(minutes=5))))
     await feed(update("message", message(2, "/catchup", date=ago())))
-    assert llm.calls == [] and bot.sent[-1]["text"].startswith("С твоего последнего сообщения (")
+    assert llm.calls == [] and bot.sent[-1]["text"].startswith("👌 С твоего последнего сообщения (")
 
 
 # ---- fact-check by reply ----
@@ -397,7 +405,7 @@ async def test_digest_is_switched_on_by_an_admin_and_posted_once(make_env, conn)
     await feed(update("message", message(1, "/digest on", uid=222)))
     assert bot.sent[-1]["text"] == prompts.ADMINS_ONLY
     await feed(update("message", message(2, "/digest on")))
-    assert bot.sent[-1]["text"].startswith("Ежедневный дайджест включён")
+    assert markup.to_plain(bot.sent[-1]["text"]).startswith("☀️ Ежедневный дайджест включён")
     yesterday = int(local(-1, 12).timestamp())
     for i in range(10, 16):
         await feed(update("message", message(i, f"обсуждаем отпуск {i}", uid=200 + i, date=yesterday + i)))
@@ -479,7 +487,7 @@ async def test_wisdom_sends_only_themes_to_the_web_model(make_env, conn):
 
     # A group admin switches it off: nothing is even tried.
     await feed(update("message", message(50, "/wisdom off")))
-    assert bot.sent[-1]["text"].startswith("Мудрость дня выключена")
+    assert markup.to_plain(bot.sent[-1]["text"]).startswith("🦉 Мудрость дня выключена")
     calls = len(smart.calls)
     await answerer.run_daily_posts(local(2, 21, 30).astimezone(timezone.utc))
     await answerer.drain()

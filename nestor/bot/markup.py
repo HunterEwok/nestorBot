@@ -9,8 +9,9 @@ always well-formed.
 References to archive messages ([«quote»](#37285), a bare #37285, or a t.me/c link into the
 same chat) become links to the message. The address is built by code from the message id,
 never taken from the model; ids the archive does not show (deleted, author used /forget_me)
-keep their text without a link. A link to any other site shows its real domain next to it,
-so a label cannot hide where it leads.
+keep their text without a link. A bare number needs three digits or more: «проблема #1» is
+a count, not a message. A link to any other site shows its real domain next to it, unless
+the label is that very domain, so a label cannot hide where it leads.
 """
 from __future__ import annotations
 
@@ -27,6 +28,7 @@ class Ref:
     """An archive message the answer refers to."""
     url: str | None         # None: no t.me link exists (basic groups)
     quote: str              # a short piece of its text, for a bare #id
+    user_id: int | None = None   # its author: /forget_me also removes answers that quote them
 
 
 def split_text(text: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
@@ -34,9 +36,8 @@ def split_text(text: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
     parts: list[str] = []
     rest = text.strip()
     while len(rest) > limit:
-        cut = max(rest.rfind("\n\n", 0, limit), rest.rfind("\n", 0, limit), rest.rfind(" ", 0, limit))
-        if cut <= limit // 2:
-            cut = limit
+        cut = next((at for at in (rest.rfind(sep, 0, limit) for sep in ("\n\n", "\n", " ")) if at > limit // 2),
+                   limit)
         parts.append(rest[:cut].rstrip())
         rest = rest[cut:].lstrip()
     if rest:
@@ -48,7 +49,8 @@ def split_text(text: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
 
 _TME = r"https?://t\.me/c/(?P<{0}>\d{{1,15}})/(?:\d{{1,12}}/)?(?P<{1}>\d{{1,12}})"
 _TME_LINK = re.compile(_TME.format("internal", "message"))
-_BARE_REF = re.compile(r"(?<![\w#&/])#(\d{1,12})(?!\w)")
+_BARE_REF = re.compile(r"(?<![\w#&/])#([1-9]\d{2,11})(?!\w)")    # three digits or more
+_LINK_REF = re.compile(r"\]\(\s*#(\d{1,12})\s*\)")                  # [«quote»](#5): any number
 # «#37285 (https://t.me/c/…/37285)»: the same message twice, keep the id only.
 _REF_AND_LINK = re.compile(r"#(?P<id>\d{1,12})[ \t]*[(\[]?[ \t]*" + _TME.format("internal", "message")
                            + r"[ \t]*[)\]]?")
@@ -65,7 +67,8 @@ def _internal(chat_id: int | None) -> str | None:
 def ref_ids(text: str, chat_id: int | None = None) -> list[int]:
     """Message ids an answer refers to, first seen first (at most MAX_REFS)."""
     internal = _internal(chat_id)
-    found = [(m.start(), int(m.group(1))) for m in _BARE_REF.finditer(text or "")]
+    found = [(m.start(), int(m.group(1)))
+             for pattern in (_BARE_REF, _LINK_REF) for m in pattern.finditer(text or "")]
     if internal is not None:
         found += [(m.start(), int(m.group("message"))) for m in _TME_LINK.finditer(text or "")
                   if m.group("internal") == internal]
@@ -94,7 +97,7 @@ _INLINE = re.compile(
     r"|\[(?P<label>[^\[\]\n]{1,300})\]\(\s*(?P<target>#\d{1,12}|https?://[^\s()<>]+(?:\([^\s()<>]*\)[^\s()<>]*)*)\s*\)"
     r"|\[(?P<badlabel>[^\[\]\n]{1,300})\]\((?!\s*(?:#|https?://))[^()\s]*(?:\([^()\s]*\)[^()\s]*)*\)"
     r"|(?P<url>https?://[^\s<>]+)"
-    r"|(?<![\w#&/])#(?P<ref>\d{1,12})(?!\w)"
+    r"|(?<![\w#&/])#(?P<ref>[1-9]\d{2,11})(?!\w)"
     r"|(?<!\w)\*\*\*(?P<bolditalic>[^\s*](?:[^\n]*?[^\s*])?)\*\*\*(?!\w)"
     r"|(?<!\w)\*\*(?P<bold>[^\s*](?:[^\n]*?[^\s*])?)\*\*(?!\w)"
     r"|~~(?P<strike>[^\s~](?:[^\n]*?[^\s~])?)~~"
@@ -118,6 +121,25 @@ def _plain(text: str) -> str:
 
 def _a(url: str, label_html: str) -> str:
     return f'<a href="{html.escape(url, quote=True)}">{label_html}</a>'
+
+
+def _host(url: str) -> str | None:
+    """The domain a browser opens, or None when it is unclear: userinfo («a.com@b.com»),
+    backslashes and percent signs are read differently by browsers and by Python."""
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+    except ValueError:          # «https://rbc.ru[1]» and other broken addresses
+        return None
+    if not host or re.search(r"[@\\%]", parts.netloc) or "\\" in url:
+        return None
+    return host.lower().removeprefix("www.")
+
+
+def _names_host(label: str, host: str) -> bool:
+    """The label is the link's own domain (or its address): no need to repeat it."""
+    shown = re.sub(r"^https?://", "", label.strip().lower()).removeprefix("www.")
+    return re.split(r"[/?#:]", shown, maxsplit=1)[0] == host
 
 
 class _Renderer:
@@ -148,11 +170,12 @@ class _Renderer:
             return self._ref(own, label)
         if self.internal is not None and _TME_LINK.fullmatch(target):
             return _esc(label)      # a link into another chat: the label alone
-        host = (urlsplit(target).hostname or "").removeprefix("www.")
-        link = _a(target, self.inline(label, links=False))
-        if not host or host.lower() in label.lower():
-            return link
-        return f"{link} ({_esc(host)})"
+        host = _host(target)
+        if host is None:
+            return self.inline(label, links=False)     # an address that could mislead: the label alone
+        shown = self.inline(label, links=False)
+        link = _a(target, shown)
+        return link if _names_host(to_plain(shown), host) else f"{link} ({_esc(host)})"
 
     def inline(self, text: str, *, links: bool = True) -> str:
         out: list[str] = []
@@ -177,6 +200,8 @@ class _Renderer:
                     out.append(_esc(value))
             elif kind == "ref":
                 out.append(self._ref(int(value), None) if links else _esc(m.group(0)))
+            elif kind == "spoiler" and not links:     # inside a link label: nothing may be hidden
+                out.append(self.inline(value, links=False))
             elif kind == "bolditalic":
                 out.append(f"<b><i>{self.inline(value, links=links)}</i></b>")
             else:
@@ -190,7 +215,7 @@ class _Renderer:
 
 _FENCE = re.compile(r"^\s*```")
 _QUOTE = re.compile(r"^\s*>\s?(.*)$")
-_HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$")
+_HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(\S.*)$")      # closing #s are stripped in code: no backtracking
 _BULLET = re.compile(r"^(\s*)[-*+•]\s+(.*)$")
 _RULE = re.compile(r"^\s*(?:[-*_]\s*){3,}$")
 _TABLE_SEPARATOR = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)*\|?\s*$")
@@ -205,7 +230,7 @@ def _pre(lines: list[str]) -> str:
 def to_html(text: str, refs: dict[int, Ref] | None = None, chat_id: int | None = None) -> str:
     """Markdown from the model -> Telegram HTML."""
     r = _Renderer(refs, chat_id)
-    text = _REF_AND_LINK.sub(lambda m: f"#{m.group('id')}" if m.group("id") == m.group("message")
+    text = _REF_AND_LINK.sub(lambda m: f"[#{m.group('id')}](#{m.group('id')})" if m.group("id") == m.group("message")
                              and m.group("internal") == r.internal else m.group(0), text or "")
     out: list[str] = []
     quote_lines: list[str] = []
@@ -241,13 +266,17 @@ def to_html(text: str, refs: dict[int, Ref] | None = None, chat_id: int | None =
         if _RULE.match(line) or _TABLE_SEPARATOR.match(line) and "|" in line:
             out.append("")
             continue
-        if _TABLE_ROW.match(line):
+        if _TABLE_ROW.match(line) and not line.lstrip().startswith("||"):    # «||spoiler||» is not a table
             cells = [c.strip() for c in line.strip().strip("|").split("|")]
             out.append(r.inline(" — ".join(c for c in cells if c)))
             continue
         m = _HEADING.match(line)
         if m:
-            title = m.group(1).replace("**", "").strip()
+            title = m.group(1).rstrip()
+            bare = title.rstrip("#")
+            if bare != title and (not bare or bare[-1].isspace()):     # «## Итог ##», but not «C#»
+                title = bare
+            title = title.replace("**", "").strip()
             out.append(f"<b>{r.inline(title)}</b>")
             continue
         m = _BULLET.match(line)
@@ -272,16 +301,27 @@ def visible_len(html_text: str) -> int:
     return len(to_plain(html_text).encode("utf-16-le")) // 2
 
 
+def _split_markdown(text: str, limit: int) -> list[str]:
+    """split_text that keeps code blocks whole in each part: a block cut in two is closed
+    at the end of one part and opened again at the start of the next."""
+    parts = split_text(text, limit)
+    for i in range(len(parts) - 1):
+        if sum(1 for line in parts[i].split("\n") if _FENCE.match(line)) % 2:
+            parts[i] += "\n```"
+            parts[i + 1] = "```\n" + parts[i + 1]
+    return parts
+
+
 def render(text: str, refs: dict[int, Ref] | None = None, chat_id: int | None = None,
            limit: int = TELEGRAM_LIMIT) -> list[str]:
     """Telegram HTML parts of a Markdown answer, each within Telegram's length limit."""
     parts: list[str] = []
-    pending = split_text(text, limit)
+    pending = _split_markdown(text, limit)
     while pending:
         part = pending.pop(0)
         out = to_html(part, refs, chat_id)
         if visible_len(out) > limit and len(part) > 1:
-            pending[:0] = split_text(part, max(len(part) // 2, 1))
+            pending[:0] = _split_markdown(part, max(len(part) // 2, 1))
             continue
         if out:
             parts.append(out)

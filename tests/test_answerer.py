@@ -285,7 +285,7 @@ async def test_rate_limit_per_user(make_env, conn):
     for i in range(1, 4):
         await feed(update("message", message(i, "бот, привет")))
     assert len(llm.calls) == 2
-    assert bot.sent[-1]["text"].startswith("Слишком часто")
+    assert bot.sent[-1]["text"].startswith("⏳ Слишком часто")
     assert await conn.fetchval("SELECT count(*) FROM bot_requests WHERE status = 'rate_limited'") == 1
 
 
@@ -337,7 +337,7 @@ async def test_forget_me(make_env, conn):
 
     assert await conn.fetchval("SELECT count(*) FROM messages WHERE user_id = 222") == 0
     assert "моё личное" not in str(await conn.fetchval("SELECT raw FROM messages WHERE message_id = 2"))
-    assert bot.sent[-1]["text"].startswith("Готово: удалил из архива твои сообщения (2)")
+    assert bot.sent[-1]["text"].startswith("🧹 Готово: удалил из архива твои сообщения (2)")
 
 
 async def test_pause_requires_admin_and_stops_archiving(make_env, conn):
@@ -402,20 +402,66 @@ async def test_mcp_server_exposes_only_read_tools():
 # ---- formatting ----
 
 async def test_model_markdown_is_sent_as_telegram_formatting(make_env, conn):
-    answer = "**Итог:** договорились ехать 🏖\n\n- Петя: [«беру палатку»](#1)\n- Вася: #2\n- кто-то: [«удалено»](#99)"
+    answer = ("**Итог:** договорились ехать 🏖\n\n- Петя: [«беру палатку»](#1)\n- Вася: [«гитару»](#2)\n"
+              "- кто-то: [«удалено»](#99)")
     bot, llm, feed = make_env(FakeLLM(answer))
     await feed(update("message", message(1, "беру палатку и котелок", uid=222)))
     await feed(update("message", message(2, "а я гитару", uid=333)))
     await conn.execute("UPDATE users SET opted_out = TRUE WHERE user_id = 333")   # Вася used /forget_me
-    await feed(update("message", message(3, "нестор, о чём договорились?", uid=111)))
+    await feed(update("message", message(3, "нестор, кто что берёт?", uid=111)))
     sent = bot.sent[-1]
     assert sent["parse_mode"] == "HTML" and sent["text"] == (
         "<b>Итог:</b> договорились ехать 🏖\n\n"
         '• Петя: <a href="https://t.me/c/1000000001/1">«беру палатку»</a>\n'
-        "• Вася: #2\n"                      # an author who opted out: no quote, no link
+        "• Вася: «гитару»\n"                 # an author who opted out: no quote of theirs, no link
         "• кто-то: «удалено»")
     assert "Стиль собеседника: пишет коротко." in llm.calls[0][-1]["content"]
-    assert await conn.fetchval("SELECT answer FROM bot_requests") == answer
+    req = await conn.fetchrow("SELECT answer, quoted_user_ids FROM bot_requests")
+    assert (req["answer"], req["quoted_user_ids"]) == (answer, [222])
+
+
+async def test_summaries_keep_their_own_format(make_env):
+    bot, llm, feed = make_env()
+    now = int(datetime.now(timezone.utc).timestamp())
+    await feed(update("message", message(1, "беру палатку", uid=222, date=now - 300)))
+    await feed(update("message", message(2, "/summary", uid=111, date=now - 200)))
+    await feed(update("message", message(3, "а я котелок", uid=222, date=now - 100)))
+    await feed(update("message", message(4, "нестор, что я пропустил?", uid=111, date=now - 50)))
+    await feed(update("message", message(5, "нестор, оцени тезисы", uid=111, date=now)))
+    assert len(llm.calls) == 3 and not any("Стиль собеседника" in c[-1]["content"] for c in llm.calls)
+
+
+async def test_forget_me_also_removes_answers_that_quote_them(make_env, conn):
+    bot, llm, feed = make_env(FakeLLM("Петя берёт: [«палатку»](#1)"))
+    await feed(update("message", message(1, "беру палатку и секретный котелок", uid=222)))
+    await feed(update("message", message(2, "нестор, кто что берёт?", uid=111)))
+    answer_id = bot.sent[-1]["message_id"]
+    assert "секретный" not in bot.sent[-1]["text"] and "палатку" in bot.sent[-1]["text"]
+    reply = message(3, "точно", uid=111, reply_to_message={"message_id": answer_id, "date": 1, "chat": {"id": CHAT_ID,
+                    "type": "supergroup"}, "from": {"id": BOT_ID, "is_bot": True, "first_name": "Нестор"}},
+                    quote={"text": "палатку", "position": 0})
+    await feed(update("message", reply))
+    await feed(update("message", message(4, "/forget_me", uid=222)))
+
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE message_id = $1", answer_id) == 0
+    assert "палатку" not in str(await conn.fetchval("SELECT raw FROM messages WHERE message_id = 3"))
+    assert await conn.fetchval("SELECT answer FROM bot_requests WHERE scenario = 'other'") is None
+    # The next request does not carry their words to the model in any form.
+    await feed(update("message", message(5, "нестор, а теперь?", uid=111)))
+    assert "палатк" not in str(llm.calls[-1])
+
+
+async def test_ids_shared_by_a_migrated_chat_and_its_old_group_are_not_linked(make_env, conn):
+    old = -4242
+    bot, llm, feed = make_env(FakeLLM("Это сказал Петя: [«едем в Грецию»](#7), а Вася: [«ок»](#8)"))
+    for i in range(1, 9):
+        await feed(update("message", message(i, f"новая группа {i}", uid=111)))
+    await feed.answerer.save_outgoing(message(7, "едем в Грецию", chat_id=old, uid=222)
+                                      | {"chat": {"id": old, "type": "group", "title": "Old"}})
+    await conn.execute("UPDATE chats SET migrated_from_chat_id = $1 WHERE chat_id = $2", old, CHAT_ID)
+    await feed(update("message", message(9, "нестор, кто что сказал?", uid=111)))
+    assert bot.sent[-1]["text"] == 'Это сказал Петя: «едем в Грецию», а Вася: ' \
+                                   '<a href="https://t.me/c/1000000001/8">«ок»</a>'
 
 
 async def test_refused_formatting_is_sent_as_plain_text(make_env, conn):

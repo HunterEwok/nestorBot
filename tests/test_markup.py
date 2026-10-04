@@ -1,10 +1,14 @@
 """Model Markdown -> Telegram HTML: formatting, escaping, links and references to archive messages."""
+import re
+import time
+
 import pytest
 
 from nestor.bot.markup import Ref, quote, ref_ids, render, to_html, to_plain, visible_len
 
 CHAT = -1001000000001
-REFS = {37285: Ref("https://t.me/c/1000000001/37285", "«налоги надо снизить»"), 12: Ref(None, "«в старой группе»")}
+REFS = {37285: Ref("https://t.me/c/1000000001/37285", "«налоги надо снизить»"), 12: Ref(None, "«в старой группе»"),
+        120: Ref(None, "«в старой группе»"), 1: Ref("https://t.me/c/1000000001/1", "«привет всем»")}
 
 
 @pytest.mark.parametrize("source, html", [
@@ -23,6 +27,9 @@ REFS = {37285: Ref("https://t.me/c/1000000001/37285", "«налоги надо �
     ("```python\nprint('<x>')\n```\nпосле", "<pre>print('&lt;x&gt;')</pre>\nпосле"),
     ("```незакрытый\nкод", "<pre>код</pre>"),
     ("```\n```", ""),
+    ("## Итог ##", "<b>Итог</b>"),
+    ("## Язык C#", "<b>Язык C#</b>"),
+    ("||ответ: 42||", "<tg-spoiler>ответ: 42</tg-spoiler>"),             # a whole-line spoiler is not a table
     ("<script>alert(1)</script> & co", "&lt;script&gt;alert(1)&lt;/script&gt; &amp; co"),
     ("2*3*4, a_b_c, 2**3 и a ** b", "2*3*4, a_b_c, 2**3 и a ** b"),   # not markup
     ("**незакрытый и *одна", "незакрытый и *одна"),                    # a stray ** is dropped
@@ -42,6 +49,19 @@ def test_links_show_their_domain_unless_the_label_does():
         '<a href="https://en.wikipedia.org/wiki/Foo_(bar)">вики</a> (en.wikipedia.org) конец'
     assert to_html('[x](https://a.example/"onmouseover=1)') == \
         '<a href="https://a.example/&quot;onmouseover=1">x</a> (a.example)'
+    # The label must be the domain itself, not merely contain it; a hidden label shows nothing.
+    assert to_html("[sberbank.ru](https://rbank.ru/login)").endswith("</a> (rbank.ru)")
+    assert to_html("[https://google.com/?r=evil.com](https://evil.com/x)").endswith("</a> (evil.com)")
+    assert to_html("[login.evil.com.google.com](https://evil.com/x)").endswith("</a> (evil.com)")
+    assert to_html("[Сбер ||rbank.ru||](https://rbank.ru/login)") == \
+        '<a href="https://rbank.ru/login">Сбер rbank.ru</a> (rbank.ru)'
+    assert to_html("[||rbank.ru||](https://rbank.ru/login)") == '<a href="https://rbank.ru/login">rbank.ru</a>'
+    assert to_html("[https://www.Reuters.com/a](https://reuters.com/a)") == \
+        '<a href="https://reuters.com/a">https://www.Reuters.com/a</a>'
+    # Addresses browsers and Python read differently, or broken ones: the label alone, no crash.
+    for target in (r"https://evil.com\@sberbank.ru/login", "https://a.com@b.com/x", "https://evil%2Ecom/x",
+                   "https://rbc.ru[1]", "https://example.com]", "https://[localhost]/"):
+        assert to_html(f"[Сбербанк]({target}) конец") == "Сбербанк конец", target
     # Bare addresses stay text: Telegram links them itself, markup inside them is not touched.
     assert to_html("см. https://example.com/a*b*c_d") == "см. https://example.com/a*b*c_d"
 
@@ -68,7 +88,10 @@ def test_references_to_archive_messages():
     assert to_html("[тут](https://t.me/c/1000000001/37285)", REFS, CHAT) == \
         '<a href="https://t.me/c/1000000001/37285">тут</a>'
     # No t.me link (a basic group): the words without a link.
-    assert to_html("[«слова»](#12) и #12", REFS, CHAT) == "«слова» и «в старой группе»"
+    assert to_html("[«слова»](#12) и #120", REFS, CHAT) == "«слова» и «в старой группе»"
+    # A bare number under 100 counts things, it is not a message; the [«…»](#1) form always links.
+    assert to_html("Проблема #1 и #12, а Петя: [«привет»](#1)", REFS, CHAT) == \
+        'Проблема #1 и #12, а Петя: <a href="https://t.me/c/1000000001/1">«привет»</a>'
     # Unknown to the archive (deleted, author used /forget_me, invented): no link, no quote.
     assert to_html("[«что-то»](#99) и #99", REFS, CHAT) == "«что-то» и #99"
     assert to_html("[тут](https://t.me/c/1000000001/99)", REFS, CHAT) == "тут"
@@ -81,10 +104,11 @@ def test_references_to_archive_messages():
 
 
 def test_ref_ids():
-    text = "a #5 b https://t.me/c/1000000001/7 c #5 [x](#9) https://x.example/#3 page#4 https://t.me/c/999/8"
-    assert ref_ids(text, CHAT) == [5, 7, 9]
-    assert ref_ids(text, None) == [5, 9]
-    assert ref_ids(" ".join(f"#{i}" for i in range(100)), CHAT) == list(range(50))
+    text = "a #500 b https://t.me/c/1000000001/7 c #500 [x](#9) #12 https://x.example/#300 page#400 " \
+           "https://t.me/c/999/8"
+    assert ref_ids(text, CHAT) == [500, 7, 9]
+    assert ref_ids(text, None) == [500, 9]
+    assert ref_ids(" ".join(f"#{i}" for i in range(100, 200)), CHAT) == list(range(100, 150))
 
 
 def test_quote():
@@ -105,7 +129,63 @@ def test_render_keeps_every_part_within_the_limit():
     assert render("") == [] and render("```\n```") == []
 
 
+def test_render_splits_between_lines_and_keeps_code_blocks_whole():
+    # Lines are kept whole, so a quote-link never breaks in two.
+    refs = {i: Ref(f"https://t.me/c/1000000001/{i}", "«x»") for i in range(1, 41)}
+    lines = [f"- 📌 **Тема номер {i}**: Петя написал [«давайте поедем на дачу в субботу утром»](#{i}), все за."
+             for i in range(1, 41)]
+    for intro in range(0, 140, 7):
+        parts = render("Вступление " + "а" * intro + "\n" + "\n".join(lines), refs, CHAT, limit=1000)
+        assert len(parts) >= 2
+        assert all("](" not in p and "**" not in p and visible_len(p) <= 1000 for p in parts)
+    # A long code block cut in two stays code in both parts; the text after it is not code.
+    code = "\n".join(f"step {i}: compute *x* and **y** # {i}" for i in range(120))
+    parts = render("Скрипт:\n\n```python\n" + code + "\n```\n\nИ **итог**: работает.", limit=2000)
+    assert len(parts) >= 3
+    assert all(p.startswith("<pre>") or p.startswith("Скрипт") for p in parts[:-1])
+    assert parts[-1].endswith("И <b>итог</b>: работает.") and "<b>y</b>" not in "".join(parts)
+
+
+def test_headings_never_take_long():
+    started = time.monotonic()
+    assert to_html("# a" + " " * 5000 + "b") == "<b>a" + " " * 5000 + "b</b>"
+    assert time.monotonic() - started < 1
+
+
 def test_to_plain_and_visible_len():
     html = to_html("**Итог** & [x](https://a.example) 😀")
     assert to_plain(html) == "Итог & x (a.example) 😀"
     assert visible_len(html) == len("Итог & x (a.example) ") + 2    # an emoji is two UTF-16 units
+
+
+def test_the_bots_own_texts_are_well_formed_telegram_html():
+    from html.parser import HTMLParser
+
+    from nestor.bot import prompts
+
+    allowed = {"b", "i", "u", "s", "a", "code", "pre", "blockquote", "tg-spoiler"}
+
+    class Check(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=False)
+            self.open: list[str] = []
+
+        def handle_starttag(self, tag, attrs):
+            assert tag in allowed, tag
+            self.open.append(tag)
+
+        def handle_endtag(self, tag):
+            assert self.open and self.open.pop() == tag, tag
+
+    texts = {name: value for name, value in vars(prompts).items()
+             if name.isupper() and isinstance(value, str) and not name.endswith(("SYSTEM", "FORMAT", "BREVITY"))
+             and name not in ("WEB_MARKER", "DIGEST_HEADER")}
+    assert {"HELP", "PRIVACY", "PAUSED", "REACTIONS_STATE"} <= set(texts)
+    for name, text in texts.items():
+        check = Check()
+        check.feed(text)
+        assert check.open == [], name
+        assert not re.search(r"&(?!amp;|lt;|gt;|quot;)", text), name
+    help_text = prompts.HELP.format(username="ewok_nestor_bot")
+    assert "<b>Команды</b>" in help_text and "/reactions on|off" in help_text
+    assert to_plain(help_text).startswith("👋 Я Нестор: молча веду архив")

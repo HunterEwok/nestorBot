@@ -55,18 +55,24 @@ def normalize(emoji: str) -> str:
 # (reaction, pattern, sure): a sure guess may be put without the model.
 _RULES: tuple[tuple[str | None, re.Pattern, bool], ...] = tuple((emoji, re.compile(pattern, re.I), sure) for
                                                                  emoji, pattern, sure in (
-    ("🤣", r"(?:ха){2,}|(?:ах){2,}|(?:хе){2,}|(?:хи){2,}|\bлол\b|\bржу\b|\bору\b|\bугар|😂|🤣|😆|😹|\bxd\b", True),
+    # Laughter is a whole word of laughter letters: «ахаха», «хехе», «ха-ха», not «страхах» or «хахаль».
+    ("🤣", r"\b(?=[ах]{4,}\b)[ах]*?(?:хах|аха)|\b(?=[хе]{4,}\b)[хе]*?(?:хех|ехе)|\b(?=[хи]{4,}\b)[хи]*?(?:хих|ихи)|"
+           r"\b(?=[ha]{4,}\b)[ha]*?(?:hah|aha)|\bх[аеи](?:[\s-]+х[аеи])+\b|"
+           r"\bлол\b|\blol\b|\bржу\b|\blmao\b|😂|🤣|😆|😹|\bxd\b", True),
     ("😁", r"\){3,}|😄|😃|😀|😁", True),
     ("🎉", r"\bура+\b|поздравля|\bс\s+дн[её]м\s+рождени|\bс\s+др\b|🎉|🥳|🎊", True),
     ("🏆", r"\bпобедил|\bвыиграл|\bчемпион", False),
     ("👏", r"\bполучилось\b|\bсдал[аи]?\b|\bнаконец-то\b|\bгоржусь|\bмолод(?:ец|цы)\b", False),
-    ("❤", r"\bлюблю\b|\bобожаю\b|❤|😍|🥰|💕|💖", True),
+    ("❤", r"❤|😍|🥰|💕|💖", True),
     ("🔥", r"\bогонь\b|\bофигенн|\bшикарн|\bпушка\b|\bкайф|🔥", False),
     ("😢", r"\bгрустно\b|\bпечальн|\bпечаль\b|\bжаль\b|\bобидно\b|😢|😭|😞|😔|\({3,}", False),
     ("🙏", r"\bсоболезн|\bумер(?:ла|ли)?\b|\bскончал|\bпохорон|царствие\s+небесное|покойся\s+с\s+миром", False),
     ("😱", r"\bофигеть\b|\bохренеть\b|ничего\s+себе|ни\s*фига\s+себе|\bвау\b|\bwow\b|\bомг\b|\bomg\b|\bкапец\b|"
            r"\bжесть\b|😱|😨|🤯|😮", False),
     ("🤔", r"🤔|\bхм+\b", False),
+    # Words that only the model can read right: «ору» is laughter or shouting, «люблю» may be «не люблю».
+    ("🤣", r"\bору\b|\bугар(?:но)?\b", False),
+    ("❤", r"\bлюблю\b|\bобожаю\b", False),
     (None, r"!{3,}|[?!]{4,}", False),       # strong, but which feeling: only the model can tell
 ))
 
@@ -100,13 +106,21 @@ _THANKS = re.compile(r"(?:большое\s+|огромное\s+)?(?:спасиб
 _ACK = re.compile(r"(?:ок|окей|ok|okay|понял|поняла|ясно|понятно|принято|угу)")
 
 
+# Friendly emoji outside the reactions list: answered with 👌.
+_FRIENDLY = ("🙂", "😊", "☺", "😉", "👋", "✅", "✔", "💪", "🫶", "😀", "😃", "😄", "😆")
+
+
 def acknowledgement(text: str | None) -> str | None:
-    """The reaction for a bare «спасибо», «ок» or emoji sent to the bot; None for a real question."""
+    """The reaction for a bare «спасибо», «ок» or a friendly emoji sent to the bot; None for
+    anything else (a question, «❓», «👎»): that goes to the model."""
     raw = normalize(text or "")
-    if raw and not re.search(r"[\w?]", raw):
+    if raw and not re.search(r"[\w?¿‽？❓❔⁉]", raw):
         if re.fullmatch(r"[\s)]+", raw):       # «)))»: a smile
             return "😁"
-        return next((e for e in ALLOWED if raw.startswith(e)), "👌")
+        mirrored = next((e for e in ALLOWED if raw.startswith(e)), None)
+        if mirrored is not None:
+            return mirrored
+        return "👌" if raw.startswith(_FRIENDLY) else None
     words = re.sub(r"\s+", " ", re.sub(r"[^\w\s?-]", " ", raw)).strip().lower()
     if _THANKS.fullmatch(words):
         return "❤"
@@ -195,6 +209,10 @@ class Reactor:
             await self.flush(chat_id)
         except Exception:  # noqa: BLE001 - a reaction is never worth a crash
             log.exception("reactions failed", extra={"chat_id": chat_id})
+        finally:
+            # Candidates that came while this batch was being decided wait for the next one.
+            if self._pending.get(chat_id):
+                self._timers[chat_id] = asyncio.create_task(self._flush_later(chat_id))
 
     async def flush(self, chat_id: int) -> int:
         """Decide and put this chat's reactions; returns how many were put."""
@@ -204,16 +222,23 @@ class Reactor:
             return 0
         texts = await self._texts(chat_id, [c.message_id for c in queue])
         queue = [c for c in queue if c.message_id in texts]
-        allowed = await self._allowed(chat_id)
+        allowed = await self.allowed(chat_id)
         if not queue or not allowed:
             return 0
         picks = await self._ask(chat_id, queue, texts, allowed, room)
         if picks is None:   # no model now: only the sure guesses
             picks = {i: c.guess.emoji for i, c in enumerate(queue, 1)
                      if c.guess.sure and c.guess.emoji in allowed}
+        if not picks:
+            return 0
+        # The model may take a while: a /pause, /reactions off or an author's /forget_me
+        # meanwhile still counts.
+        if not await self.wanted(chat_id):
+            return 0
+        still = await self._texts(chat_id, [queue[i - 1].message_id for i in picks])
         put = 0
         for i, emoji in sorted(picks.items())[:room]:
-            if await self._put(chat_id, queue[i - 1].message_id, emoji):
+            if queue[i - 1].message_id in still and await self._put(chat_id, queue[i - 1].message_id, emoji):
                 put += 1
         return put
 
@@ -232,7 +257,7 @@ class Reactor:
                      AND (u.user_id IS NULL OR NOT u.opted_out)""", chat_id, ids)
         return {r["message_id"]: r["text"] for r in rows}
 
-    async def _allowed(self, chat_id: int) -> frozenset[str]:
+    async def allowed(self, chat_id: int) -> frozenset[str]:
         """ALLOWED as far as the chat permits (ChatFullInfo.available_reactions; absent = all)."""
         cached = self._available.get(chat_id)
         if cached and time.monotonic() - cached[0] < self.cfg.cache_s:
@@ -266,6 +291,9 @@ class Reactor:
                                                               {"role": "user", "content": listed}]), 60)
         except Exception as e:  # noqa: BLE001 - Hermes down: the code's own guesses
             log.warning("reaction model failed", extra={"chat_id": chat_id, "error": type(e).__name__})
+            # A failed call counts toward the day's calls too: a broken profile is not asked every minute.
+            await self.log_call(chat_id, Completion("", None, None, None), started,
+                                "timeout" if isinstance(e, asyncio.TimeoutError) else "error")
             return None
         picks = parse(completion.text, len(queue), allowed)
         await self.log_call(chat_id, completion, started, "ok")

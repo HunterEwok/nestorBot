@@ -1,4 +1,5 @@
 """Reactions to emotional messages: the code's candidates, the model's picks, and the limits."""
+import asyncio
 import json
 import time
 from datetime import datetime, timezone
@@ -8,7 +9,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import SetMessageReaction
 from aiogram.types import ReactionTypeEmoji
 
-from nestor.bot import prompts, reactions
+from nestor.bot import markup, prompts, reactions
 from nestor.bot.reactions import ALLOWED, STANDARD, Guess, ReactionConfig, acknowledgement, eligible, guess, parse
 
 from .factories import CHAT_ID, message, update
@@ -20,6 +21,10 @@ FAST = ReactionConfig(delay_s=0)
 
 def answer(*pairs) -> str:
     return json.dumps({"reactions": [{"n": n, "emoji": e} for n, e in pairs]}, ensure_ascii=False)
+
+
+def reactions_text(bot) -> str:
+    return markup.to_plain(bot.sent[-1]["text"])
 
 
 def picks(*pairs) -> FakeLLM:
@@ -59,6 +64,12 @@ def test_the_bot_uses_only_standard_and_friendly_reactions():
     ("привет, как дела", None),
     ("", None),
     (None, None),
+    # Not laughter or love, whatever letters they share with it.
+    ("Соседи отравились угарным газом, в реанимации", None),
+    ("Поговорим о страхах", None), ("в рубахах пришли", None), ("её хахаль ушёл", None),
+    ("ха-ха, смешно", Guess("🤣", True)), ("хехе", Guess("🤣", True)), ("haha", Guess("🤣", True)),
+    ("Я на детей постоянно ору, не знаю что делать", Guess("🤣", False)),   # the model reads it
+    ("Я не люблю, когда так делают", Guess("❤", False)),
 ])
 def test_guess(text, expected):
     assert guess(text) == expected
@@ -77,7 +88,8 @@ def test_eligible():
 @pytest.mark.parametrize("text, emoji", [
     ("спасибо!", "❤"), ("Спасибо большое, нестор 🙏", "❤"), ("спс", "❤"), ("благодарю", "❤"), ("Thanks", "❤"),
     ("ок)", "👌"), ("Понял.", "👌"), ("ясно", "👌"),
-    ("👍", "👍"), ("❤️", "❤"), ("🔥🔥", "🔥"), (")))", "😁"), ("🍺", "👌"),
+    ("👍", "👍"), ("❤️", "❤"), ("🔥🔥", "🔥"), (")))", "😁"), ("🙂", "👌"),
+    ("❓", None), ("⁉️", None), ("？", None), ("👎", None), ("🤬", None), ("!!!", None), ("🍺", None),
     ("понял?", None), ("спасибо, а почему так?", None), ("ок, а завтра?", None), ("что?", None), ("", None),
     ("??", None),
 ])
@@ -204,7 +216,7 @@ async def test_reactions_are_off_by_default_and_switched_by_admins(make_env):
     await feed(update("message", message(2, "/reactions on", uid=222)))
     assert bot.sent[-1]["text"] == prompts.ADMINS_ONLY
     await feed(update("message", message(3, "/reactions on", uid=111)))
-    assert bot.sent[-1]["text"].startswith("Реакции включены.")
+    assert reactions_text(bot).startswith("😄 Реакции включены.")
     await feed(update("message", message(4, "ахахах", uid=222, date=NOW())))
     assert bot.reactions == [(4, ["🤣"])]
 
@@ -212,7 +224,7 @@ async def test_reactions_are_off_by_default_and_switched_by_admins(make_env):
     await feed(update("message", message(6, "ахахах", uid=222, date=NOW())))
     await feed(update("message", message(7, "/resume", uid=111)))
     await feed(update("message", message(8, "/reactions off", uid=111)))
-    assert bot.sent[-1]["text"].startswith("Реакции выключены.")
+    assert reactions_text(bot).startswith("😄 Реакции выключены.")
     await feed(update("message", message(9, "ахахах", uid=222, date=NOW())))
     assert bot.reactions == [(4, ["🤣"])]
 
@@ -245,9 +257,78 @@ async def test_thanks_to_the_bot_gets_a_reaction_not_an_answer(make_env, conn):
     assert len(llm.calls) == 2 and await conn.fetchval("SELECT count(*) FROM bot_requests") == 2
 
 
+async def test_thanks_get_a_reaction_the_chat_allows_or_an_answer(make_env):
+    bot, llm, feed = make_env()
+    bot.available_reactions = [ReactionTypeEmoji(emoji="👍")]
+    await feed(update("message", message(1, "нестор, спасибо!", uid=222)))
+    assert bot.reactions == [(1, ["👍"])] and llm.calls == []
+    bot.available_reactions = []                           # no reactions in this group: a normal answer
+    feed.answerer.reactor._available.clear()
+    await feed(update("message", message(2, "нестор, спасибо!", uid=222)))
+    assert len(llm.calls) == 1 and bot.sent[-1]["reply_to"] == 2
+
+
+async def test_a_yes_to_the_bots_question_or_to_someone_else_is_a_request(make_env):
+    bot, llm, feed = make_env(FakeLLM("Тебе про Кино?"))
+    await feed(update("message", message(1, "нестор, расскажи про группу", uid=222)))
+    question = bot.sent[-1]
+    bot_msg = {"message_id": question["message_id"], "date": NOW(), "chat": {"id": CHAT_ID, "type": "supergroup"},
+               "from": {"id": 42, "is_bot": True, "first_name": "Нестор", "username": "ewok_nestor_bot"},
+               "text": question["text"]}
+    await feed(update("message", message(2, "угу", uid=222, reply_to_message=bot_msg)))
+    assert len(llm.calls) == 2 and (2, ["👌"]) not in bot.reactions
+    await feed(update("message", message(3, "нестор 👍", uid=222, reply_to_message=message(1, "x", uid=333))))
+    assert len(llm.calls) == 3
+
+
+async def test_candidates_that_come_during_a_batch_get_the_next_one(make_env):
+    model = SeqLLM(answer((1, "😁")), answer((1, "🎉")))
+    model.delay = 0.3
+    bot, llm, feed = make_env(news_llm=model, reaction_chat_ids=frozenset({CHAT_ID}),
+                              reactions=ReactionConfig(delay_s=0.05))
+    answerer = feed.answerer
+    for i in (1, 2):
+        msg = message(i, "ахахах", uid=200 + i, date=NOW())
+        await answerer.save_outgoing(msg)
+        await answerer.on_message(msg, paused=False)
+        await asyncio.sleep(0.15)                          # the second comes while the first is with the model
+    await answerer.drain()
+    assert bot.reactions == [(1, ["😁"]), (2, ["🎉"])]
+
+
+async def test_failed_model_calls_count_toward_the_day(make_env, conn):
+    model = FakeLLM(fail=True)
+    bot, llm, feed = make_env(news_llm=model, reaction_chat_ids=frozenset({CHAT_ID}),
+                              reactions=ReactionConfig(delay_s=0, calls_per_day=1))
+    for i in (1, 2, 3):
+        await feed(update("message", message(i, "ну всё, приехали!!!", uid=222, date=NOW())))
+    assert len(model.calls) == 1
+    assert await conn.fetchval("SELECT status FROM bot_requests WHERE scenario = 'reaction'") == "error"
+
+
+@pytest.mark.parametrize("meanwhile", [
+    "UPDATE chats SET enabled = FALSE",                                      # /pause
+    "UPDATE chats SET settings = settings || '{\"reactions\": false}'",       # /reactions off
+    "UPDATE users SET opted_out = TRUE WHERE user_id = 222",                 # the author's /forget_me
+])
+async def test_what_changes_during_the_model_call_still_counts(make_env, pool, meanwhile):
+    class Slow(FakeLLM):
+        async def complete(self, messages):
+            async with pool.acquire() as c:
+                await c.execute(meanwhile)
+            return await super().complete(messages)
+
+    bot, llm, feed = make_env(news_llm=Slow(answer((1, "😁"))), reaction_chat_ids=frozenset({CHAT_ID}),
+                              reactions=FAST)
+    await feed(update("message", message(1, "ахахах", uid=222, date=NOW())))
+    assert bot.reactions == []
+
+
 def test_rules_are_quick():
     started = time.monotonic()
     for _ in range(2000):
         guess("обычное длинное сообщение без эмоций " * 20)
+    for text in ("х" * 4000 + "ь", "ха" * 2000 + "ль", "ха " * 1300 + "ь"):
+        guess(text)
     assert time.monotonic() - started < 2
     assert reactions.normalize("❤️") == "❤"
