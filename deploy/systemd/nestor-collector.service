@@ -16,10 +16,6 @@ ExecStartPre=/opt/nestor/.venv/bin/python -m nestor.migrate
 ExecStart=/opt/nestor/.venv/bin/python -m nestor.collector
 Restart=always
 RestartSec=10
-# While the database stays unreachable (or a migration keeps failing) the pauses between restarts
-# grow from 10 s to 5 min instead of a new process every 10 s; systemd 254 or later.
-RestartSteps=8
-RestartMaxDelaySec=5min
 # Migrations run before the start: a long backfill, or 30 s waiting for a table lock (nestor.migrate),
 # must not be cut by the default 90 s.
 TimeoutStartSec=5min

@@ -34,12 +34,14 @@ CREATE TABLE maintenance_runs (
   UNIQUE (job, day)
 );
 
--- The newest purged message id per chat: the importer resumes after it, so history that already
--- left the archive is not imported again with a fresh stored_at.
+-- The span of message ids the purge removed, per chat: from the oldest to the newest. The importer
+-- leaves it out, so history that already left the archive is not imported again with a fresh
+-- stored_at; older history that never entered the archive can still be imported.
 CREATE TABLE retention_marks (
-  chat_id     BIGINT PRIMARY KEY,
-  message_id  BIGINT NOT NULL,
-  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+  chat_id          BIGINT PRIMARY KEY,
+  first_message_id BIGINT NOT NULL,
+  message_id       BIGINT NOT NULL,
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- Health of the service (collector heartbeat, watchdog snapshot, collector_watch dedupe):
@@ -100,11 +102,15 @@ WHERE r.raw ? 'quote' AND r.raw ? 'reply_to_message' AND NOT (r.raw->'reply_to_m
   AND NOT EXISTS (SELECT 1 FROM messages t WHERE t.chat_id = r.chat_id AND t.message_id = r.reply_to_id);
 
 -- Forwards of opted-out authors: keep the row (it is the forwarder's), drop the words and names.
+-- Live updates name the author in sender_user, imported forwards by an id ({type, sender_id}).
 UPDATE messages m
 SET text = NULL, entities = NULL,
     forward_origin = jsonb_build_object('type', m.forward_origin->'type', 'sender_user', jsonb_build_object('id', u.user_id)),
-    raw = (m.raw - 'text' - 'caption' - 'entities' - 'caption_entities')
+    raw = (m.raw - 'text' - 'caption' - 'entities' - 'caption_entities'
+                 - 'forward_from' - 'forward_sender_name' - 'forward_signature')
           || jsonb_build_object('forward_origin',
                jsonb_build_object('type', m.forward_origin->'type', 'sender_user', jsonb_build_object('id', u.user_id)))
 FROM users u
-WHERE u.opted_out AND m.forward_origin->'sender_user'->>'id' = u.user_id::text;
+WHERE u.opted_out
+  AND coalesce(m.forward_origin->'sender_user'->>'id',
+               CASE WHEN m.forward_origin->>'type' = 'user' THEN m.forward_origin->>'sender_id' END) = u.user_id::text;

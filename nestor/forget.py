@@ -11,10 +11,14 @@ from __future__ import annotations
 import asyncpg
 
 ERASE_LOCK = 0x6E6573746F73      # nestor.migrate takes ...72; transaction-scoped, released at commit
+# How long to wait for it: more than a purge batch can hold it (nestor.retention.STATEMENT_TIMEOUT_S,
+# 120 s, and its bookkeeping), not the pool's 30 s per query. A /forget_me or an answer being logged
+# waits for a slow batch; it does not fail.
+ERASE_WAIT_S = 180
 
 
 async def erase_lock(conn: asyncpg.Connection) -> None:
-    await conn.execute("SELECT pg_advisory_xact_lock($1)", ERASE_LOCK)
+    await conn.execute("SELECT pg_advisory_xact_lock($1)", ERASE_LOCK, timeout=ERASE_WAIT_S)
 
 
 async def forget(conn: asyncpg.Connection, user_id: int, bot_id: int) -> int:
@@ -38,16 +42,20 @@ async def forget(conn: asyncpg.Connection, user_id: int, bot_id: int) -> int:
     await conn.execute(
         """UPDATE messages SET raw = raw - 'quote'
            WHERE raw ? 'quote' AND raw->'reply_to_message'->'from'->>'id' = $1::bigint::text""", user_id)
-    # Their messages forwarded by others: the row is the forwarder's, the words are theirs.
+    # Their messages forwarded by others: the row is the forwarder's, the words and names are theirs.
+    # Live updates name the author in sender_user, imported forwards by an id (the importer's {type, sender_id}).
     await conn.execute(
         """UPDATE messages
            SET text = NULL, entities = NULL,
                forward_origin = jsonb_build_object('type', forward_origin->'type',
                                                    'sender_user', jsonb_build_object('id', $1::bigint)),
-               raw = (raw - 'text' - 'caption' - 'entities' - 'caption_entities')
+               raw = (raw - 'text' - 'caption' - 'entities' - 'caption_entities'
+                          - 'forward_from' - 'forward_sender_name' - 'forward_signature')
                      || jsonb_build_object('forward_origin', jsonb_build_object(
                           'type', forward_origin->'type', 'sender_user', jsonb_build_object('id', $1::bigint)))
-           WHERE forward_origin->'sender_user'->>'id' = $1::bigint::text""", user_id)
+           WHERE coalesce(forward_origin->'sender_user'->>'id',
+                          CASE WHEN forward_origin->>'type' = 'user' THEN forward_origin->>'sender_id' END)
+                 = $1::bigint::text""", user_id)
     status = await conn.execute("DELETE FROM messages WHERE user_id = $1", user_id)
     await conn.execute("UPDATE bot_requests SET question = NULL WHERE user_id = $1", user_id)
     await conn.execute("DELETE FROM reminders WHERE user_id = $1", user_id)

@@ -4,9 +4,10 @@ leaves the archive the way /forget_me takes it. And of 0008: when older answers 
 retention clock, and the copies of words the archive should not hold."""
 from pathlib import Path
 
-from nestor.collector.parse import reduce_raw
+from nestor.collector import store
+from nestor.collector.parse import parse_chat, parse_message, reduce_raw
 
-from .factories import CHAT_ID
+from .factories import CHAT_ID, message
 from .test_answerer import BOT_ID
 
 MIGRATIONS = Path(__file__).resolve().parents[1] / "migrations"
@@ -280,7 +281,8 @@ async def test_0008_scrubs_forwards_and_quotes_of_opted_out(conn):
              "sender_user": {"id": 333, "is_bot": False, "first_name": "Вася", "username": "vasya"}}
     bold = [{"type": "bold", "offset": 0, "length": 6}]
     await _msg(conn, 1, 111, "секрет Васи", entities=bold, forward_origin=vasya,
-               extra={"entities": bold, "forward_origin": vasya})
+               extra={"entities": bold, "forward_origin": vasya,
+                      "forward_from": {"id": 333, "first_name": "Вася", "username": "vasya"}})
     petya = vasya | {"sender_user": {"id": 222, "is_bot": False, "first_name": "Петя"}}
     await _msg(conn, 2, 111, "мысль Пети", forward_origin=petya, extra={"forward_origin": petya})
     # A reply that came after Вася's /forget_me, quoting the message Telegram still showed.
@@ -290,14 +292,63 @@ async def test_0008_scrubs_forwards_and_quotes_of_opted_out(conn):
     await _msg(conn, 4, 222, "мой текст")
     await _msg(conn, 5, 111, "да", reply_to=4, quote="мой текст", extra={"import_source": "telegram_import"})
     await _msg(conn, 6, 111, "да", reply_to=901, quote="забытое", extra={"import_source": "telegram_import"})
+    # Imported forwards name their author by an id; the id of a chat is not a person's.
+    imported = {"type": "user", "date": 1_700_000_000, "sender_id": 333}
+    await _msg(conn, 7, 111, "секрет Васи, из истории", forward_origin=imported,
+               extra={"forward_origin": imported, "import_source": "telegram_import"})
+    channel = {"type": "chat", "date": 1_700_000_000, "sender_id": 333}
+    await _msg(conn, 8, 111, "из канала", forward_origin=channel, extra={"forward_origin": channel})
     await conn.execute(RETENTION)
     rows = {r["message_id"]: r for r in await conn.fetch("SELECT * FROM messages WHERE chat_id = $1", CHAT_ID)}
     forward = rows[1]
     assert (forward["user_id"], forward["text"], forward["entities"]) == (111, None, None)
     assert forward["forward_origin"] == forward["raw"]["forward_origin"] == {"type": "user", "sender_user": {"id": 333}}
     assert not {"text", "entities"} & set(forward["raw"]) and "Вася" not in str(forward["raw"])
+    assert "vasya" not in str(forward["raw"]) and "forward_from" not in forward["raw"]
+    assert (rows[7]["text"], rows[7]["forward_origin"]) == (None, {"type": "user", "sender_user": {"id": 333}})
+    assert "секрет" not in str(rows[7]["raw"]) and "sender_id" not in str(rows[7]["raw"])
+    assert (rows[8]["text"], rows[8]["forward_origin"]) == ("из канала", channel)
     assert (rows[2]["text"], rows[2]["forward_origin"], rows[2]["raw"]["forward_origin"]) == ("мысль Пети", petya, petya)
     assert "quote" not in rows[3]["raw"] and "quote" not in rows[6]["raw"]
     assert rows[5]["raw"]["quote"]["text"] == "мой текст"
     names = await conn.fetchrow("SELECT username, first_name, last_name FROM users WHERE user_id = 333")
     assert tuple(names) == (None, None, None)
+
+
+async def test_0008_scrubs_what_was_stored_the_way_a_new_message_is_stored(conn):
+    """The backfill and store.save_message apply one rule to forwards and quotes: the same words go."""
+    await _setup(conn)
+    vasya = {"id": 333, "is_bot": False, "first_name": "Вася", "username": "vasya"}
+    live = {"type": "user", "date": 1_700_000_000, "sender_user": vasya}
+    quote = {"text": "секрет Васи", "position": 0}
+    samples = [
+        ("секрет Васи", {"forward_origin": live, "forward_from": vasya, "forward_date": 1_700_000_000,
+                         "entities": [{"type": "bold", "offset": 0, "length": 6}]}),
+        ("секрет Васи", {"forward_origin": {"type": "user", "date": 1_700_000_000, "sender_id": 333}}),
+        ("из канала", {"forward_origin": {"type": "chat", "date": 1_700_000_000, "sender_id": 333}}),
+        ("мысль Пети", {"forward_origin": live | {"sender_user": {"id": 222, "is_bot": False, "first_name": "Петя"}}}),
+        ("да", {"reply_to_message": {"message_id": 900, "date": 1, "from": vasya}, "quote": quote}),
+        ("да", {"reply_to_message": {"message_id": 900}, "quote": quote}),           # imported, replied is not archived
+        ("да", {"reply_to_message": {"message_id": 1}, "quote": {"text": "мой текст"}}),     # ... is archived
+        ("да", {"reply_to_message": {"message_id": 1}}),
+    ]
+    await _msg(conn, 1, 222, "мой текст")
+    rows = [parse_message(message(100 + i, text, **extra)) for i, (text, extra) in enumerate(samples)]
+    for row in rows:                                    # as an older collector stored them
+        await conn.execute(store._INSERT_MESSAGE, *store._message_args(row))
+    await conn.execute("UPDATE users SET opted_out = TRUE WHERE user_id = 333")
+    await conn.execute(RETENTION)
+
+    async def stored():
+        return [dict(r) for r in await conn.fetch(
+            "SELECT message_id, text, entities, forward_origin, raw FROM messages WHERE message_id >= 100 "
+            "ORDER BY message_id")]
+    backfilled = await stored()
+    await conn.execute("DELETE FROM messages WHERE message_id >= 100")
+    for i, (text, extra) in enumerate(samples):         # the same messages arriving now
+        await store.save_message(conn, parse_chat(message(1)["chat"]), parse_message(message(100 + i, text, **extra)))
+    assert await stored() == backfilled
+    assert backfilled[0]["text"] is None and "vasya" not in str(backfilled[0]["raw"])
+    assert backfilled[1]["text"] is None and backfilled[2]["text"] == "из канала" and backfilled[3]["text"] == "мысль Пети"
+    assert "quote" not in backfilled[4]["raw"] and "quote" not in backfilled[5]["raw"]
+    assert backfilled[6]["raw"]["quote"]["text"] == "мой текст"

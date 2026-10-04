@@ -1,3 +1,4 @@
+from nestor import forget
 from nestor.collector import store
 from nestor.collector.parse import parse_chat, parse_message
 from nestor.collector.store import Result
@@ -100,10 +101,44 @@ async def test_forward_of_an_opted_out_author_is_stored_without_text(conn):
     await save(conn, message(1, "до", uid=222))
     await conn.execute("UPDATE users SET opted_out = TRUE WHERE user_id = 222")
     origin = {"type": "user", "date": 1_700_000_000, "sender_user": user(222, last_name="Петров")}
-    forward = message(2, "секрет Пети", uid=111, forward_origin=origin,
+    # Telegram still sends the legacy fields beside forward_origin.
+    forward = message(2, "секрет Пети", uid=111, forward_origin=origin, forward_from=user(222, last_name="Петров"),
                       entities=[{"type": "bold", "offset": 0, "length": 6}])
     assert await save(conn, forward) is Result.INSERTED
     row = await conn.fetchrow("SELECT user_id, text, entities, forward_origin, raw FROM messages WHERE message_id = 2")
     assert (row["user_id"], row["text"], row["entities"]) == (111, None, None)
     assert row["forward_origin"] == row["raw"]["forward_origin"] == {"type": "user", "sender_user": {"id": 222}}
-    assert "секрет" not in str(row["raw"]) and "Петров" not in str(row["raw"])
+    assert "секрет" not in str(row["raw"]) and "Петров" not in str(row["raw"]) and "forward_from" not in row["raw"]
+
+
+async def test_imported_forward_names_its_author_by_an_id(conn):
+    await save(conn, message(1, "до", uid=222))
+    await conn.execute("UPDATE users SET opted_out = TRUE WHERE user_id = 222")
+    imported = {"type": "user", "date": 1_700_000_000, "sender_id": 222}
+    assert await save(conn, message(2, "секрет Пети", uid=111, forward_origin=imported)) is Result.INSERTED
+    # The id of a chat is not a person's, and somebody who did not opt out keeps their words.
+    await save(conn, message(3, "из канала", uid=111, forward_origin=imported | {"type": "chat"}))
+    await save(conn, message(4, "мысль Васи", uid=111, forward_origin=imported | {"sender_id": 333}))
+    rows = {r["message_id"]: r for r in await conn.fetch("SELECT message_id, text, forward_origin, raw FROM messages")}
+    assert (rows[2]["text"], rows[2]["forward_origin"]) == (None, {"type": "user", "sender_user": {"id": 222}})
+    assert "секрет" not in str(rows[2]["raw"]) and "sender_id" not in str(rows[2]["raw"])
+    assert rows[3]["text"] == "из канала" and rows[4]["text"] == "мысль Васи"
+
+
+async def test_imported_reply_keeps_its_quote_only_beside_the_message_in_the_archive(conn):
+    # Imported replies do not name the author of the replied message: the archive tells.
+    imported = {"reply_to_message": {"message_id": 10}, "import_source": "telegram_import"}
+    await save(conn, message(10, "тайна Пети", uid=222))
+    assert await save(conn, message(11, "согласен", uid=111, quote={"text": "тайна Пети"}, **imported)) is Result.INSERTED
+    assert (await conn.fetchval("SELECT raw FROM messages WHERE message_id = 11"))["quote"]["text"] == "тайна Пети"
+    # After /forget_me the replied message is not there (and its author's own are not stored again).
+    async with conn.transaction():
+        await forget.forget(conn, 222, 42)
+    assert await save(conn, message(10, "тайна Пети", uid=222)) is Result.OPTED_OUT
+    await save(conn, message(12, "согласен", uid=111, quote={"text": "тайна Пети"}, **imported))
+    # A message that was never stored (deleted in Telegram, or purged) cannot say whose words these are.
+    await save(conn, message(13, "согласен", uid=111, quote={"text": "чьё-то"},
+                             reply_to_message={"message_id": 900}, import_source="telegram_import"))
+    raws = {r["message_id"]: r["raw"] for r in await conn.fetch("SELECT message_id, raw FROM messages")}
+    assert "quote" not in raws[11] and "quote" not in raws[12] and "quote" not in raws[13]
+    assert "тайна" not in str(raws[12]) and raws[12]["text"] == "согласен"

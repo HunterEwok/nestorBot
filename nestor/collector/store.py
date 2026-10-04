@@ -148,10 +148,34 @@ async def save_message(
         return Result.EDITED
 
 
+# What a forward of someone who used /forget_me does not keep (nestor.forget and migration 0008 drop the same).
+_FORWARD_WORDS = ("text", "caption", "entities", "caption_entities",
+                  "forward_from", "forward_sender_name", "forward_signature")
+
+
 def _dig(value: Any, *keys: str) -> Any:
     for key in keys:
         value = value.get(key) if isinstance(value, dict) else None
     return value
+
+
+def _forward_author(origin: Any) -> Any:
+    """Who wrote a forwarded message: live updates name a `sender_user`, the importer an id."""
+    author = _dig(origin, "sender_user", "id")
+    if author is None and _dig(origin, "type") == "user":
+        author = _dig(origin, "sender_id")
+    return author
+
+
+async def _quote_of_nobody(conn: asyncpg.Connection, msg: MessageRow) -> bool:
+    """A quote beside a replied message that does not name its author (imported replies): whose
+    words it holds is known only from that message in the archive. Without it (forgotten, purged,
+    never stored) the quote goes, as migration 0008 does to what was stored."""
+    reply = msg.raw.get("reply_to_message")
+    if "quote" not in msg.raw or not isinstance(reply, dict) or "from" in reply:
+        return False
+    return not await conn.fetchval("SELECT EXISTS (SELECT 1 FROM messages WHERE chat_id = $1 AND message_id = $2)",
+                                   msg.chat_id, msg.reply_to_id)
 
 
 async def _without_forgotten_words(conn: asyncpg.Connection, msg: MessageRow) -> MessageRow:
@@ -161,17 +185,15 @@ async def _without_forgotten_words(conn: asyncpg.Connection, msg: MessageRow) ->
     raw = msg.raw
     replied = ([_dig(raw, "reply_to_message", "from", "id"), _dig(raw, "external_reply", "origin", "sender_user", "id")]
                if "quote" in raw else [])
-    forwarded = _dig(msg.forward_origin, "sender_user", "id")
+    forwarded = _forward_author(msg.forward_origin)
     wanted = [u for u in (*replied, forwarded) if isinstance(u, int)]
-    if not wanted:
-        return msg
     gone = set(await conn.fetchval("SELECT array_agg(user_id) FROM users WHERE opted_out AND user_id = ANY($1::bigint[])",
-                                   wanted) or [])
-    if gone & set(replied):
+                                   wanted) or []) if wanted else set()
+    if gone & set(replied) or await _quote_of_nobody(conn, msg):
         raw = {k: v for k, v in raw.items() if k != "quote"}
     if forwarded in gone:
         origin = {"type": msg.forward_origin.get("type"), "sender_user": {"id": forwarded}}
-        raw = {k: v for k, v in raw.items() if k not in ("text", "caption", "entities", "caption_entities")}
+        raw = {k: v for k, v in raw.items() if k not in _FORWARD_WORDS}
         return dataclasses.replace(msg, text=None, entities=None, forward_origin=origin, raw=raw | {"forward_origin": origin})
     return msg if raw is msg.raw else dataclasses.replace(msg, raw=raw)
 

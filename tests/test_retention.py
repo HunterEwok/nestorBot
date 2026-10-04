@@ -11,6 +11,7 @@ import asyncpg
 
 from nestor import forget, promises, retention
 from nestor.bot.answerer import AnswerConfig
+from nestor.collector import store
 from nestor.config import Settings
 from nestor.logs import JsonFormatter
 
@@ -85,7 +86,8 @@ async def test_messages_leave_by_the_time_they_entered_the_archive_with_edits_an
     assert "quote" not in left[4] and "старое" not in str(left[4])
     assert left[5]["quote"]["text"] == "история"
     assert await conn.fetchval("SELECT count(*) FROM message_edits") == 0
-    assert await conn.fetchval("SELECT message_id FROM retention_marks WHERE chat_id = $1", CHAT_ID) == 3
+    span = await conn.fetchrow("SELECT first_message_id, message_id FROM retention_marks WHERE chat_id = $1", CHAT_ID)
+    assert tuple(span) == (1, 3)                     # the ids that left: the importer does not bring them back
     assert await _purge(pool, conn) == {}            # nothing left to do
 
 
@@ -295,6 +297,32 @@ async def test_purge_waits_for_forget_me(pool, conn):
         await forgetting.commit()
     assert _plain(await purging)["messages"] == 1
     assert await conn.fetchval("SELECT count(*) FROM messages") == 0
+
+
+async def test_forget_me_waits_for_a_slow_purge_batch_instead_of_failing(database, pool, conn):
+    """A purge batch may hold the lock for 120 s, the pool gives a query 30 s: here 0.6 s against 0.3 s."""
+    assert forget.ERASE_WAIT_S > retention.STATEMENT_TIMEOUT_S + 30
+    await _setup(conn)
+    short = await asyncpg.create_pool(database["collector"], min_size=1, max_size=1, init=store.init_connection,
+                                      command_timeout=0.3)
+
+    async def forgetting():
+        async with short.acquire() as c, c.transaction():
+            return await forget.forget(c, 222, BOT_ID)
+
+    try:
+        async with pool.acquire() as batch:
+            purging = batch.transaction()
+            await purging.start()
+            await forget.erase_lock(batch)                  # a batch in flight
+            task = asyncio.create_task(forgetting())
+            await asyncio.sleep(0.6)
+            assert not task.done()
+            await purging.commit()
+        await task
+    finally:
+        await short.close()
+    assert await conn.fetchval("SELECT opted_out FROM users WHERE user_id = 222")
 
 
 async def test_preview_counts_without_deleting(conn):

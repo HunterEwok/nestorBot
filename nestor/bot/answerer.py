@@ -500,8 +500,9 @@ class Answerer:
             """INSERT INTO bot_requests (chat_id, trigger_msg_id, user_id, thread_id, scenario, question,
                                          answer, model, input_tokens, output_tokens, latency_ms, status,
                                          answer_msg_ids, parent_id, profile, quoted_user_ids, oldest_source_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                       least(now(), coalesce($17::timestamptz, now()))) RETURNING id""",
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                       (SELECT id FROM bot_requests WHERE id = $14),    -- the retention purge may have deleted it
+                       $15, $16, least(now(), coalesce($17::timestamptz, now()))) RETURNING id""",
             msg["chat"]["id"], msg["message_id"], msg["from"]["id"], msg.get("message_thread_id"),
             job.scenario, job.question, fields.get("answer"), fields.get("model"),
             fields.get("input_tokens"), fields.get("output_tokens"), fields.get("latency_ms"), status,
@@ -554,7 +555,9 @@ class Answerer:
             async with self.pool.acquire() as conn:
                 await conn.execute("DELETE FROM request_tickets WHERE ticket = $1 OR expires_at < now()", ticket)
                 async with conn.transaction():
-                    if fields.get("quoted_user_ids"):   # it may erase: the lock comes before the insert's row locks
+                    # It may erase, and the purge may delete the parent request meanwhile: the lock
+                    # comes before the insert's row locks, and waits for a purge batch to commit.
+                    if fields.get("quoted_user_ids") or fields.get("parent_id"):
                         await forget.erase_lock(conn)
                     rid = await self._log(conn, job, status, **fields)
                     await self._scrub_if_opted_out(conn, rid, fields.get("quoted_user_ids"))

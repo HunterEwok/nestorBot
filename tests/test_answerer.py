@@ -9,7 +9,7 @@ from aiogram.enums import ChatMemberStatus
 from aiogram.exceptions import TelegramForbiddenError
 from aiogram.types import Message, Update
 
-from nestor import retention
+from nestor import forget, retention
 from nestor.bot import prompts
 from nestor.bot.answerer import AnswerConfig, Answerer
 from nestor.bot.llm import Completion
@@ -648,6 +648,49 @@ async def test_a_reply_to_a_scrubbed_answer_continues_with_answer_removed(make_e
     assert "Ответ модели" not in str(llm.calls[1][1:])
 
 
+class _PurgingLLM(FakeLLM):
+    """The retention purge deletes the parent request while the follow-up is being written."""
+
+    def __init__(self, pool, *, commit_after=None):
+        super().__init__()
+        self.pool, self.commit_after, self.batch = pool, commit_after, None
+
+    async def complete(self, messages):
+        if self.calls:                                    # the follow-up, not the first question
+            if self.commit_after is None:
+                async with self.pool.acquire() as c:
+                    _, cutoff = await retention.db_times(c)
+                await retention.purge(self.pool, cutoff, pause_s=0)
+            else:                                         # a batch in flight: deleted, not committed yet
+                self.batch = await self.pool.acquire()
+                self.tx = self.batch.transaction()
+                await self.tx.start()
+                await forget.erase_lock(self.batch)
+                await self.batch.execute("DELETE FROM bot_requests")
+                self.commit = asyncio.create_task(self._commit())
+        return await super().complete(messages)
+
+    async def _commit(self):
+        await asyncio.sleep(self.commit_after)
+        await self.tx.commit()
+        await self.pool.release(self.batch)
+
+
+@pytest.mark.parametrize("commit_after", [None, 0.3], ids=["purged", "purging"])
+async def test_a_follow_up_is_logged_when_the_purge_deletes_its_parent_meanwhile(make_env, pool, conn, commit_after):
+    llm = _PurgingLLM(pool, commit_after=commit_after)
+    bot, _, feed = make_env(llm)
+    await feed(update("message", message(1, "нестор, кто прав?")))
+    await conn.execute("UPDATE bot_requests SET created_at = now() - interval '13 months'")
+    await feed(update("message", message(2, "а подробнее?", reply_to_message=_telegram_view(bot.sent[-1]))))
+    if commit_after is not None:
+        await llm.commit
+    # The follow-up keeps its row, without the parent that left (as ON DELETE SET NULL would leave it).
+    rows = await conn.fetch("SELECT trigger_msg_id, parent_id, status FROM bot_requests")
+    assert [tuple(r) for r in rows] == [(2, None, "ok")]
+    assert bot.reactions[-1] == (2, [])
+
+
 async def test_privacy_says_from_when_and_backup_weeks(make_env):
     bot, _, feed = make_env()
     await feed(update("message", message(1, "/privacy")))
@@ -662,11 +705,17 @@ async def test_forget_me_strips_imported_quotes_forwards_and_names(make_env, con
     petya["from"] |= {"last_name": "Петров", "username": "petya"}
     await feed(update("message", petya))
     # Вася forwards Петя's message from elsewhere: the row is Вася's, the words are Петя's.
+    author = {"id": 222, "is_bot": False, "first_name": "User222", "last_name": "Петров", "username": "petya"}
     forward = message(3, "секрет Пети", uid=111, entities=[{"type": "bold", "offset": 0, "length": 6}],
-                      forward_origin={"type": "user", "date": 1_789_000_000,
-                                      "sender_user": {"id": 222, "is_bot": False, "first_name": "User222",
-                                                      "last_name": "Петров", "username": "petya"}})
+                      forward_origin={"type": "user", "date": 1_789_000_000, "sender_user": author},
+                      forward_from=author, forward_date=1_789_000_000)    # the legacy fields Telegram still sends
     await feed(update("message", forward))
+    # An imported forward names its author by an id.
+    origin = {"type": "user", "date": 1_789_000_000, "sender_id": 222}
+    await conn.execute(
+        "INSERT INTO messages (chat_id, message_id, user_id, sent_at, text, forward_origin, raw) "
+        "VALUES ($1, 5, 111, now(), 'ещё секрет Пети', $2, $3)", CHAT_ID, origin,
+        {"message_id": 5, "text": "ещё секрет Пети", "forward_origin": origin, "import_source": "telegram_import"})
     # An imported reply: Telegram's export does not say who wrote the replied message.
     await conn.execute(
         "INSERT INTO messages (chat_id, message_id, user_id, sent_at, reply_to_id, text, raw) "
@@ -676,12 +725,13 @@ async def test_forget_me_strips_imported_quotes_forwards_and_names(make_env, con
     await feed(update("message", message(4, "/forget_me", uid=222)))
     assert bot.sent[-1]["text"].startswith("🧹 Готово: удалил из архива твои сообщения (2)")
 
-    rows = {r["message_id"]: r for r in await conn.fetch("SELECT * FROM messages WHERE message_id IN (2, 3)")}
+    rows = {r["message_id"]: r for r in await conn.fetch("SELECT * FROM messages WHERE message_id IN (2, 3, 5)")}
     assert "quote" not in rows[2]["raw"] and "личное" not in str(rows[2]["raw"])
-    fwd = rows[3]
-    assert (fwd["user_id"], fwd["text"], fwd["entities"]) == (111, None, None)
-    assert fwd["forward_origin"] == {"type": "user", "sender_user": {"id": 222}}
-    assert fwd["raw"]["forward_origin"] == {"type": "user", "sender_user": {"id": 222}}
-    assert not {"text", "entities"} & set(fwd["raw"]) and "Петров" not in str(fwd["raw"])
+    for fwd in (rows[3], rows[5]):
+        assert (fwd["user_id"], fwd["text"], fwd["entities"]) == (111, None, None)
+        assert fwd["forward_origin"] == {"type": "user", "sender_user": {"id": 222}}
+        assert fwd["raw"]["forward_origin"] == {"type": "user", "sender_user": {"id": 222}}
+        assert not {"text", "entities", "forward_from"} & set(fwd["raw"])
+        assert "Петров" not in str(fwd["raw"]) and "секрет" not in str(fwd["raw"])
     names = await conn.fetchrow("SELECT username, first_name, last_name, opted_out FROM users WHERE user_id = 222")
     assert tuple(names) == (None, None, None, True)

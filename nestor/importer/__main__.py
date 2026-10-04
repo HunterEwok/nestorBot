@@ -34,22 +34,24 @@ log = logging.getLogger("nestor.importer")
 BATCH = 200
 
 
-async def last_imported_id(conn: asyncpg.Connection, chat_id: int) -> int:
-    """Where to resume: after the last imported message, and after the newest one the nightly purge
-    removed (nestor.retention), so history that already left the archive does not come back."""
-    return await conn.fetchval(
-        """SELECT greatest(
-               (SELECT coalesce(max(message_id), 0) FROM messages WHERE chat_id = $1 AND raw ? 'import_source'),
-               (SELECT coalesce(max(message_id), 0) FROM retention_marks WHERE chat_id = $1))""",
-        chat_id,
-    )
+async def import_ranges(conn: asyncpg.Connection, chat_id: int) -> list[tuple[int, int | None]]:
+    """What to import, as (after, before) message ids: everything after the last imported message,
+    except the span the nightly purge removed (nestor.retention), so history that already left the
+    archive does not come back with a fresh stored_at. Older history that never entered it is imported."""
+    imported = await conn.fetchval(
+        "SELECT coalesce(max(message_id), 0) FROM messages WHERE chat_id = $1 AND raw ? 'import_source'", chat_id)
+    purged = await conn.fetchrow("SELECT first_message_id, message_id FROM retention_marks WHERE chat_id = $1", chat_id)
+    if purged is None:
+        return [(imported, None)]
+    older = [(imported, purged["first_message_id"])] if imported + 1 < purged["first_message_id"] else []
+    return [*older, (max(imported, purged["message_id"]), None)]
 
 
 async def import_history(client: TelegramClient, pool: asyncpg.Pool, entity, chat: dict) -> int:
     """Imports one chat's history oldest-first; returns the number of new rows."""
     async with pool.acquire() as conn:
-        min_id = await last_imported_id(conn, chat["id"])
-    log.info("import started", extra={"chat_id": chat["id"], "after_message_id": min_id})
+        ranges = await import_ranges(conn, chat["id"])
+    log.info("import started", extra={"chat_id": chat["id"], "after_message_id": ranges[0][0]})
 
     inserted = seen = 0
     started = time.monotonic()
@@ -63,16 +65,19 @@ async def import_history(client: TelegramClient, pool: asyncpg.Pool, entity, cha
                 inserted += result is store.Result.INSERTED
         batch.clear()
 
-    async for msg in client.iter_messages(entity, reverse=True, min_id=min_id):
-        if not isinstance(msg, (t.Message, t.MessageService)):
-            continue
-        batch.append(to_bot_api(msg, chat, msg.sender))
-        seen += 1
-        if len(batch) >= BATCH:
-            await flush()
-        if seen % 1000 == 0:
-            log.info("import progress", extra={"chat_id": chat["id"], "seen": seen, "inserted": inserted,
-                                               "rate_per_s": round(seen / (time.monotonic() - started), 1)})
+    for after, before in ranges:
+        async for msg in client.iter_messages(entity, reverse=True, min_id=after):
+            if before is not None and msg.id >= before:
+                break
+            if not isinstance(msg, (t.Message, t.MessageService)):
+                continue
+            batch.append(to_bot_api(msg, chat, msg.sender))
+            seen += 1
+            if len(batch) >= BATCH:
+                await flush()
+            if seen % 1000 == 0:
+                log.info("import progress", extra={"chat_id": chat["id"], "seen": seen, "inserted": inserted,
+                                                   "rate_per_s": round(seen / (time.monotonic() - started), 1)})
     if batch:
         await flush()
     log.info("import finished", extra={"chat_id": chat["id"], "seen": seen, "inserted": inserted})

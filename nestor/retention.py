@@ -38,7 +38,7 @@ log = logging.getLogger("nestor.retention")
 BATCH = 500
 MIN_BATCH = 50                  # a slow batch halves, down to this
 PAUSE_S = 0.1                   # between batches: the collector's writes go first
-STATEMENT_TIMEOUT_S = 120
+STATEMENT_TIMEOUT_S = 120       # a batch holds ERASE_LOCK this long at most; nestor.forget.ERASE_WAIT_S outlasts it
 JOB = "retention"
 CONFIRM_JOB = "retention_confirm"
 MAX_SKEW = timedelta(minutes=10)            # Pi clock vs database clock
@@ -82,8 +82,8 @@ SELECT (SELECT count(*) FROM scrubbed) AS answers, (SELECT count(*) FROM gone) A
        (SELECT count(*) FROM unquoted) AS answer_quotes"""
 
 # B. The messages themselves, oldest first; their edits go by ON DELETE CASCADE. A reply that
-#    stays loses its quote of them (found by the replied id, so imported replies too). The newest
-#    id that left is remembered per chat, so the importer does not bring it back.
+#    stays loses its quote of them (found by the replied id, so imported replies too). The span of
+#    ids that left is remembered per chat, so the importer does not bring it back.
 MESSAGES = """
 WITH batch AS (
     SELECT chat_id, message_id FROM messages
@@ -102,9 +102,11 @@ gone AS (
     WHERE m.chat_id = b.chat_id AND m.message_id = b.message_id
     RETURNING m.chat_id, m.message_id),
 marked AS (
-    INSERT INTO retention_marks AS k (chat_id, message_id)
-    SELECT chat_id, max(message_id) FROM gone GROUP BY chat_id
-    ON CONFLICT (chat_id) DO UPDATE SET message_id = greatest(k.message_id, EXCLUDED.message_id), updated_at = now()
+    INSERT INTO retention_marks AS k (chat_id, first_message_id, message_id)
+    SELECT chat_id, min(message_id), max(message_id) FROM gone GROUP BY chat_id
+    ON CONFLICT (chat_id) DO UPDATE
+      SET first_message_id = least(k.first_message_id, EXCLUDED.first_message_id),
+          message_id = greatest(k.message_id, EXCLUDED.message_id), updated_at = now()
     RETURNING 1)
 SELECT (SELECT count(*) FROM gone) AS messages, (SELECT n FROM edits) AS edits,
        (SELECT count(*) FROM unquoted) AS quotes"""
