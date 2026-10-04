@@ -7,8 +7,9 @@
 For each source: whether it answered, how many entries it gave, how many pass the filters,
 the newest date and two titles. With -v, every entry instead of the two titles: the filters'
 verdict (a drop reason or "ok"), its date and title, and what the verdict rests on: score,
-comments, self or link post, the archive's removal category and the link's domain for Reddit;
-the forward for Telegram; the change label for trials; the version for preprints.
+comments, self or link post, the archive's removal category, whether the archive has looked at
+the post again and the link's domain for Reddit; the forward for Telegram; the change label for
+trials; the version for preprints.
 Reads NEWS_CONTACT_EMAIL and NEWS_TELEGRAM_CHANNELS from .env.
 """
 from __future__ import annotations
@@ -86,9 +87,15 @@ def _facts(item: Item, source: Source) -> str:
         out.append(f"score {meta.get('score')}, comments {meta.get('num_comments')}")
         out.append("self" if meta.get("is_self") else "link")
         if meta.get("removed_by"):
-            out.append(f"removed_by {meta['removed_by']}")
+            later = (", approved later" if meta.get("restored")
+                     else ", removed later" if meta.get("removed_later") else "")
+            out.append(f"removed_by {meta['removed_by']}{later}")
+        elif meta.get("removed_later"):
+            out.append("removed later")         # _meta.was_deleted_later without a category
         elif meta.get("removed"):
             out.append("body removed")          # selftext "[removed]" or "[deleted]" without a category
+        if meta.get("rechecked") is False:
+            out.append("not rechecked")         # the archive's second look, about 36 h after posting, is still due
         out.append(f"domain {filters._link_domain(item) or '-'}")
     elif source.kind == "tme" and meta.get("forwarded"):
         out.append(f"forwarded from {meta.get('forwarded_from') or '?'}")

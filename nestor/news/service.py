@@ -146,6 +146,8 @@ class NewsService:
     def _status(self, item: Item, source: Source, now: datetime, *, first_run: bool) -> tuple[str | None, str | None]:
         """(status, drop reason) for a fetched item; (None, None): not worth a row."""
         reason = filters.drop_reason(item, source)
+        if reason == "unsettled" and first_run:
+            return "seen", None     # history like the rest of the first fetch; asked for again next run, then deduped
         if reason is not None:
             return ("dropped", reason) if reason in filters.STORED_REASONS else (None, None)
         if first_run:

@@ -7,8 +7,8 @@ Quirks:
 - /api/posts/search answers {"data": [<full Reddit post objects>]}, errors as
   {"data": null, "error": "..."}. A fields= list with permalink or removed_by_category is
   HTTP 400: fields= is never sent, the full objects come back.
-- Score and num_comments stay 0-1 for about 36 h, so the run asks once a day for the posts
-  36-60 h old, already scored; ranking is client side (the API cannot sort by score). The
+- Score and num_comments stay 0-1 until the archive's second look (below), so the run asks
+  once a day for the posts 36-60 h old; ranking is client side (the API cannot sort by score). The
   cursor keeps where the last window ended: a late run, or one after an outage, starts there,
   so no slice of posts falls between two windows. Up to CATCH_UP_H earlier than usual: the
   posts are then 96 h old, as far as service.MAX_AGE keeps anything new, and a host refusing
@@ -16,10 +16,24 @@ Quirks:
   outage starts CATCH_UP_H early and loses only what lies before that.
 - At most 100 posts per page: a full page is followed by another with before=<oldest
   created_utc>, up to MAX_PAGES. Pages may overlap, posts are deduped by id.
-- removed_by_category is ABSENT on live posts and "reddit", "moderator", "deleted"... on
-  removed ones; spam-filtered posts also carry selftext "[removed]", deleted ones "[deleted]".
-  The archive's snapshot is taken seconds after posting: meta removed_by keeps the raw category,
-  so `python -m nestor.news --check -v` shows what the archive said.
+- removed_by_category is ABSENT on posts live at the first look and "reddit", "moderator",
+  "deleted"... on removed ones. Reddit hides a removed body as "[removed]", "[deleted]" or a
+  longer notice ("[ Removed by Reddit ]"): any of them is a body the bot never saw.
+- The archive looks at a post twice: seconds after posting and again about 36 h later
+  (_meta.retrieved_2nd_on; once 48 h in the records of 2026-10-04). The second look updates
+  score, num_comments and the text. In those records, posts Reddit's filter held back at first
+  and the moderators approved later kept removed_by_category "reddit" with their real text
+  (score up to 91) and _meta {"was_initially_deleted": true, "removal_type": "reddit"}; posts
+  removed at both looks had no such flag. So was_initially_deleted, a second look and a body
+  mean live. Inferred, not seen live: removal_type without was_initially_deleted, or
+  was_deleted_later, is a removal between the two looks (removed_by_category may then be
+  absent) and counts as removed. Whether the second look ever writes a category is not known.
+  A post the archive has not looked at again has the first look's score and removal state: in
+  the usual window it is marked unsettled (filters.py drops it unstored) and the cursor stays
+  at the oldest such post, so the next run asks for it again; once older than the usual window
+  it is taken as it is. A second look later than about 60 h after posting is not waited for:
+  the post is judged on its first look, which drops rather than passes it. meta removed_by
+  keeps the raw category, so `python -m nestor.news --check -v` shows what the archive said.
 - Titles, selftext and url are HTML-escaped (&amp; &lt; &gt;); selftext is Markdown. Titles
   pasted from elsewhere carry entities of their own ("It&amp;#39;s"): text is decoded to the end,
   links only the API's one level.
@@ -41,7 +55,7 @@ from ..text import squash, unescape
 PAGE_SIZE = 100
 MAX_PAGES = 5
 WINDOW_START_H = 60     # after=now-60h
-WINDOW_END_H = 36       # before=now-36h: scores are settled by then
+WINDOW_END_H = 36       # before=now-36h: about when the archive looks at a post again (fetch: unsettled)
 CATCH_UP_H = 36         # a late run or an outage: start where the last window ended, at most this much earlier
 TITLE_MAX = 300
 SUMMARY_MAX = 1500
@@ -68,7 +82,8 @@ _MD_EMPHASIS = re.compile(r"(\*\*|__|~~|>!|!<)")
 _MD_ITALIC = re.compile(r"(?<![\w*\\])([*_])(?=\S)([^\n]{1,300}?)(?<=\S)\1(?![\w*])")
 _MD_LINE = re.compile(r"(?m)^[ \t]*(?:#{1,6}[ \t]+|(?:>[ \t]?)+|[*+-][ \t]+)")
 _MD_ESCAPE = re.compile(r"\\([\\`*_{}\[\]()#+\-.!>~|^])")
-_GONE = ("[removed]", "[deleted]")
+# "[removed]", "[deleted]", "[ Removed by Reddit on account of violating the content policy. ]"
+_GONE = re.compile(r"\[\s*(?:removed|deleted)\b.{0,200}", re.I | re.S)
 
 
 class Page(NamedTuple):
@@ -81,14 +96,16 @@ async def fetch(http: Http, source: Source, cursor: dict, now: datetime) -> Fetc
     """The posts created 36-60 h ago, newest first. A late run starts where the last window ended
     instead, up to CATCH_UP_H earlier; an early one keeps the usual start and the store dedupes
     the overlap by post id. The cursor keeps the window's end, or its start when MAX_PAGES did
-    not reach the oldest posts."""
+    not reach the oldest posts, or the oldest unsettled post when that is earlier."""
     sub = source.params.get("subreddit")
     if not isinstance(sub, str) or not _SUB.fullmatch(sub):
         raise ValueError(f"arctic: bad subreddit {str(sub)[:30]!r}")
     now = now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
-    after = int((now - timedelta(hours=WINDOW_START_H)).timestamp())
+    start = int((now - timedelta(hours=WINDOW_START_H)).timestamp())
+    after = start
     before = int((now - timedelta(hours=WINDOW_END_H)).timestamp())
     end = before
+    unsettled: int | None = None    # the oldest post of the usual window the archive has not looked at again
     until = cursor.get("until") if isinstance(cursor, dict) else None
     if isinstance(until, int) and not isinstance(until, bool) and until < after:
         after = max(until, after - CATCH_UP_H * 3600) - 1   # the bounds may be exclusive; the overlap is deduped
@@ -102,11 +119,17 @@ async def fetch(http: Http, source: Source, cursor: dict, now: datetime) -> Fetc
             if item.ext_id not in seen:
                 seen.add(item.ext_id)
                 items.append(item)
+                created = int(item.published_at.timestamp()) if item.published_at else None
+                if not item.meta["rechecked"] and created is not None and created >= start:
+                    item.meta["unsettled"] = True
+                    unsettled = created if unsettled is None else min(unsettled, created)
         if page.posts < PAGE_SIZE or page.oldest is None or not after < page.oldest < before:
             break
         before = page.oldest
     else:
         end = after   # the page cap cut the window short: its oldest part is unread, the next run starts there
+    if unsettled is not None:
+        end = min(end, unsettled)   # asked for again next run, and taken as it is once older than the usual window
     return FetchResult(items, cursor={"until": end})
 
 
@@ -159,7 +182,13 @@ def _post(p: Any, subreddit: str, lang: str) -> Item | None:
         domain = f"self.{sub}" if is_self else (urlsplit(link).hostname or "") if link else ""
     rbc = p.get("removed_by_category")
     created = _epoch(p.get("created_utc"))
-    gone = selftext.strip() in _GONE
+    gone = _GONE.fullmatch(selftext.strip()) is not None
+    second = p.get("_meta") if isinstance(p.get("_meta"), dict) else {}
+    rechecked = _epoch(second.get("retrieved_2nd_on")) is not None
+    removal = second.get("removal_type")
+    approved = second.get("was_initially_deleted") is True     # removed at the first look, live at the second
+    later = second.get("was_deleted_later") is True or removal not in (None, "") and not approved
+    restored = rechecked and approved and not later and not gone
     meta: dict[str, Any] = {
         "subreddit": sub,
         "score": _int(p.get("score")),
@@ -170,11 +199,17 @@ def _post(p: Any, subreddit: str, lang: str) -> Item | None:
         "over_18": p.get("over_18") is True,
         "stickied": p.get("stickied") is True,
         # a body the bot never saw cannot be checked for trade or doses
-        "removed": rbc not in (None, "") or gone,
+        "removed": gone or later or rbc not in (None, "") and not restored,
         "flair": _plain(p.get("link_flair_text")) or None,
+        "rechecked": rechecked,
     }
-    if isinstance(rbc, str) and rbc.strip():
-        meta["removed_by"] = rbc.strip()[:40]
+    category = next((c.strip()[:40] for c in (rbc, removal) if isinstance(c, str) and c.strip()), None)
+    if category:
+        meta["removed_by"] = category
+    if later:
+        meta["removed_later"] = True
+    elif restored:
+        meta["restored"] = True
     links = [] if gone else _links(selftext)
     if links:
         meta["links"] = links

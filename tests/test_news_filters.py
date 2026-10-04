@@ -699,6 +699,9 @@ def test_community_music_tutorials_pass(title):
 
 
 def test_community_order_of_reasons():
+    # Before the archive's second look, the removal mark and the score are not final.
+    assert drop_reason(post("Spores for sale, 2 g", unsettled=True, removed=True), REDDIT) == "unsettled"
+    assert drop_reason(post("Bad Ras", unsettled=False), REDDIT) is None
     assert drop_reason(post("Spores for sale, 2 g", removed=True, over_18=True), REDDIT) == "removed"
     assert drop_reason(post("Spores for sale, 2 g", over_18=True), REDDIT) == "nsfw"
     assert drop_reason(post("Spores for sale, 2 g", score=1), REDDIT) == "low_score"
@@ -747,8 +750,8 @@ def test_clean_topical_items_pass_every_source(source):
 
 def test_stored_reasons():
     assert STORED_REASONS == {"blocklist", "trade", "dosing", "howto", "crime", "sponsored"}
-    assert {"offtopic", "removed", "nsfw", "stickied", "self_post", "low_score", "pubtype", "minor_update"}.isdisjoint(
-        STORED_REASONS)
+    assert {"offtopic", "unsettled", "removed", "nsfw", "stickied", "self_post", "low_score", "pubtype",
+            "minor_update"}.isdisjoint(STORED_REASONS)
 
 
 # ---- clean_text ----
