@@ -75,6 +75,8 @@ RESEARCH_NEWS_DOMAINS = frozenset({
     "vice.com", "independent.co.uk", "telegraph.co.uk", "cbc.ca", "abc.net.au", "aljazeera.com", "dw.com",
     "spiegel.de", "zeit.de", "sueddeutsche.de", "faz.net", "lemonde.fr", "theverge.com", "nature.org",
     "meduza.io", "nplus1.ru", "knife.media",
+    # sites the digest no longer reads but a post may still link to: High Times refuses our bot (sources.py)
+    "hightimes.com",
 }) | frozenset(
     # the curated sites of sources.py (feeds, Reggaeville), whatever gets added there
     (urlparse(s.url).hostname or "").removeprefix("www.") for s in SOURCES if s.kind in ("rss", "reggaeville")

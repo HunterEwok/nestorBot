@@ -1,11 +1,12 @@
 """RSS 2.0, Atom and RDF (RSS 1.0) feeds: every Source with kind "rss".
 
 What the feeds we read look like, and what this module does about it:
-- WordPress (PsyPost, Marijuana Moment, NORML, Leafly, High Times, Psychedelic Alpha, Lucid News,
-  MAPS, World A Reggae, Нож): guid isPermaLink="false" (usually ?p=<id>, Marijuana Moment uses the
+- WordPress (PsyPost, Marijuana Moment, NORML, Leafly, Psychedelic Alpha, Lucid News, MAPS,
+  World A Reggae, Нож): guid isPermaLink="false" (usually ?p=<id>, Marijuana Moment uses the
   article URL), the full post in content:encoded, repeated <category>, titles with numeric entities.
-  High Times appends utm_* to links and tags advertorials "Sponsored" (filters.py drops them by
-  category); NORML descriptions open with an <img>; NORML guids carry "&#038;".
+  Some append utm_* to links and tag advertorials "Sponsored" (High Times did, before it refused
+  bots; filters.py drops such posts by params drop_categories); NORML descriptions open with an
+  <img>; NORML guids carry "&#038;".
 - Squarespace (Daily Reggae): opaque guids, so params id_from_link keys items by the link.
 - ScienceDaily: dates in EDT/EST; its CDN serves stale copies, so params cache_buster adds
   ?_=<unix hour>; its terms forbid keeping the text, so params keep_text=False empties the summary.

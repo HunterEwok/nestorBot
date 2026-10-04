@@ -43,6 +43,9 @@ UTC = timezone.utc
 NOW = datetime(2026, 10, 4, 18, 30, tzinfo=UTC)
 SRC = {s.key: s for s in SOURCES}
 GENERIC = Source("test_feed", "Test", "rss", "https://example.org/feed/", None, every_h=1)
+# No longer in the registry (it refuses bots); its saved feed still tests utm_* links and sponsored posts.
+HIGHTIMES = Source("hightimes", "High Times", "rss", "https://hightimes.com/category/news/feed/", "policy", every_h=2,
+                   params={"drop_categories": ("sponsored", "grow", "products", "strains", "deals")})
 # Every kind "rss" source of the registry and the saved feed it is tested on.
 FIXTURE_OF = {
     "psypost": "feeds_psypost.xml",
@@ -52,7 +55,6 @@ FIXTURE_OF = {
     "norml_news": "feeds_norml_news.xml",
     "norml_blog": "feeds_norml_blog.xml",
     "leafly_politics": "feeds_leafly_politics.xml",
-    "hightimes": "feeds_hightimes.xml",
     "psychedelicalpha": "feeds_psychedelicalpha.xml",
     "lucidnews": "feeds_lucidnews.xml",
     "maps": "feeds_maps.xml",
@@ -136,7 +138,7 @@ async def test_fetch_passes_http_errors_through():
 async def test_fetch_bad_body_is_a_value_error():
     http = FakeHttp([("GET", r".", Response(200, fixture("feeds_not_a_feed.html"), "https://hightimes.com/x"))])
     with pytest.raises(ValueError):
-        await feeds.fetch(http, SRC["hightimes"], {}, NOW)
+        await feeds.fetch(http, HIGHTIMES, {}, NOW)
 
 
 # ---- WordPress RSS 2.0 ----
@@ -183,7 +185,7 @@ def test_norml_blog_description_starting_with_an_image():
 
 
 def test_high_times_utm_links_and_sponsored_category():
-    items = _by_url(_parse("feeds_hightimes.xml", SRC["hightimes"]))
+    items = _by_url(_parse("feeds_hightimes.xml", HIGHTIMES))
     jamaica = items["https://hightimes.com/news/world/jamaicas-cannabis-reform-opens-a-new-path-for-small-growers/"]
     assert jamaica.ext_id == "https://hightimes.com/?p=320307"
     assert jamaica.title == "Jamaica’s Cannabis Reform Opens a New Path for Small Growers"

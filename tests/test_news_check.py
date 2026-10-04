@@ -49,10 +49,10 @@ def fake(monkeypatch):
 
 
 async def test_default_output_is_unchanged(fake, capsys):
-    assert await cli.check(["reddit_psychonaut", "hightimes"]) == 1
+    assert await cli.check(["reddit_psychonaut", "marijuanamoment"]) == 1
     out = capsys.readouterr().out.splitlines()
     newest = WHEN.astimezone().strftime("%Y-%m-%d %H:%M")
-    assert out == ["✗ hightimes: HTTP 403",     # in registry order
+    assert out == ["✗ marijuanamoment: HTTP 403",     # in registry order
                    f"✓ reddit_psychonaut: записей 3, проходят фильтр 1, самая новая {newest}; "
                    "отброшено: removed 1, low_score 1",
                    "    Psilocybin trial results",
