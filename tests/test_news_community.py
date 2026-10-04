@@ -260,6 +260,8 @@ async def test_arctic_pages_at_most_five_times():
     result = await arctic.fetch(http, SRC["reddit_dub"], {}, NOW)
     assert len(http.calls) == arctic.MAX_PAGES == 5
     assert len(result.items) == 500
+    # The older part of the window is unread: the next run starts at this window's start, not its end.
+    assert result.cursor == {"until": AFTER}
 
 
 async def test_arctic_stops_when_the_page_does_not_move_back():
@@ -267,6 +269,7 @@ async def test_arctic_stops_when_the_page_does_not_move_back():
     http = FakeHttp([("GET", ARCTIC_URL, _page(BEFORE - 1, 100))])
     result = await arctic.fetch(http, SRC["reddit_dub"], {}, NOW)
     assert len(http.calls) == 2 and len(result.items) == 100
+    assert result.cursor == {"until": BEFORE}
 
 
 async def test_arctic_empty_window():

@@ -80,7 +80,8 @@ class Page(NamedTuple):
 async def fetch(http: Http, source: Source, cursor: dict, now: datetime) -> FetchResult:
     """The posts created 36-60 h ago, newest first. A late run starts where the last window ended
     instead, up to CATCH_UP_H earlier; an early one keeps the usual start and the store dedupes
-    the overlap by post id. The cursor keeps the window's end."""
+    the overlap by post id. The cursor keeps the window's end, or its start when MAX_PAGES did
+    not reach the oldest posts."""
     sub = source.params.get("subreddit")
     if not isinstance(sub, str) or not _SUB.fullmatch(sub):
         raise ValueError(f"arctic: bad subreddit {str(sub)[:30]!r}")
@@ -104,6 +105,8 @@ async def fetch(http: Http, source: Source, cursor: dict, now: datetime) -> Fetc
         if page.posts < PAGE_SIZE or page.oldest is None or not after < page.oldest < before:
             break
         before = page.oldest
+    else:
+        end = after   # the page cap cut the window short: its oldest part is unread, the next run starts there
     return FetchResult(items, cursor={"until": end})
 
 
