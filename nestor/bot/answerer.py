@@ -830,6 +830,8 @@ class Answerer:
                 name = _snippet(first["text"])
                 if first["user_id"] is not None:
                     job.quoted.add(first["user_id"])
+            else:                   # the model named it from these messages and may have kept their words
+                job.quoted |= {r["user_id"] for r in rows if r["user_id"] not in (None, self.me.user_id)}
             name = html.escape(name)
             size = b["size"]
             link = context.message_link(first["chat_id"], first["message_id"], first["thread_id"],

@@ -306,7 +306,9 @@ async def test_stats_names_the_longest_branches(make_env, conn):
     naming = llm.calls[0]
     assert naming[0]["content"] == prompts.TOPICS_SYSTEM and "Бюджет пуст" in naming[1]["content"]
     assert await conn.fetchval("SELECT input_tokens FROM bot_requests WHERE scenario = 'stats'") == 1000
-    assert await conn.fetchval("SELECT quoted_user_ids FROM bot_requests WHERE scenario = 'stats'") is None
+    # The model named the branch from its messages and may have kept their words: their authors
+    # go with the answer. The other branch was not shown to it.
+    assert await conn.fetchval("SELECT quoted_user_ids FROM bot_requests WHERE scenario = 'stats'") == [222, 333, 444]
 
     # Without a name from the model, a branch is called by its first words: its author's own,
     # so their /forget_me removes that /stats answer from the archive.
