@@ -5,7 +5,8 @@ A profile is fixed by what it can reach and by its model (set in its config.yaml
 - deep:  the same archive tools, a bigger model (Sonnet or Opus); optional;
 - web:   internet search, no archive, a cheap model;
 - smart: internet search, no archive, a bigger model; optional;
-- news:  no tools at all, a cheap model, for sorting public news items; optional.
+- news:  no tools at all, a cheap model, for sorting public news items and for picking
+         reactions to chat messages (nothing to search with, nothing to read); optional.
 
 Tasks that read the archive may only go to group/deep, tasks that search the internet only
 to web/smart: that split is what keeps chat text out of search queries, so a route that
@@ -22,6 +23,7 @@ from .llm import LLM
 ARCHIVE = ("group", "deep")
 WEB = ("web", "smart")
 PUBLIC = ("news", "web", "smart")   # public news items only: any profile without the archive
+NO_WEB = ("news", "group")          # chat text without the internet: reactions
 BIG = frozenset({"deep", "smart"})
 
 # task -> (profiles it may use, default profile)
@@ -39,6 +41,7 @@ TASKS: dict[str, tuple[tuple[str, ...], str]] = {
     "wisdom": (WEB, "smart"),
     "news_triage": (PUBLIC, "news"),     # one line per news item
     "news": (PUBLIC, "smart"),           # the evening news digest
+    "react": (NO_WEB, "news"),           # reactions to emotional messages; no `news` profile: the code decides
 }
 FALLBACK = {"deep": ("group",), "smart": ("web",), "news": ("web", "smart"), "group": (), "web": ()}
 
@@ -65,10 +68,11 @@ class Router:
         self.routes = routes or {}
 
     def profile(self, task: str) -> str | None:
-        """The configured profile for a task, or its fallback; None if none of them is set up."""
+        """The configured profile for a task, or its fallback; None if none of them is set up.
+        Reactions never fall back: without their profile the code picks them for free."""
         allowed, default = TASKS[task]
         wanted = self.routes.get(task, default)
-        for name in (wanted, *FALLBACK.get(wanted, ())):
+        for name in (wanted, *(FALLBACK.get(wanted, ()) if task != "react" else ())):
             if name in allowed and name in self.clients:
                 return name
         return None

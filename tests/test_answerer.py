@@ -36,6 +36,9 @@ class FakeBot(BaseFakeBot):
         self.no_private = set(no_private)  # users who never opened a private chat with the bot
         self.bot_status = ChatMemberStatus.MEMBER
         self.send_errors: list[Exception] = []  # raised by the next send_message calls, one per call
+        self.reaction_errors: dict[str, Exception] = {}  # emoji -> raised by set_message_reaction
+        self.available_reactions = None   # ChatFullInfo.available_reactions; None: all allowed
+        self.get_chat_calls = 0
 
     async def send_message(self, chat_id, text, reply_parameters=None, **kw):
         if self.send_errors:
@@ -60,8 +63,21 @@ class FakeBot(BaseFakeBot):
         return True
 
     async def set_message_reaction(self, chat_id, message_id, reaction=None, **kw):
-        self.reactions.append((message_id, [r.emoji for r in reaction or []]))
+        emojis = [r.emoji for r in reaction or []]
+        for emoji in emojis:
+            if emoji in self.reaction_errors:
+                raise self.reaction_errors[emoji]
+        self.reactions.append((message_id, emojis))
         return True
+
+    async def get_chat(self, chat_id, **kw):
+        self.get_chat_calls += 1
+
+        class Chat:
+            pass
+        chat = Chat()
+        chat.id, chat.available_reactions = chat_id, self.available_reactions
+        return chat
 
     async def send_chat_action(self, chat_id, action, **kw):
         self.actions.append(action)
@@ -381,3 +397,42 @@ async def test_mcp_server_exposes_only_read_tools():
 
     names = sorted(t.name for t in await server.list_tools())
     assert names == ["find_files", "find_links", "get_recent", "get_thread", "get_user_messages", "search_messages"]
+
+
+# ---- formatting ----
+
+async def test_model_markdown_is_sent_as_telegram_formatting(make_env, conn):
+    answer = "**Итог:** договорились ехать 🏖\n\n- Петя: [«беру палатку»](#1)\n- Вася: #2\n- кто-то: [«удалено»](#99)"
+    bot, llm, feed = make_env(FakeLLM(answer))
+    await feed(update("message", message(1, "беру палатку и котелок", uid=222)))
+    await feed(update("message", message(2, "а я гитару", uid=333)))
+    await conn.execute("UPDATE users SET opted_out = TRUE WHERE user_id = 333")   # Вася used /forget_me
+    await feed(update("message", message(3, "нестор, о чём договорились?", uid=111)))
+    sent = bot.sent[-1]
+    assert sent["parse_mode"] == "HTML" and sent["text"] == (
+        "<b>Итог:</b> договорились ехать 🏖\n\n"
+        '• Петя: <a href="https://t.me/c/1000000001/1">«беру палатку»</a>\n'
+        "• Вася: #2\n"                      # an author who opted out: no quote, no link
+        "• кто-то: «удалено»")
+    assert "Стиль собеседника: пишет коротко." in llm.calls[0][-1]["content"]
+    assert await conn.fetchval("SELECT answer FROM bot_requests") == answer
+
+
+async def test_refused_formatting_is_sent_as_plain_text(make_env, conn):
+    from aiogram.methods import SendMessage
+    from aiogram.exceptions import TelegramBadRequest
+
+    bot, llm, feed = make_env(FakeLLM("**Итог:** [сайт](https://a.example)"))
+    bot.send_errors = [TelegramBadRequest(SendMessage(chat_id=CHAT_ID, text="x"),
+                                          "Bad Request: can't parse entities")]
+    await feed(update("message", message(1, "нестор, итог?")))
+    assert [(s["text"], s["parse_mode"]) for s in bot.sent] == [("Итог: сайт (a.example)", None)]
+    assert await conn.fetchval("SELECT status FROM bot_requests") == "ok"
+
+
+async def test_long_writers_get_room_for_longer_answers(make_env):
+    bot, llm, feed = make_env()
+    for i in range(1, 4):
+        await feed(update("message", message(i, "очень подробное рассуждение " * 12, uid=111)))
+    await feed(update("message", message(4, "нестор, а ты что думаешь?", uid=111)))
+    assert "Стиль собеседника: пишет развёрнуто." in llm.calls[0][-1]["content"]

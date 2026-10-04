@@ -27,7 +27,7 @@ from aiogram.types import (BufferedInputFile, InlineKeyboardMarkup, LinkPreviewO
                            ReplyParameters)
 
 from ..collector.app import dump
-from . import context, daily, export, markup, music, prompts, reminders, routing
+from . import context, daily, export, markup, music, prompts, reactions, reminders, routing
 from .llm import LLM, Completion
 from .markup import TELEGRAM_LIMIT, split_text
 from .triggers import BotIdentity, Invocation, detect
@@ -58,6 +58,8 @@ class AnswerConfig:
     news_chat_ids: frozenset[int] = frozenset()      # news digest on by default; /news on|off overrides
     news_time: dtime = dtime(20, 0)
     news_max_topics: int = 10
+    reaction_chat_ids: frozenset[int] = frozenset()  # reactions on by default; /reactions on|off overrides
+    reactions: reactions.ReactionConfig = reactions.ReactionConfig()
 
 
 @dataclass
@@ -103,6 +105,9 @@ class Answerer:
         self.news = news                # nestor.news.service.NewsService, None without the news digest
         self.checker = checker or music.HttpChecker()
         self.save_outgoing = save_outgoing
+        self.reactor = reactions.Reactor(bot, pool, lambda: self.router.llm("react"), wanted=self._reactions_wanted,
+                                         calls_today=self._reaction_calls_today, may_spend=self._may_spend_on_reactions,
+                                         log_call=self._log_reaction, cfg=cfg.reactions)
         self._queues: dict[int, asyncio.Queue[Callable[[], Awaitable[None]]]] = {}
         self._workers: dict[int, asyncio.Task] = {}
 
@@ -113,12 +118,20 @@ class Answerer:
         async with self.pool.acquire() as conn:
             settings = await conn.fetchval("SELECT settings FROM chats WHERE chat_id = $1", msg["chat"]["id"]) or {}
         inv = detect(msg, self.me, generic_keyword_enabled=settings.get("keyword_bot", True))
-        if inv is None or "from" not in msg:
+        if "from" not in msg:
+            return
+        if inv is None:
+            if not paused and self._reactions_on(msg["chat"]["id"], settings):
+                self.reactor.consider(msg)
             return
         if paused and inv.command != "resume":
             return
         if inv.kind == "command":
             await self._command(msg, inv)
+            return
+        thanks = reactions.acknowledgement(inv.text)
+        if thanks is not None:   # «спасибо», «ок»: a reaction says it, no model needed
+            await self._put_reaction(msg, thanks)
             return
         think, question = routing.split_think(inv.text)
         scenario = context.classify(question, reply_target=_reply_target(msg, inv) is not None)
@@ -149,6 +162,7 @@ class Answerer:
         """Wait until all queued jobs are done (tests, shutdown)."""
         for queue in list(self._queues.values()):
             await queue.join()
+        await self.reactor.drain()
 
     async def _worker(self, chat_id: int) -> None:
         queue = self._queues[chat_id]
@@ -187,14 +201,14 @@ class Answerer:
             await self._list_reminders(msg)
         elif cmd == "unremind":
             await self._unremind(msg, inv.args)
-        elif cmd in ("pause", "resume", "bot_word", "digest", "wisdom", "news"):
+        elif cmd in ("pause", "resume", "bot_word", "digest", "wisdom", "news", "reactions"):
             if not await self._is_admin(msg):
                 await self._reply(msg, prompts.ADMINS_ONLY)
                 return
             if cmd == "news" and inv.args.strip().lower() in ("status", "статус"):
                 await self._reply(msg, await self._news_status())
                 return
-            if cmd in ("digest", "wisdom", "news"):
+            if cmd in ("digest", "wisdom", "news", "reactions"):
                 await self._toggle(msg, cmd, inv.args)
                 return
             async with self.pool.acquire() as conn:
@@ -209,7 +223,7 @@ class Answerer:
             await self._reply(msg, prompts.RESUMED if cmd == "resume" else prompts.PAUSED)
 
     async def _toggle(self, msg: dict, key: str, args: str) -> None:
-        """/digest, /wisdom, /news on|off; without an argument shows the current state."""
+        """/digest, /wisdom, /news, /reactions on|off; without an argument shows the current state."""
         chat_id, arg = msg["chat"]["id"], args.strip().lower()
         async with self.pool.acquire() as conn:
             if arg:
@@ -225,6 +239,10 @@ class Answerer:
             on = self._news_on(chat_id, settings)
             text = prompts.NEWS_STATE.format(state="включена" if on else "выключена",
                                              time=self.cfg.news_time.strftime("%H:%M"), topics=self.cfg.news_max_topics)
+        elif key == "reactions":
+            on = self._reactions_on(chat_id, settings)
+            text = prompts.REACTIONS_STATE.format(state="включены" if on else "выключены",
+                                                  per_hour=self.cfg.reactions.per_hour)
         else:
             on = self._wisdom_on(chat_id, settings)
             text = prompts.WISDOM_STATE.format(state="включена" if on else "выключена",
@@ -238,6 +256,42 @@ class Answerer:
     def _news_on(self, chat_id: int, settings: dict) -> bool:
         value = (settings or {}).get("news")
         return bool(value) if value is not None else chat_id in self.cfg.news_chat_ids
+
+    def _reactions_on(self, chat_id: int, settings: dict) -> bool:
+        value = (settings or {}).get("reactions")
+        return bool(value) if value is not None else chat_id in self.cfg.reaction_chat_ids
+
+    # ---- reactions (nestor.bot.reactions) ----
+
+    async def _reactions_wanted(self, chat_id: int) -> bool:
+        """Checked again when a batch is due: the chat may have been paused or switched off meanwhile."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT enabled, settings FROM chats WHERE chat_id = $1", chat_id)
+        return row is not None and row["enabled"] and self._reactions_on(chat_id, row["settings"] or {})
+
+    async def _reaction_calls_today(self, chat_id: int) -> int:
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT count(*) FROM bot_requests WHERE chat_id = $1 AND scenario = 'reaction' AND created_at >= $2",
+                chat_id, self._day_start())
+
+    async def _may_spend_on_reactions(self) -> bool:
+        """Reactions stop asking the model at half the daily tokens: answers come first."""
+        async with self.pool.acquire() as conn:
+            return await self._tokens_today(conn) < self.cfg.daily_token_limit // 2
+
+    async def _log_reaction(self, chat_id: int, completion: Completion, started: float, status: str) -> None:
+        async with self.pool.acquire() as conn:
+            await self._log_scheduled(conn, chat_id, "reaction", completion, [], started, status=status)
+
+    async def _put_reaction(self, msg: dict, emoji: str) -> bool:
+        try:
+            await self.bot.set_message_reaction(msg["chat"]["id"], msg["message_id"],
+                                                reaction=[ReactionTypeEmoji(emoji=emoji)])
+        except TelegramAPIError as e:
+            log.warning("reaction failed", extra={"chat_id": msg["chat"]["id"], "error": type(e).__name__})
+            return False
+        return True
 
     async def _is_admin(self, msg: dict) -> bool:
         if msg["from"]["id"] == ANONYMOUS_ADMIN_ID and (msg.get("sender_chat") or {}).get("id") == msg["chat"]["id"]:

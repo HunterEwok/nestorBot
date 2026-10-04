@@ -1,0 +1,253 @@
+"""Reactions to emotional messages: the code's candidates, the model's picks, and the limits."""
+import json
+import time
+from datetime import datetime, timezone
+
+import pytest
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.methods import SetMessageReaction
+from aiogram.types import ReactionTypeEmoji
+
+from nestor.bot import prompts, reactions
+from nestor.bot.reactions import ALLOWED, STANDARD, Guess, ReactionConfig, acknowledgement, eligible, guess, parse
+
+from .factories import CHAT_ID, message, update
+from .test_answerer import FakeLLM, make_env_fixture  # noqa: F401 - the fixture is used by name
+
+NOW = lambda: int(datetime.now(timezone.utc).timestamp())  # noqa: E731
+FAST = ReactionConfig(delay_s=0)
+
+
+def answer(*pairs) -> str:
+    return json.dumps({"reactions": [{"n": n, "emoji": e} for n, e in pairs]}, ensure_ascii=False)
+
+
+def picks(*pairs) -> FakeLLM:
+    return FakeLLM(answer(*pairs))
+
+
+class SeqLLM(FakeLLM):
+    """One answer per call, in order."""
+
+    def __init__(self, *answers):
+        super().__init__()
+        self.answers = list(answers)
+
+    async def complete(self, messages):
+        self.answer = self.answers.pop(0)
+        return await super().complete(messages)
+
+
+# ---- pure parts ----
+
+def test_the_bot_uses_only_standard_and_friendly_reactions():
+    assert set(ALLOWED) <= STANDARD and len(STANDARD) == 73
+    assert not {"👎", "🤡", "💩", "🖕", "🤬", "🤮", "💊", "😡", "🥱", "💋"} & set(ALLOWED)
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("Ахахахах, ну ты даёшь", Guess("🤣", True)),
+    ("лол", Guess("🤣", True)),
+    ("ну да)))", Guess("😁", True)),
+    ("Ура, сдал на права!", Guess("🎉", True)),
+    ("С днём рождения!", Guess("🎉", True)),
+    ("обожаю этот трек ❤️", Guess("❤", True)),
+    ("жаль, что не смогу", Guess("😢", False)),           # the model decides: maybe just politeness
+    ("у меня комп умер", Guess("🙏", False)),
+    ("ничего себе новости", Guess("😱", False)),
+    ("Это вообще как?!?!", Guess(None, False)),
+    ("привет, как дела", None),
+    ("", None),
+    (None, None),
+])
+def test_guess(text, expected):
+    assert guess(text) == expected
+
+
+def test_eligible():
+    assert eligible(message(1, "ахаха"))
+    assert not eligible(message(1, None))
+    assert not eligible(message(1, "/stats ахаха"))
+    assert not eligible(message(1, "ахаха", **{"from": {"id": 5, "is_bot": True, "first_name": "B"}}))
+    assert not eligible(message(1, "ахаха", forward_origin={"type": "hidden_user", "date": 1, "sender_user_name": "X"}))
+    assert not eligible(message(1, "ахаха", sender_chat={"id": CHAT_ID, "type": "supergroup"}))
+    assert eligible(message(1, None, caption="ахаха", photo=[]))
+
+
+@pytest.mark.parametrize("text, emoji", [
+    ("спасибо!", "❤"), ("Спасибо большое, нестор 🙏", "❤"), ("спс", "❤"), ("благодарю", "❤"), ("Thanks", "❤"),
+    ("ок)", "👌"), ("Понял.", "👌"), ("ясно", "👌"),
+    ("👍", "👍"), ("❤️", "❤"), ("🔥🔥", "🔥"), (")))", "😁"), ("🍺", "👌"),
+    ("понял?", None), ("спасибо, а почему так?", None), ("ок, а завтра?", None), ("что?", None), ("", None),
+    ("??", None),
+])
+def test_acknowledgement(text, emoji):
+    assert acknowledgement(text) == emoji
+
+
+def test_parse():
+    allowed = frozenset({"😁", "❤", "🎉"})
+    answer = 'Вот: {"reactions": [{"n": 1, "emoji": "😁"}, {"n": 2, "emoji": "❤️"}, {"n": 1, "emoji": "🎉"}, ' \
+             '{"n": 3, "emoji": "👎"}, {"n": 9, "emoji": "🎉"}, {"n": true, "emoji": "🎉"}, ' \
+             '{"n": "4", "emoji": "🎉"}, ' \
+             '"мусор", {"n": 4}]}'
+    assert parse(answer, 4, allowed) == {1: "😁", 2: "❤"}
+    assert parse("не JSON", 4, allowed) == {} and parse('{"reactions": "нет"}', 4, allowed) == {}
+    assert parse(None, 4, allowed) == {}
+
+
+# ---- in the bot ----
+
+async def test_the_model_picks_reactions_without_seeing_names(make_env, conn):
+    model = SeqLLM(answer((1, "😁"), (2, "🎉")), answer((1, "👎")))
+    bot, llm, feed = make_env(news_llm=model, reaction_chat_ids=frozenset({CHAT_ID}), reactions=FAST)
+    await feed(update("message", message(1, "Ахахаха, Петя опять проспал", uid=222, date=NOW())))
+    await feed(update("message", message(2, "ну всё, приехали!!!", uid=333, date=NOW())))
+    await feed(update("message", message(3, "встречаемся в шесть", uid=444, date=NOW())))
+
+    # n=2 of the first batch does not exist; 👎 is not the bot's to put; a neutral message is not asked about.
+    assert bot.reactions == [(1, ["😁"])]
+    assert llm.calls == []                                 # the archive model is not involved
+    system, user = model.calls[0][0]["content"], model.calls[0][1]["content"]
+    assert user == "1. Ахахаха, Петя опять проспал" and "User222" not in user
+    assert "👎" not in system and "😁" in system
+    assert len(model.calls) == 2 and model.calls[1][1]["content"] == "1. ну всё, приехали!!!"
+    rows = await conn.fetch("SELECT * FROM bot_requests WHERE scenario = 'reaction'")
+    logged = [(r["chat_id"], r["user_id"], r["input_tokens"], r["status"]) for r in rows]
+    assert logged == [(CHAT_ID, None, 1000, "ok")] * 2
+
+
+async def test_without_the_model_only_sure_guesses(make_env):
+    bot, llm, feed = make_env(reaction_chat_ids=frozenset({CHAT_ID}), reactions=FAST)
+    await feed(update("message", message(1, "ахахах", uid=222, date=NOW())))
+    await feed(update("message", message(2, "жаль, конечно", uid=333, date=NOW())))
+    await feed(update("message", message(3, "С днём рождения, Вася!", uid=444, date=NOW())))
+    assert bot.reactions == [(1, ["🤣"]), (3, ["🎉"])] and llm.calls == []
+
+
+async def test_a_failing_model_falls_back_to_sure_guesses(make_env):
+    bot, llm, feed = make_env(news_llm=FakeLLM(fail=True), reaction_chat_ids=frozenset({CHAT_ID}), reactions=FAST)
+    await feed(update("message", message(1, "ахахах", uid=222, date=NOW())))
+    assert bot.reactions == [(1, ["🤣"])]
+
+
+async def test_reactions_follow_what_the_chat_allows(make_env):
+    model = picks((1, "😁"))
+    bot, llm, feed = make_env(news_llm=model, reaction_chat_ids=frozenset({CHAT_ID}), reactions=FAST)
+    bot.available_reactions = [ReactionTypeEmoji(emoji="👍"), ReactionTypeEmoji(emoji="❤️")]
+    await feed(update("message", message(1, "ахахах", uid=222, date=NOW())))
+    assert bot.reactions == []                             # the model picked one the chat does not allow
+    assert "Только эмодзи из этого списка: 👍 ❤\n" in model.calls[0][0]["content"]
+
+    bot.available_reactions = []                           # reactions switched off in the group
+    feed.answerer.reactor._available.clear()
+    await feed(update("message", message(2, "ахахах", uid=222, date=NOW())))
+    assert len(model.calls) == 1 and bot.reactions == []
+
+
+async def test_a_refused_reaction_is_not_tried_again(make_env):
+    bot, llm, feed = make_env(reaction_chat_ids=frozenset({CHAT_ID}), reactions=FAST)
+    bot.reaction_errors["🤣"] = TelegramBadRequest(SetMessageReaction(chat_id=CHAT_ID, message_id=1, reaction=[]),
+                                                   "Bad Request: REACTION_INVALID")
+    await feed(update("message", message(1, "ахахах", uid=222, date=NOW())))
+    assert "🤣" not in feed.answerer.reactor._available[CHAT_ID][1]
+    del bot.reaction_errors["🤣"]
+    await feed(update("message", message(2, "ахахах", uid=222, date=NOW())))
+    assert bot.reactions == [] and bot.get_chat_calls == 1
+
+
+async def test_hourly_and_daily_limits(make_env, conn):
+    model = picks((1, "😁"), (2, "🎉"))
+    cfg = ReactionConfig(delay_s=0, per_hour=1, calls_per_day=1)
+    bot, llm, feed = make_env(news_llm=model, reaction_chat_ids=frozenset({CHAT_ID}), reactions=cfg)
+    await feed(update("message", message(1, "ахахах", uid=222, date=NOW())))
+    assert bot.reactions == [(1, ["😁"])]
+    assert "Не больше 1 реакций" in model.calls[0][0]["content"]
+    await feed(update("message", message(2, "ура!", uid=333, date=NOW())))
+    assert bot.reactions == [(1, ["😁"])] and len(model.calls) == 1   # an hour has not passed
+
+    feed.answerer.reactor._done.clear()
+    await feed(update("message", message(3, "ура!", uid=333, date=NOW())))
+    assert len(model.calls) == 1 and bot.reactions[-1] == (3, ["🎉"])  # the day's model calls are used up
+
+
+async def test_reactions_stop_asking_the_model_at_half_the_daily_tokens(make_env, conn):
+    model = picks((1, "😁"))
+    bot, llm, feed = make_env(news_llm=model, reaction_chat_ids=frozenset({CHAT_ID}), reactions=FAST,
+                              daily_token_limit=10_000)
+    await conn.execute(
+        "INSERT INTO bot_requests (chat_id, scenario, input_tokens, status) VALUES ($1, 'x', 5000, 'ok')", CHAT_ID)
+    await feed(update("message", message(1, "ахахах", uid=222, date=NOW())))
+    assert model.calls == [] and bot.reactions == [(1, ["🤣"])]
+
+
+async def test_old_deleted_and_forgotten_messages_get_nothing(make_env, conn):
+    model = picks((1, "😁"), (2, "😁"))
+    bot, llm, feed = make_env(news_llm=model, reaction_chat_ids=frozenset({CHAT_ID}), reactions=FAST)
+    await feed(update("message", message(1, "ахахах", uid=222, date=NOW() - 3600)))
+    assert model.calls == [] and bot.reactions == []
+
+    # Queued, then the author used /forget_me before the batch was due.
+    reactor = feed.answerer.reactor
+    msg = message(2, "ахахах", uid=333, date=NOW())
+    await feed.answerer.save_outgoing(msg)
+    await conn.execute("UPDATE users SET opted_out = TRUE WHERE user_id = 333")
+    assert reactor.consider(msg)
+    await reactor.drain()
+    assert model.calls == [] and bot.reactions == []
+
+
+async def test_reactions_are_off_by_default_and_switched_by_admins(make_env):
+    bot, llm, feed = make_env(admins={111}, reactions=FAST)
+    await feed(update("message", message(1, "ахахах", uid=222, date=NOW())))
+    assert bot.reactions == []
+    await feed(update("message", message(2, "/reactions on", uid=222)))
+    assert bot.sent[-1]["text"] == prompts.ADMINS_ONLY
+    await feed(update("message", message(3, "/reactions on", uid=111)))
+    assert bot.sent[-1]["text"].startswith("Реакции включены.")
+    await feed(update("message", message(4, "ахахах", uid=222, date=NOW())))
+    assert bot.reactions == [(4, ["🤣"])]
+
+    await feed(update("message", message(5, "/pause", uid=111)))
+    await feed(update("message", message(6, "ахахах", uid=222, date=NOW())))
+    await feed(update("message", message(7, "/resume", uid=111)))
+    await feed(update("message", message(8, "/reactions off", uid=111)))
+    assert bot.sent[-1]["text"].startswith("Реакции выключены.")
+    await feed(update("message", message(9, "ахахах", uid=222, date=NOW())))
+    assert bot.reactions == [(4, ["🤣"])]
+
+
+async def test_a_batch_waits_and_keeps_the_newest(make_env):
+    model = picks((1, "😁"), (3, "🎉"))
+    cfg = ReactionConfig(delay_s=0.2, batch=3)
+    bot, llm, feed = make_env(news_llm=model, reaction_chat_ids=frozenset({CHAT_ID}), reactions=cfg)
+    answerer = feed.answerer
+    for i in range(1, 6):
+        await answerer.save_outgoing(message(i, f"ахахах {i}", uid=200 + i, date=NOW()))
+        await answerer.on_message(message(i, f"ахахах {i}", uid=200 + i, date=NOW()), paused=False)
+    await answerer.drain()
+    assert len(model.calls) == 1
+    assert model.calls[0][1]["content"] == "1. ахахах 3\n2. ахахах 4\n3. ахахах 5"
+    assert bot.reactions == [(3, ["😁"]), (5, ["🎉"])]
+
+
+async def test_thanks_to_the_bot_gets_a_reaction_not_an_answer(make_env, conn):
+    bot, llm, feed = make_env()
+    await feed(update("message", message(1, "нестор, привет", uid=222)))
+    answer = bot.sent[-1]
+    bot_msg = {"message_id": answer["message_id"], "date": NOW(), "chat": {"id": CHAT_ID, "type": "supergroup"},
+               "from": {"id": 42, "is_bot": True, "first_name": "Нестор", "username": "ewok_nestor_bot"},
+               "text": answer["text"]}
+    await feed(update("message", message(2, "спасибо!", uid=222, reply_to_message=bot_msg)))
+    await feed(update("message", message(3, "нестор, ок)", uid=222)))
+    await feed(update("message", message(4, "спасибо, а почему?", uid=222, reply_to_message=bot_msg)))
+    assert (2, ["❤"]) in bot.reactions and (3, ["👌"]) in bot.reactions
+    assert len(llm.calls) == 2 and await conn.fetchval("SELECT count(*) FROM bot_requests") == 2
+
+
+def test_rules_are_quick():
+    started = time.monotonic()
+    for _ in range(2000):
+        guess("обычное длинное сообщение без эмоций " * 20)
+    assert time.monotonic() - started < 2
+    assert reactions.normalize("❤️") == "❤"
