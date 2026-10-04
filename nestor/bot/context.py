@@ -172,6 +172,28 @@ async def messages_by_id(conn, chat_id: int, message_ids: list[int]) -> list[asy
             ORDER BY m.sent_at, m.message_id""", chat_id, message_ids))
 
 
+async def typical_length(conn, chat_ids: list[int], user_id: int, limit: int = 30) -> int | None:
+    """How long the person's recent messages here are, in characters (median); None if none."""
+    return await conn.fetchval(
+        """SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY length(text)) FROM (
+               SELECT text FROM messages
+               WHERE chat_id = ANY($1::bigint[]) AND user_id = $2 AND kind <> 'service'
+                 AND coalesce(text, '') <> ''
+               ORDER BY sent_at DESC LIMIT $3) recent""",
+        chat_ids, user_id, limit)
+
+
+def style_hint(typical: int | None, question: str) -> str:
+    """One line for the prompt: how long the asker writes, so the answer can match it. Only
+    a length, no chat text: it may go to the web profiles too."""
+    size = max(typical or 0, len(question or ""))
+    if size < 80:
+        return "Стиль собеседника: пишет коротко. Ответь в 1–3 предложениях, если он не просит подробностей."
+    if size < 250:
+        return "Стиль собеседника: пишет средними сообщениями. Ответ — до 4–6 предложений."
+    return "Стиль собеседника: пишет развёрнуто. Можно ответить подробнее, но без воды."
+
+
 def plural(n: int, forms: tuple[str, str, str]) -> str:
     """plural(5, ("сообщение", "сообщения", "сообщений")) -> "сообщений"."""
     if n % 10 == 1 and n % 100 != 11:

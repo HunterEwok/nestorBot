@@ -10,7 +10,7 @@ from aiogram.enums import ChatMemberStatus
 from aiogram.exceptions import TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter
 from aiogram.methods import SendMessage
 
-from nestor.bot import prompts
+from nestor.bot import markup, prompts
 from nestor.bot.context import classify
 from nestor.bot.scheduler import Scheduler
 from nestor.mcp import tools
@@ -270,8 +270,9 @@ async def test_stats_names_the_longest_branches(make_env, conn):
     await feed(update("message", message(7, "/stats", date=ago())))
 
     text = bot.sent[-1]["text"]
-    assert text.startswith(prompts.STATS_ACTIVITY)
-    assert text.endswith(f"{prompts.STATS_TOPICS}\n1. Налоги и бюджет — 4 сообщения\nhttps://t.me/c/1000000001/1")
+    assert text.startswith(f"<b>{prompts.STATS_ACTIVITY}</b>")
+    assert text.endswith(f'<b>{prompts.STATS_TOPICS}</b>\n1. <a href="https://t.me/c/1000000001/1">Налоги и бюджет</a>'
+                         " — 4 сообщения")
     naming = llm.calls[0]
     assert naming[0]["content"] == prompts.TOPICS_SYSTEM and "Бюджет пуст" in naming[1]["content"]
     assert await conn.fetchval("SELECT input_tokens FROM bot_requests WHERE scenario = 'stats'") == 1000
@@ -408,8 +409,8 @@ async def test_digest_is_switched_on_by_an_admin_and_posted_once(make_env, conn)
     await answerer.run_daily_posts(local(0, 9, 30).astimezone(timezone.utc))
     await answerer.drain()
     post = bot.sent[-1]
-    assert post["reply_to"] is None and post["text"].startswith("Дайджест за вчера, ")
-    assert post["text"].endswith("решили ехать в Грецию")
+    assert post["reply_to"] is None and post["text"].startswith("☀️ <b>Дайджест за вчера, ")
+    assert post["text"].endswith("решили ехать в Грецию") and post["parse_mode"] == "HTML"
     assert llm.calls[0][0]["content"] == prompts.DIGEST_SYSTEM and "обсуждаем отпуск 10" in llm.calls[0][1]["content"]
     count = len(bot.sent)
     await answerer.run_daily_posts(local(0, 10).astimezone(timezone.utc))
@@ -441,7 +442,7 @@ async def test_long_digest_is_one_message_and_a_failed_send_is_retried(make_env,
     await answerer.drain()
     assert len(bot.sent) == count + 1
     post = bot.sent[-1]["text"]
-    assert len(post) <= 4096 and post.endswith("…") and post.startswith("Дайджест за вчера, ")
+    assert markup.visible_len(post) <= 4096 and post.endswith("…") and post.startswith("☀️ <b>Дайджест за вчера, ")
     assert await conn.fetchval("SELECT status FROM daily_posts") == "posted"
 
 
@@ -462,8 +463,8 @@ async def test_wisdom_sends_only_themes_to_the_web_model(make_env, conn):
     assert "Темы сегодняшних разговоров: дом, деньги." in to_web
     assert "секретный" not in to_web and "Пети" not in to_web
     post = bot.sent[-1]
-    assert post["reply_to"] is None and post["text"].startswith(prompts.WISDOM_HEADER)
-    assert "«Счастлив тот, кто счастлив у себя дома.»\n— Лев Толстой" in post["text"]
+    assert post["reply_to"] is None and post["text"].startswith(f"<b>{prompts.WISDOM_HEADER}</b>")
+    assert "«Счастлив тот, кто счастлив у себя дома.»\n— <i>Лев Толстой</i>" in post["text"]
     row = await conn.fetchrow("SELECT * FROM daily_posts")
     assert (row["status"], row["themes"], row["author"]) == ("posted", ["дом", "деньги"], "Лев Толстой")
     assert sorted(r["scenario"] for r in await conn.fetch("SELECT scenario FROM bot_requests")) == ["wisdom",

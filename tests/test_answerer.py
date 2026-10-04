@@ -165,11 +165,14 @@ async def test_keyword_invocation_answers_and_archives(make_env, conn):
 
 
 async def test_answer_with_link_is_archived_without_apology(make_env, conn):
-    answer = "Это было в #1 (https://t.me/c/1234567890/1)."
+    answer = "Это было в #1 (https://t.me/c/1000000001/1)."
     bot, llm, feed = make_env(FakeLLM(answer))
     await feed(update("message", message(1, "нестор, где это было?")))
-    assert [s["text"] for s in bot.sent] == [answer]
-    assert await conn.fetchval("SELECT text FROM messages WHERE message_id = $1", bot.sent[0]["message_id"]) == answer
+    # The reference becomes a quote of the message, linked to it.
+    sent = 'Это было в <a href="https://t.me/c/1000000001/1">«нестор, где это было?»</a>.'
+    assert [(s["text"], s["parse_mode"]) for s in bot.sent] == [(sent, "HTML")]
+    assert await conn.fetchval("SELECT text FROM messages WHERE message_id = $1", bot.sent[0]["message_id"]) == sent
+    assert await conn.fetchval("SELECT answer FROM bot_requests") == answer   # the model's own words, for follow-ups
     assert await conn.fetchval("SELECT status FROM bot_requests") == "ok"
 
 
@@ -350,7 +353,7 @@ async def test_summary_command_and_stats(make_env):
     assert "Сценарий: summary" in llm.calls[0][-1]["content"]
     assert "<сообщения за период>" in llm.calls[0][-1]["content"]
     await feed(update("message", message(3, "/stats", uid=111, date=int(datetime.now(timezone.utc).timestamp()))))
-    assert bot.sent[-1]["text"].startswith("Активность за 7 дней")
+    assert bot.sent[-1]["text"].startswith(f"<b>{prompts.STATS_ACTIVITY}</b>")
 
 
 async def test_mcp_tools_are_scoped_by_ticket(make_env, conn, reader):

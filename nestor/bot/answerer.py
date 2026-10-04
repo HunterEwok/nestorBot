@@ -27,14 +27,14 @@ from aiogram.types import (BufferedInputFile, InlineKeyboardMarkup, LinkPreviewO
                            ReplyParameters)
 
 from ..collector.app import dump
-from . import context, daily, export, music, prompts, reminders, routing
+from . import context, daily, export, markup, music, prompts, reminders, routing
 from .llm import LLM, Completion
+from .markup import TELEGRAM_LIMIT, split_text
 from .triggers import BotIdentity, Invocation, detect
 
 log = logging.getLogger("nestor.answerer")
 
 ANONYMOUS_ADMIN_ID = 1087968824  # GroupAnonymousBot: an admin posting as the group
-TELEGRAM_LIMIT = 4096
 _OFF = ("off", "выкл", "0", "нет", "no")
 
 
@@ -72,7 +72,8 @@ class Job:
 
 @dataclass
 class Outgoing:
-    """What an answer sends. Plain text is split into Telegram-sized parts; an HTML card
+    """What an answer sends. Plain text is split into Telegram-sized parts; a model answer
+    (markdown) is formatted by nestor.bot.markup and split the same way; an HTML card
     (songs) goes as one message."""
     text: str
     completion: Completion | None = None
@@ -81,21 +82,8 @@ class Outgoing:
     preview_url: str | None = None
     keyboard: InlineKeyboardMarkup | None = None
     log_text: str | None = None         # for bot_requests.answer when the text is not plain
-
-
-def split_text(text: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
-    """SC-6: split on paragraph, then line, then word boundaries."""
-    parts: list[str] = []
-    rest = text.strip()
-    while len(rest) > limit:
-        cut = max(rest.rfind("\n\n", 0, limit), rest.rfind("\n", 0, limit), rest.rfind(" ", 0, limit))
-        if cut <= limit // 2:
-            cut = limit
-        parts.append(rest[:cut].rstrip())
-        rest = rest[cut:].lstrip()
-    if rest:
-        parts.append(rest)
-    return parts
+    markdown: bool = False
+    refs: dict[int, markup.Ref] | None = None   # archive messages the answer refers to
 
 
 SaveOutgoing = Callable[[dict], Awaitable[object]]
@@ -510,13 +498,32 @@ class Answerer:
         completion = await self._complete_with_progress(job.msg, prompt, self.router.llm(task),
                                                         timeout=self._timeout(task))
         if prompts.WEB_MARKER in completion.text:
-            completion = await self._answer_from_web(job, completion)
-        return _out(completion)
+            return _out(await self._answer_from_web(job, completion))
+        return _out(completion, await self._refs(job.msg["chat"]["id"], completion.text))
 
     async def _deliver(self, msg: dict, out: Outgoing) -> list[Message | None]:
         if out.html or out.keyboard or out.preview_url:
             return [await self._reply(msg, out.text, html=out.html, preview_url=out.preview_url, keyboard=out.keyboard)]
+        if out.markdown:
+            return [await self._reply(msg, part, html=True, plain=markup.to_plain(part))
+                    for part in markup.render(out.text, out.refs, msg["chat"]["id"])]
         return [await self._reply(msg, part) for part in split_text(out.text)]
+
+    async def _refs(self, chat_id: int, text: str) -> dict[int, markup.Ref]:
+        """The archive messages an answer refers to (#id, [«…»](#id), t.me/c links), with
+        their links and a piece of their text. Deleted messages and authors who used
+        /forget_me are not found, so their references stay without a link or quote."""
+        ids = markup.ref_ids(text, chat_id)
+        if not ids:
+            return {}
+        refs: dict[int, markup.Ref] = {}
+        async with self.pool.acquire() as conn:
+            for cid in await context.chat_lineage(conn, chat_id):
+                for r in await context.messages_by_id(conn, cid, [i for i in ids if i not in refs]):
+                    refs[r["message_id"]] = markup.Ref(
+                        context.message_link(r["chat_id"], r["message_id"], r["thread_id"], r["is_topic_message"]),
+                        markup.quote(r["text"]))
+        return refs
 
     async def _parent(self, conn, job: Job):
         """The earlier request whose answer this message replies to, if any."""
@@ -582,11 +589,12 @@ class Answerer:
             return Outgoing(prompts.FACTCHECK_HOW)
         async with self.pool.acquire() as conn:
             claim, opted_out = await self._replied_text(conn, job.msg)
+            style = await self._style(conn, job)
         if claim is None:
             return Outgoing(prompts.REPLIED_OPTED_OUT if opted_out else prompts.FACTCHECK_NO_TEXT)
         now = datetime.now(self.cfg.tz).strftime("%Y-%m-%d %H:%M")
         user = (f"Сейчас {now} ({self.cfg.tz.key}). Утверждение из чата: «{claim}»\n"
-                f"Вопрос участника: {job.question or 'проверь'}")
+                f"Вопрос участника: {job.question or 'проверь'}\n{style}")
         prompt = [{"role": "system", "content": prompts.FACTCHECK_SYSTEM}, {"role": "user", "content": user}]
         return _out(await self._complete_with_progress(job.msg, prompt, llm,
                                                        timeout=self._timeout("think_web" if job.think else "factcheck")))
@@ -644,9 +652,11 @@ class Answerer:
                 rows = await context.messages_by_id(conn, b["chat_id"], [b["root"]] + members[:6] + members[-3:])
                 if rows:
                     branches.append((b, rows))
-        lines = [prompts.STATS_ACTIVITY] + [f"{i}. {context.author(r)} — {r['n']}" for i, r in enumerate(activity, 1)]
+        lines = [f"<b>{html.escape(prompts.STATS_ACTIVITY)}</b>"] + [
+            f"{i}. {html.escape(context.author(r))} — {r['n']}" for i, r in enumerate(activity, 1)]
         if not branches:
-            return Outgoing("\n".join(lines + ["", prompts.STATS_NO_TOPICS]))
+            text = "\n".join(lines + ["", html.escape(prompts.STATS_NO_TOPICS)])
+            return Outgoing(text, html=True, log_text=markup.to_plain(text))
 
         completion, names = None, []
         prompt = [{"role": "system", "content": prompts.TOPICS_SYSTEM},
@@ -658,17 +668,18 @@ class Answerer:
             names = _numbered(completion.text, len(branches))
         except Exception as e:  # noqa: BLE001 - the activity part is still worth sending
             log.warning("topic naming failed", extra={"chat_id": msg["chat"]["id"], "error": type(e).__name__})
-        lines += ["", prompts.STATS_TOPICS]
+        lines += ["", f"<b>{html.escape(prompts.STATS_TOPICS)}</b>"]
         for i, (b, rows) in enumerate(branches, 1):
             first = rows[0]
-            name = (names[i - 1] if i <= len(names) else None) or _snippet(first["text"])
+            name = html.escape((names[i - 1] if i <= len(names) else None) or _snippet(first["text"]))
             size = b["size"]
-            lines.append(f"{i}. {name} — {size} {context.plural(size, ('сообщение', 'сообщения', 'сообщений'))}")
             link = context.message_link(first["chat_id"], first["message_id"], first["thread_id"],
                                         first["is_topic_message"])
             if link:
-                lines.append(link)
-        return Outgoing("\n".join(lines), completion)
+                name = f'<a href="{html.escape(link, quote=True)}">{name}</a>'
+            lines.append(f"{i}. {name} — {size} {context.plural(size, ('сообщение', 'сообщения', 'сообщений'))}")
+        text = "\n".join(lines)
+        return Outgoing(text, completion, html=True, log_text=markup.to_plain(text))
 
     async def _answer_from_web(self, job: Job, routed: Completion | None) -> Completion:
         """The archive model asked for the internet. The web profile gets the asker's question and
@@ -682,9 +693,10 @@ class Answerer:
                                       if routed else (None, None, None, None)))
         async with self.pool.acquire() as conn:
             history = await self._history(conn, job, ("web", "factcheck"))
+            style = await self._style(conn, job)
         now = datetime.now(self.cfg.tz).strftime("%Y-%m-%d %H:%M")
         prompt = [{"role": "system", "content": prompts.WEB_SYSTEM}, *history,
-                  {"role": "user", "content": f"Сейчас {now} ({self.cfg.tz.key}). Вопрос: {job.question}"}]
+                  {"role": "user", "content": f"Сейчас {now} ({self.cfg.tz.key}). Вопрос: {job.question}\n{style}"}]
         web = await self._complete_with_progress(job.msg, prompt, llm, timeout=self._timeout(task))
         if routed is None:
             return web
@@ -723,6 +735,12 @@ class Answerer:
                         await self.bot.delete_message(msg["chat"]["id"], note.message_id)
                     except TelegramAPIError:
                         pass
+
+    async def _style(self, conn, job: Job) -> str:
+        """How long the asker usually writes here, as one line for the prompt: answers match it.
+        Only a length, never chat text, so the web profiles may get it too."""
+        ids = await context.chat_lineage(conn, job.msg["chat"]["id"])
+        return context.style_hint(await context.typical_length(conn, ids, job.msg["from"]["id"]), job.question)
 
     def _timeout(self, task: str) -> float:
         """Bigger models and several web searches take longer."""
@@ -778,7 +796,7 @@ class Answerer:
         now = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
         question = job.question or ("Оцени тезисы в сообщении, на которое ответили." if target else "Что скажешь?")
         user = (f"Чат «{title}», сейчас {now} ({tz.key}). Запрос от {who}: {question}\n"
-                f"Сценарий: {job.scenario}\n\n" + "\n\n".join(blocks))
+                f"{await self._style(conn, job)}\nСценарий: {job.scenario}\n\n" + "\n\n".join(blocks))
         system = prompts.SYSTEM.format(ticket=ticket, web_marker=prompts.WEB_MARKER)
         return [{"role": "system", "content": system}, *history, {"role": "user", "content": user}]
 
@@ -846,8 +864,9 @@ class Answerer:
         text = prompts.DIGEST_HEADER.format(date=daily.day_name(yesterday)) + "\n\n" + completion.text
         # Always one message, cut if the model overran its length limit: a post is then either
         # delivered whole or retried whole, never left half-sent.
-        parts = split_text(text, TELEGRAM_LIMIT - 1)
-        sent = await self._post(chat_id, parts[0] + ("…" if len(parts) > 1 else ""))
+        parts = markup.render(text, await self._refs(chat_id, completion.text), chat_id, TELEGRAM_LIMIT - 1)
+        first = parts[0] + ("…" if len(parts) > 1 else "")
+        sent = await self._post(chat_id, first, html=True, plain=markup.to_plain(first))
         async with self.pool.acquire() as conn:
             await self._log_scheduled(conn, chat_id, "digest", completion, [sent], started,
                                       status="ok" if sent else "error")
@@ -891,7 +910,8 @@ class Answerer:
             async with self.pool.acquire() as conn:
                 await self._log_scheduled(conn, chat_id, "wisdom", completion, [], started, status="error")
             return "failed", {"themes": themes}
-        sent = await self._post(chat_id, daily.format_wisdom(wisdom))
+        card = daily.format_wisdom(wisdom)
+        sent = await self._post(chat_id, card, html=True, plain=markup.to_plain(card))
         async with self.pool.acquire() as conn:
             await self._log_scheduled(conn, chat_id, "wisdom", completion, [sent], started,
                                       status="ok" if sent else "error")
@@ -969,26 +989,42 @@ class Answerer:
     # ---- Telegram side ----
 
     async def _reply(self, msg: dict, text: str, *, save: bool = True, html: bool = False,
-                     preview_url: str | None = None, keyboard: InlineKeyboardMarkup | None = None) -> Message | None:
+                     preview_url: str | None = None, keyboard: InlineKeyboardMarkup | None = None,
+                     plain: str | None = None) -> Message | None:
         return await self._send(msg["chat"]["id"], text, reply_to=msg["message_id"], save=save, html=html,
-                                preview_url=preview_url, keyboard=keyboard)
+                                preview_url=preview_url, keyboard=keyboard, plain=plain)
 
-    async def _post(self, chat_id: int, text: str) -> Message | None:
+    async def _post(self, chat_id: int, text: str, *, html: bool = False, plain: str | None = None) -> Message | None:
         """A message of the bot's own, not a reply (scheduled posts)."""
-        return await self._send(chat_id, text)
+        return await self._send(chat_id, text, html=html, plain=plain)
 
     async def _send(self, chat_id: int, text: str, *, reply_to: int | None = None, save: bool = True,
                     html: bool = False, preview_url: str | None = None,
-                    keyboard: InlineKeyboardMarkup | None = None) -> Message | None:
+                    keyboard: InlineKeyboardMarkup | None = None, plain: str | None = None) -> Message | None:
+        """plain: the same text without formatting, sent if Telegram refuses the HTML."""
         preview = (LinkPreviewOptions(url=preview_url, prefer_large_media=True, show_above_text=True) if preview_url
                    else LinkPreviewOptions(is_disabled=True))
-        try:
-            sent = await self.bot.send_message(
-                chat_id, text,
+
+        async def send(body: str, formatted: bool) -> Message:
+            return await self.bot.send_message(
+                chat_id, body,
                 reply_parameters=(ReplyParameters(message_id=reply_to, allow_sending_without_reply=True)
                                   if reply_to is not None else None),
-                link_preview_options=preview, parse_mode="HTML" if html else None, reply_markup=keyboard,
+                link_preview_options=preview, parse_mode="HTML" if formatted else None, reply_markup=keyboard,
             )
+
+        try:
+            sent = await send(text, html)
+        except TelegramBadRequest as e:
+            if not (html and plain):
+                log.warning("send failed", extra={"chat_id": chat_id, "error": type(e).__name__})
+                return None
+            log.warning("formatting refused, sending plain text", extra={"chat_id": chat_id})
+            try:
+                sent = await send(plain, False)
+            except TelegramAPIError as e2:
+                log.warning("send failed", extra={"chat_id": chat_id, "error": type(e2).__name__})
+                return None
         except TelegramAPIError as e:
             log.warning("send failed", extra={"chat_id": chat_id, "error": type(e).__name__})
             return None
@@ -1020,8 +1056,9 @@ class Answerer:
                     pass
 
 
-def _out(completion: Completion) -> Outgoing:
-    return Outgoing(completion.text or "Мне нечего ответить по этим данным.", completion)
+def _out(completion: Completion, refs: dict[int, markup.Ref] | None = None) -> Outgoing:
+    """A model answer: its Markdown becomes Telegram formatting."""
+    return Outgoing(completion.text or "Мне нечего ответить по этим данным.", completion, markdown=True, refs=refs)
 
 
 def _numbered(text: str, n: int) -> list[str | None]:

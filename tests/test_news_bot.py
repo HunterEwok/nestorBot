@@ -156,7 +156,7 @@ async def test_think_goes_to_the_bigger_models(make_env, conn):
     assert len(deep.calls) == 2 and "о чём говорили сегодня?" in deep.calls[-1][-1]["content"]
     await feed(update("message", message(5, "нестор, подумай: какая погода в Таллине?", date=ago())))
     assert len(smart.calls) == 1 and web.calls == []
-    assert smart.calls[0][-1]["content"].endswith("Вопрос: какая погода в Таллине?")
+    assert "Вопрос: какая погода в Таллине?\nСтиль собеседника:" in smart.calls[0][-1]["content"]
     rows = [tuple(r) for r in await conn.fetch(
         "SELECT trigger_msg_id, scenario, profile FROM bot_requests ORDER BY id")]
     assert rows == [(2, "who_is_right", "deep"), (3, "summary", None), (4, "summary", "deep"), (5, "web", "smart")]
@@ -189,7 +189,7 @@ async def test_bare_think_reply_reconsiders_a_web_answer_on_the_bigger_model(mak
               "text": "В Таллине +8"}
     await feed(update("message", message(2, "подумай хорошенько", reply_to_message=answer, date=ago())))
     assert bot.sent[-1]["text"] == "Если подумать, к вечеру +5" and len(web.calls) == 1
-    assert smart.calls[0][-1]["content"].endswith("подумай хорошенько")
+    assert "Вопрос: подумай хорошенько\nСтиль собеседника:" in smart.calls[0][-1]["content"]
 
 
 async def test_archive_ticket_outlives_the_bigger_models_timeout(make_env, pool):
