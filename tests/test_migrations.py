@@ -1,5 +1,5 @@
-"""The backfill of migration 0006: answers written before quoted_user_ids existed get the
-authors they quoted, the way the bot tags them now, and what cannot be attributed any more
+"""The backfill of migrations 0006 and 0007: answers written before quoted_user_ids existed get
+the authors they quoted, the way the bot tags them now, and what cannot be attributed any more
 leaves the archive the way /forget_me takes it."""
 import json
 from pathlib import Path
@@ -7,8 +7,10 @@ from pathlib import Path
 from .factories import CHAT_ID
 from .test_answerer import BOT_ID
 
-MIGRATION = Path(__file__).resolve().parents[1] / "migrations" / "0006_quoted_authors.sql"
-BACKFILL = MIGRATION.read_text(encoding="utf-8").partition("-- backfill:")[2].partition("\n")[2]
+MIGRATIONS = Path(__file__).resolve().parents[1] / "migrations"
+BACKFILL = (MIGRATIONS / "0006_quoted_authors.sql").read_text(encoding="utf-8").partition("-- backfill:")[2] \
+    .partition("\n")[2]
+CHAINS = (MIGRATIONS / "0007_quoted_chains.sql").read_text(encoding="utf-8")      # quotes along chains of answers
 OLD_ID = -500                       # the basic group the chat was migrated from: ids start from 1 again
 OTHER_ID = -1001000000009
 INTERNAL = 1000000001
@@ -73,6 +75,7 @@ async def test_references_name_the_authors_the_way_the_bot_reads_them(conn):
         "bot's own message": await _req(conn, "Я уже отвечал: #900", answer_ids=[909]),
     }
     await conn.execute(BACKFILL)
+    await conn.execute(CHAINS)
     got = await _quoted(conn)
     assert {name: got[rid] for name, rid in cases.items()} == {
         "link": [222], "bare": [444], "t.me own": [222], "t.me other chat": None, "t.me own 700": [111],
@@ -116,10 +119,16 @@ async def test_answers_about_a_replied_message_and_conversations_inherit_authors
     web = await _req(conn, "Вот что пишут.", trigger=45, scenario="web", answer_ids=[46])
     # An answer that refers to the bot's own earlier answer quotes whoever it quoted.
     repeat = await _req(conn, "Я уже отвечал: [«Неверно»](#22)", trigger=50, answer_ids=[51])
+    await _msg(conn, 51, BOT_ID, "Я уже отвечал: «Неверно»")
+    # ...and an answer that refers to that one: the chain carries over to the end (0007).
+    again = await _req(conn, "Как я говорил: [«Я уже отвечал»](#51)", trigger=60, answer_ids=[61])
     await conn.execute(BACKFILL)
+    await conn.execute(CHAINS)
     got = await _quoted(conn)
     assert (got[reminder], got[verdict], got[follow], got[follow2]) == ([222], [222], [222], [222])
-    assert (got[theses], got[topic], got[web], got[repeat]) == ([222], None, None, [222])
+    assert (got[theses], got[topic], got[web], got[repeat], got[again]) == ([222], None, None, [222], [222])
+    await conn.execute(CHAINS)                      # running it again changes nothing
+    assert await _quoted(conn) == got
 
 
 async def test_what_cannot_be_attributed_leaves_the_archive_once_somebody_opted_out(conn):
@@ -136,6 +145,7 @@ async def test_what_cannot_be_attributed_leaves_the_archive_once_somebody_opted_
     await _msg(conn, 6, BOT_ID, "⏰ U222, напоминаю: встречу с Машей")
     await _msg(conn, 7, BOT_ID, "Твои напоминания в этой группе:\n#1 — завтра в 10:00: встречу с Машей")
     await conn.execute(BACKFILL)
+    await conn.execute(CHAINS)
     got = await _quoted(conn)
     assert got[fine] == [222] and got[orphan] == [222]
     assert await conn.fetchval("SELECT answer FROM bot_requests WHERE id = $1", orphan) is None
@@ -143,3 +153,48 @@ async def test_what_cannot_be_attributed_leaves_the_archive_once_somebody_opted_
     left = {r["message_id"] for r in await conn.fetch("SELECT message_id FROM messages WHERE user_id = $1", BOT_ID)}
     assert left == {5}
     assert "котелок" not in str(await conn.fetchval("SELECT raw FROM messages WHERE message_id = 4"))
+
+
+async def test_chains_that_lead_to_forgotten_words_leave_the_archive(conn):
+    """The state 0006 left, then /forget_me by 333: 0007 finds what still carries their words."""
+    await _setup(conn)
+    await conn.execute("UPDATE users SET opted_out = TRUE WHERE user_id IN (333, 444)")
+
+    async def _tag(rid, ids):
+        await conn.execute("UPDATE bot_requests SET quoted_user_ids = $2 WHERE id = $1", rid, ids)
+
+    # 333's chain: A quoted them, B linked A (0006 tagged both, /forget_me removed both), C linked B.
+    first = await _req(conn, None, trigger=100, answer_ids=[101])
+    await _tag(first, [333])
+    second = await _req(conn, None, trigger=102, answer_ids=[103])
+    await _tag(second, [333])
+    await _msg(conn, 105, BOT_ID, "Как я говорил: «Я уже отвечал»", reply_to=104)
+    third = await _req(conn, "Как я говорил: [«Я уже отвечал»](#103)", trigger=104, answer_ids=[105])
+    await _msg(conn, 106, 111, "точно", reply_to=105, quote="Я уже отвечал")
+    # 444's reminder, confirmed before they used /forget_me: 0006 tagged it, nothing removed it.
+    await _msg(conn, 111, BOT_ID, "✅ Напомню завтра в 10:00: встречу с Машей. Отменить: /unremind 1")
+    reminder = await _req(conn, "✅ Напомню завтра в 10:00: встречу с Машей.", trigger=110, uid=444,
+                          scenario="reminder", answer_ids=[111])
+    await _tag(reminder, [444])
+    # An answer 0006 removed for a reference nobody can attribute any more, and a follow-up to it.
+    orphan = await _req(conn, None, trigger=120, answer_ids=[121])
+    await _msg(conn, 123, BOT_ID, "Да, именно так.", reply_to=122)
+    follow = await _req(conn, "Да, именно так.", trigger=122, answer_ids=[123], parent=orphan)
+    # 222 is still here: an answer that refers to an answer quoting them stays.
+    await _msg(conn, 131, BOT_ID, "Петя писал «палатку»")
+    kept = await _req(conn, "Петя писал [«палатку»](#1)", trigger=130, answer_ids=[131])
+    await _tag(kept, [222])
+    await _msg(conn, 133, BOT_ID, "Как я говорил: «Петя писал»")
+    again = await _req(conn, "Как я говорил: [«Петя писал»](#131)", trigger=132, answer_ids=[133])
+
+    await conn.execute(CHAINS)
+    got = await _quoted(conn)
+    assert (got[third], got[reminder], got[follow], got[kept], got[again]) == ([333], [444], None, [222], [222])
+    answers = {r["id"]: r["answer"] for r in await conn.fetch("SELECT id, answer FROM bot_requests")}
+    assert answers[third] is answers[reminder] is answers[follow] is None
+    assert answers[kept] and answers[again]
+    left = {r["message_id"] for r in await conn.fetch("SELECT message_id FROM messages WHERE user_id = $1", BOT_ID)}
+    assert left == {131, 133}
+    assert "Я уже отвечал" not in str(await conn.fetchval("SELECT raw FROM messages WHERE message_id = 106"))
+    await conn.execute(CHAINS)                      # running it again changes nothing
+    assert await _quoted(conn) == got
