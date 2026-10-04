@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import html
 import re
-from collections.abc import Collection
+import unicodedata
 from dataclasses import dataclass
 from urllib.parse import urlsplit
+
+import idna
 
 TELEGRAM_LIMIT = 4096
 
@@ -38,7 +40,9 @@ def split_text(text: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
     quote-link or a bold span. Only the separator goes at the cut, so an indented line (code,
     a nested list item) keeps its indentation in the next part."""
     parts: list[str] = []
-    rest = text.strip()
+    rest = text.strip("\n").rstrip()
+    if not (m := _BULLET.match(rest.split("\n", 1)[0])) or not m.group(1):
+        rest = rest.lstrip()        # a nested list item first (a part split again) keeps its depth
     while len(rest) > limit:
         cut = _cut_point(rest, limit)
         parts.append(rest[:cut].rstrip())
@@ -63,7 +67,9 @@ def _cut_point(text: str, limit: int) -> int:
         at = text.rfind(sep, 0, limit)
         if at > limit // 2:
             return at
-    spans = [m.span() for m in _INLINE.finditer(text) if m.start() < limit]
+    # Spans around the cut only: scanning the whole rest on every cut would be quadratic on a long
+    # answer full of unclosed «**». A link or a bold span is far shorter than the margin.
+    spans = [m.span() for m in _INLINE.finditer(text, 0, min(len(text), limit + 1024)) if m.start() < limit]
     at = text.rfind(" ", 0, limit)
     while at > limit // 2 and any(start < at < end for start, end in spans):
         at = text.rfind(" ", 0, at)
@@ -89,12 +95,12 @@ def _internal(chat_id: int | None) -> str | None:
     return str(-chat_id - 1000000000000)
 
 
-def ref_ids(text: str, chat_id: int | None = None, known: Collection[int] | None = None) -> list[int]:
-    """Message ids an answer refers to, first seen first (at most MAX_REFS). known: the ids the
-    model was shown; a bare #id outside them is a number («issue #1234»), not a reference."""
+def ref_ids(text: str, chat_id: int | None = None) -> list[int]:
+    """Message ids an answer may refer to, first seen first (at most MAX_REFS): quote-links, t.me
+    links into the chat and bare #ids of three digits or more. Whether a bare one is rendered as
+    a reference is decided by Ref.bare, with the archive at hand."""
     internal = _internal(chat_id)
-    found = [(m.start(), int(m.group(1))) for m in _BARE_REF.finditer(text or "")
-             if known is None or int(m.group(1)) in known]
+    found = [(m.start(), int(m.group(1))) for m in _BARE_REF.finditer(text or "")]
     found += [(m.start(), int(m.group(1))) for m in _LINK_REF.finditer(text or "")]
     if internal is not None:
         found += [(m.start(), int(m.group("message"))) for m in _TME_LINK.finditer(text or "")
@@ -159,15 +165,44 @@ def _a(url: str, label_html: str) -> str:
     return f'<a href="{html.escape(url, quote=True)}">{label_html}</a>'
 
 
-_MIXED = re.compile(r"(?=.*[a-z])(?=.*[^\x00-\x7f])")     # Latin and other letters in one label
 _BIDI = re.compile("[\u200e\u200f\u202a-\u202e\u2066-\u2069]")      # direction overrides reverse what follows
+# Cyrillic letters that look like Latin ones (the address bar's own list): a label made only of
+# them («аррӏе») under a Latin TLD reads as a Latin word.
+_LATIN_LIKE = set("асԁеһіјӏорԛѕԝхуъьҽпгѵѡ")
+_CYRILLIC_TLDS = {"рф", "рус", "бел", "укр", "срб", "мон", "бг", "ею", "мкд", "қаз", "дети", "москва", "онлайн",
+                  "сайт", "орг", "ком", "католик"}        # the Cyrillic top-level domains that exist
+
+
+def _script(ch: str) -> str:
+    return unicodedata.name(ch, " ").split(" ", 1)[0]       # LATIN, CYRILLIC, GREEK, ...
+
+
+def _looks_alike(host: str) -> bool:
+    """A host a reader would take for another: a label that mixes scripts («sbеrbank» with a
+    Cyrillic е), one made only of Cyrillic letters that look like Latin ones («аррӏе.com») outside
+    the Cyrillic TLDs, or a Cyrillic TLD that does not exist («paypal.сом»). «сбер.рф»,
+    «straße.de» and «яндекс.com» read as what they are."""
+    labels = host.split(".")
+    tld = labels[-1]
+    if not tld.isascii() and tld not in _CYRILLIC_TLDS and any(_script(ch) == "CYRILLIC" for ch in tld):
+        return True             # «paypal.сом»: a top-level domain that does not exist
+    for label in labels:
+        letters = [ch for ch in label if ch.isalpha()]
+        scripts = {_script(ch) for ch in letters}
+        if len(scripts) > 1:
+            return True
+        if scripts & {"LATIN", "CYRILLIC", "GREEK"} and any(unicodedata.category(ch) == "Mn" for ch in label):
+            return True         # a dotless ı with a dot above: a mark that makes one letter look like another
+        if letters and all(ch in _LATIN_LIKE for ch in letters) and tld not in _CYRILLIC_TLDS:
+            return True
+    return False
 
 
 def _host(url: str) -> str | None:
     """The domain a browser opens, or None when it is unclear: userinfo («a.com@b.com»),
-    backslashes and percent signs are read differently by browsers and by Python. A label
-    that mixes scripts («sbеrbank.ru» with a Cyrillic е) is shown the way the address bar
-    shows it, in its xn-- form; «сбер.рф» stays readable."""
+    backslashes, percent signs and invisible characters are read differently by browsers and by
+    Python. A host that looks like another is shown the way the address bar shows it, in its
+    xn-- form; «сбер.рф» stays readable."""
     try:
         parts = urlsplit(url)
         host = parts.hostname
@@ -178,11 +213,17 @@ def _host(url: str) -> str | None:
     host = host.lower().removeprefix("www.")
     if host.isascii():
         return host
-    try:
-        ascii_host = host.encode("idna").decode()
-    except UnicodeError:
-        return None
-    return ascii_host if any(_MIXED.match(label) for label in host.split(".")) else host
+    if host != unicodedata.normalize("NFC", host) or any(unicodedata.category(ch) in ("Cf", "Cc") for ch in host):
+        return None             # joiners, soft hyphens, decomposed letters: read differently by browsers
+    if not _looks_alike(host):
+        return host
+    try:                        # browsers use IDNA 2008: «straße» keeps its ß, the stdlib would write «strasse»
+        return idna.encode(host, uts46=True).decode()
+    except idna.IDNAError:
+        try:
+            return host.encode("idna").decode()
+        except UnicodeError:
+            return None
 
 
 def _names_host(label: str, host: str) -> bool:
@@ -278,6 +319,13 @@ def _one_line_block(line: str) -> bool:
     return rest.endswith("```") and len(rest) > 3
 
 
+def _table_row(line: str) -> bool:
+    """A row begins and ends with a cell border: the «|» of a ||spoiler||, of `code` or of a link
+    is not one, and a line that begins with «||» («|| не спойлер ||», «|||») is text."""
+    masked = _INLINE.sub(lambda m: "x" * len(m.group(0)), line)
+    return bool(_TABLE_ROW.match(masked)) and not masked.lstrip().startswith("||")
+
+
 def _cells(line: str) -> list[str]:
     """Table cells: a «|» inside ||spoilers||, `code` or a link does not split."""
     keep = [m.span() for m in _INLINE.finditer(line)]
@@ -342,7 +390,7 @@ def to_html(text: str, refs: dict[int, Ref] | None = None, chat_id: int | None =
         if _RULE.match(line) or _TABLE_SEPARATOR.match(line) and "|" in line:
             out.append("")
             continue
-        if _TABLE_ROW.match(line):
+        if _table_row(line):
             out.append(r.inline(" — ".join(c for c in _cells(line) if c)))
             continue
         m = _HEADING.match(line)

@@ -301,7 +301,7 @@ class Answerer:
         if emoji is None or _reply_target(msg, inv) is not None:
             return False
         replied = (msg.get("reply_to_message") or {}).get("text") or ""
-        if inv.replied_to_bot is not None and "?" in replied:
+        if inv.replied_to_bot is not None and "?" in _LINKS.sub("", replied):   # a «?q=» inside a link is not one
             return False
         allowed = await self.reactor.allowed(msg["chat"]["id"])
         emoji = next((e for e in (emoji, "👍", "👌", "❤") if e in allowed), None)
@@ -633,17 +633,20 @@ class Answerer:
 
     async def _refs(self, chat_id: int, text: str,
                     seen: dict[int, int | None] | None = None) -> tuple[dict[int, markup.Ref], set[int]]:
-        """The archive messages an answer refers to ([«…»](#id), t.me/c links, a bare #id the
-        model was shown), with their links, a piece of their text and their author. Deleted
-        messages and authors who used /forget_me are not found, so their references stay without
-        a link or quote. In a group migrated from a basic group both chats number from 1: an id
-        found in both is left as it is, it cannot be told which message the model meant.
+        """The archive messages an answer refers to ([«…»](#id), t.me/c links, a bare #id), with
+        their links, a piece of their text and their author. Deleted messages and authors who used
+        /forget_me are not found, so their references stay without a link or quote. In a group
+        migrated from a basic group both chats number from 1: an id found in both is left as it
+        is, it cannot be told which message the model meant. A bare #id the prompt did not show
+        is not linked either («issue #1234» is a number; the archive tools show ids the prompt
+        does not, so the model may still mean a message), but its author is recorded all the same:
+        the words beside such a number are usually theirs.
 
         Also returns the authors whose words the answer carries without a usable reference, so
         that /forget_me still removes it: of such ambiguous ids, of messages gone since the prompt
         was built (a /forget_me in flight), and of the people quoted in the bot's own answers it
         refers to."""
-        ids = markup.ref_ids(text, chat_id, known=seen)       # None: no prompt was built (tests, imports)
+        ids = markup.ref_ids(text, chat_id)
         if not ids:
             return {}, set()
         linked = markup.linked_ids(text, chat_id)
@@ -661,7 +664,8 @@ class Answerer:
                     own = r["user_id"] == self.me.user_id
                     refs[mid] = markup.Ref(
                         context.message_link(r["chat_id"], r["message_id"], r["thread_id"], r["is_topic_message"]),
-                        markup.quote(r["text"]), None if own else r["user_id"], bare=seen is None or mid in seen)
+                        markup.quote(r["text"]), None if own else r["user_id"],
+                        bare=seen is None or mid in seen)       # None: no prompt was built (tests, imports)
                     if own:     # the bot's answer: whoever it quoted is quoted again
                         authors |= set(await conn.fetchval(
                             "SELECT quoted_user_ids FROM bot_requests WHERE chat_id = $1 AND $2 = ANY(answer_msg_ids)",
@@ -869,10 +873,11 @@ class Answerer:
                 claim = await self._claim_of(conn, parent["chat_id"], parent["trigger_msg_id"])
                 question = f"Утверждение из чата: «{claim or '(сообщение недоступно)'}»\nВопрос участника: {question}"
             history[:0] = [{"role": "user", "content": question},
-                           {"role": "assistant", "content": parent["answer"] or ""}]
+                           {"role": "assistant", "content": parent["answer"] or "(ответ удалён)"}]
+            job.quoted |= set(parent["quoted_user_ids"] or [])     # a follow-up may repeat the quotes
             parent = await conn.fetchrow(
-                "SELECT id, chat_id, trigger_msg_id, question, answer, scenario, parent_id FROM bot_requests "
-                "WHERE id = $1", parent["parent_id"]) if parent["parent_id"] else None
+                "SELECT id, chat_id, trigger_msg_id, question, answer, scenario, parent_id, quoted_user_ids "
+                "FROM bot_requests WHERE id = $1", parent["parent_id"]) if parent["parent_id"] else None
         return history
 
     async def _complete_with_progress(self, msg: dict, prompt: list[dict], llm: LLM | None = None,
@@ -1233,6 +1238,9 @@ class Answerer:
 def _out(completion: Completion, refs: dict[int, markup.Ref] | None = None) -> Outgoing:
     """A model answer: its Markdown becomes Telegram formatting."""
     return Outgoing(completion.text or "Мне нечего ответить по этим данным.", completion, markdown=True, refs=refs)
+
+
+_LINKS = re.compile(r"https?://\S+?(?=[.,;:!?)»\"']*(?:\s|$))")      # an address, without its trailing punctuation
 
 
 def _quoted(refs: dict[int, markup.Ref] | None, more: Collection[int] = ()) -> list[int] | None:

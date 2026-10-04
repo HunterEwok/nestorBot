@@ -552,3 +552,33 @@ async def test_long_writers_get_room_for_longer_answers(make_env):
         await feed(update("message", message(i, "очень подробное рассуждение " * 12, uid=111)))
     await feed(update("message", message(4, "нестор, а ты что думаешь?", uid=111)))
     assert "Стиль собеседника: пишет развёрнуто." in llm.calls[0][-1]["content"]
+
+
+async def test_a_bare_number_from_an_archive_tool_is_not_linked_but_goes_with_its_author(make_env, conn):
+    # The archive tools show ids the prompt does not; the model may copy one bare. Not linked (it
+    # may be a number), but the words beside it are the author's: /forget_me removes the answer.
+    bot, llm, feed = make_env(FakeLLM("Вася писал об этом: #1234 — «купил хлеб и молоко»"))
+    three_days_ago = int((datetime.now(timezone.utc) - timedelta(days=3)).timestamp())
+    await feed(update("message", message(1234, "купил хлеб и молоко", uid=333, date=three_days_ago)))
+    await feed(update("message", message(2000, "/summary", uid=111, date=int(datetime.now(timezone.utc).timestamp()))))
+    assert "#1234" not in llm.calls[0][-1]["content"]
+    answer = bot.sent[-1]
+    assert answer["text"] == "Вася писал об этом: #1234 — «купил хлеб и молоко»"
+    assert await conn.fetchval("SELECT quoted_user_ids FROM bot_requests WHERE scenario = 'summary'") == [333]
+    await feed(update("message", message(3000, "/forget_me", uid=333)))
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE message_id = $1", answer["message_id"]) == 0
+    assert await conn.fetchval("SELECT answer FROM bot_requests WHERE scenario = 'summary'") is None
+
+
+async def test_thanks_for_an_answer_with_a_link_is_a_reaction_even_when_the_link_has_a_query(make_env, conn):
+    bot, llm, feed = make_env(FakeLLM("Вот: https://example.com/search?q=налоги"))
+    await feed(update("message", message(1, "нестор, какую ссылку кидал Петя про налоги", uid=222)))
+    answer = bot.sent[-1]
+    telegram_view = {"message_id": answer["message_id"], "date": 1, "chat": {"id": CHAT_ID, "type": "supergroup"},
+                     "from": {"id": BOT_ID, "is_bot": True, "first_name": "Нестор"}, "text": answer["text"]}
+    await feed(update("message", message(2, "спасибо", uid=222, reply_to_message=telegram_view)))
+    assert len(llm.calls) == 1 and (2, ["❤"]) in bot.reactions
+    # A question in the answer itself still makes the «угу» an answer for the model.
+    telegram_view["text"] = "Ты про https://example.com/search?q=налоги?"
+    await feed(update("message", message(3, "угу", uid=222, reply_to_message=telegram_view)))
+    assert len(llm.calls) == 2

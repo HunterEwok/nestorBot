@@ -216,10 +216,27 @@ def test_a_long_paragraph_is_not_cut_inside_a_link_or_a_bold_span():
     # The last space before the limit is inside a label: the cut moves back to the one before it.
     assert split_text("слово " * 10 + "[«длинная цитата из сообщения»](#5) хвост", limit=75) == [
         "слово слово слово слово слово слово слово слово слово слово", "[«длинная цитата из сообщения»](#5) хвост"]
-    # A nested list item that starts the next part keeps its depth.
+    # A nested list item that starts the next part keeps its depth, also when a part is split
+    # again because its HTML (quotes for bare #ids) outgrew the source.
     items = "\n".join(f"- пункт {i}\n  - вложенный {i}" for i in range(60))
     parts = render(items, limit=800)
     assert len(parts) >= 2 and all(not p.startswith("• вложенный") for p in parts)
+    refs = {i: Ref(f"https://t.me/c/1000000001/{i}", "«" + "ц" * 58 + "»") for i in range(100, 300)}
+    items = "\n".join(f"- пункт {i}\n  - вложенный #{100 + i} и #{101 + i} и #{102 + i}" for i in range(60))
+    parts = render(items, refs, CHAT, limit=1000)
+    assert len(parts) >= 4 and all(visible_len(p) <= 1000 for p in parts)
+    assert all(not p.startswith("• вложенный") for p in parts) and "  ◦ вложенный" in parts[1]
+    assert split_text("   Привет\nмир", 100) == ["Привет\nмир"]        # other leading space still goes
+
+
+def test_splitting_a_long_answer_full_of_unclosed_bold_stays_quick():
+    # The span scan around a cut is bounded: 50 000 characters of «**a » took half a minute before.
+    started = time.perf_counter()
+    parts = render("**a " * 12_500)
+    assert len(parts) == 13 and time.perf_counter() - started < 5
+    started = time.perf_counter()
+    parts = render(" ".join(f"**Пункт {i}: Петя сказал, что налоги надо снизить" for i in range(1000)))
+    assert len(parts) == 13 and time.perf_counter() - started < 5
 
 
 def test_adjacent_spans_and_spoilers_in_tables():
@@ -228,9 +245,15 @@ def test_adjacent_spans_and_spoilers_in_tables():
     assert to_html("~~a~~ и ~~b~~") == "<s>a</s> и <s>b</s>"
     assert to_html("| Кто | Ответ |\n|---|---|\n| Убийца | ||дворецкий|| |") == \
         "Кто — Ответ\n\nУбийца — <tg-spoiler>дворецкий</tg-spoiler>"
-    assert to_html("|ответ: ||42||") == "ответ: <tg-spoiler>42</tg-spoiler>"
+    assert to_html("| ответ: ||42|| |") == "ответ: <tg-spoiler>42</tg-spoiler>"
     assert to_html("| `a|b` | [x](https://a.example/a|b) |") == \
         '<code>a|b</code> — <a href="https://a.example/a|b">x</a> (a.example)'
+    # A line that begins with a spoiler and ends with a «|» is not a table row: the pipes of a
+    # span are not cell borders, and «||» alone is text.
+    assert to_html("||секрет|| текст a|b ||ещё||") == \
+        "<tg-spoiler>секрет</tg-spoiler> текст a|b <tg-spoiler>ещё</tg-spoiler>"
+    assert to_html("|ответ: ||42||") == "|ответ: <tg-spoiler>42</tg-spoiler>"
+    assert [to_html(s) for s in ("|| не спойлер ||", "|||", "||")] == ["|| не спойлер ||", "|||", "||"]
 
 
 def test_look_alike_hosts_and_direction_overrides():
@@ -241,6 +264,23 @@ def test_look_alike_hosts_and_direction_overrides():
         '<a href="https://sbеrbank.ru/login">sbеrbank.ru</a> (xn--sbrbank-8gg.ru)'
     assert to_html("[Сбер](https://сбер.рф/x)") == '<a href="https://сбер.рф/x">Сбер</a> (сбер.рф)'
     assert to_html("[сбер.рф](https://сбер.рф/x)") == '<a href="https://сбер.рф/x">сбер.рф</a>'
+    # A whole label of Cyrillic letters that look like Latin ones under a Latin TLD, or a Cyrillic
+    # TLD that does not exist: the xn-- form, as in the address bar. Real words stay readable.
+    assert to_html("[Apple Store](https://аррӏе.com/x)") == \
+        '<a href="https://аррӏе.com/x">Apple Store</a> (xn--80ak6aa92e.com)'
+    assert to_html("[аррӏе.com](https://аррӏе.com/x)") == \
+        '<a href="https://аррӏе.com/x">аррӏе.com</a> (xn--80ak6aa92e.com)'
+    assert to_html("[PayPal](https://paypal.сом/)") == '<a href="https://paypal.сом/">PayPal</a> (paypal.xn--l1adi)'
+    assert to_html("[Яндекс](https://яндекс.com/)") == '<a href="https://яндекс.com/">Яндекс</a> (яндекс.com)'
+    # IDNA 2008, as browsers read it: «straße» is not «strasse». Invisible characters: the label alone.
+    assert to_html("[сайт](https://straße.de/x)") == '<a href="https://straße.de/x">сайт</a> (straße.de)'
+    assert to_html("[faß.de](https://faß.de/x)") == '<a href="https://faß.de/x">faß.de</a>'
+    hidden = "[сайт](https://ab\u200dcd.com/x) и [сайт](https://a\u00adb.com/) и [сайт](https://cafe\u0301.fr/)"
+    assert to_html(hidden) == "сайт и сайт и сайт"
+    # A mark that makes a Latin letter look like another («ı» with a dot above is «i»): xn--.
+    assert to_html("[Почта](https://gmaı\u0307l.com/)") == \
+        '<a href="https://gmaı\u0307l.com/">Почта</a> (xn--gmal-nza43z.com)'
+    assert to_html("[сайт](https://हिन्दी.भारत/)") == '<a href="https://हिन्दी.भारत/">сайт</a> (हिन्दी.भारत)'
     # A right-to-left override in a label would show the domain hint reversed: dropped.
     assert to_html("[Госуслуги\u202e](https://evil.com/x) и \u2066текст\u2069") == \
         '<a href="https://evil.com/x">Госуслуги</a> (evil.com) и текст'
@@ -248,9 +288,8 @@ def test_look_alike_hosts_and_direction_overrides():
 
 def test_bare_numbers_are_references_only_when_the_model_saw_them():
     refs = {1234: Ref("https://t.me/c/1000000001/1234", "«купил хлеб»"), 500: Ref(None, "«x»")}
-    assert ref_ids("issue #1234 и #500 и [x](#9)", CHAT, known={500}) == [500, 9]
-    assert ref_ids("issue #1234 и #500", CHAT, known=set()) == []
-    assert ref_ids("issue #1234 (https://t.me/c/1000000001/1234)", CHAT, known=set()) == [1234]
+    assert ref_ids("issue #1234 и #500 и #99 и [x](#9)", CHAT) == [1234, 500, 9]
+    assert ref_ids("issue #1234 (https://t.me/c/1000000001/1234)", CHAT) == [1234]
     assert linked_ids("см. https://t.me/c/1000000001/7 и https://t.me/c/999/8 и #9", CHAT) == {7}
     assert linked_ids("https://t.me/c/1000000001/7", -4242) == set()
     # Unresolved, a bare number stays a number; the explicit form is always a reference.

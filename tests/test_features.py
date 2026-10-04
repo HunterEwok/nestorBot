@@ -556,3 +556,43 @@ async def test_scheduler_keeps_going_after_a_failing_step():
     with pytest.raises(asyncio.CancelledError):
         await task
     assert calls.count("daily") >= 2 and calls.count("reminders") >= 2
+
+
+async def test_follow_ups_to_a_verdict_or_a_song_go_with_the_quoted_author(make_env, conn):
+    # The web profile answers a follow-up with the claim in its history and may restate it; the
+    # smart profile answers a song follow-up with the song in its history. Both answers carry the
+    # author's words, so /forget_me removes them too, and a scrubbed turn reads as removed.
+    web = FakeLLM("Неверно: https://nasa.example")
+    bot, llm, feed = make_env(web=web)
+    claim = message(2, "Земля плоская, это доказано", uid=222)
+    await feed(update("message", claim))
+    await feed(update("message", message(3, "нестор, проверь", reply_to_message=claim)))
+    verdict = bot.sent[-1]
+    web.answer = "Нет, «Земля плоская, это доказано» ложно: https://nasa.example/2026"
+    await feed(update("message", message(4, "а источник посвежее?", reply_to_message=bot_answer(verdict))))
+    follow = bot.sent[-1]
+    assert "Земля плоская" in follow["text"]
+    rows = await conn.fetch("SELECT scenario, quoted_user_ids FROM bot_requests ORDER BY id")
+    assert [tuple(r) for r in rows] == [("factcheck", [222]), ("web", [222])]
+    await feed(update("message", message(5, "/forget_me", uid=222)))
+    gone = [verdict["message_id"], follow["message_id"]]
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE message_id = ANY($1::bigint[])", gone) == 0
+    assert await conn.fetchval("SELECT count(*) FROM bot_requests WHERE answer IS NOT NULL") == 0
+    # The asker goes on with the conversation: the removed turns are not empty messages.
+    await feed(update("message", message(6, "а ещё?", reply_to_message=bot_answer(follow))))
+    assert [m["content"] for m in web.calls[-1] if m["role"] == "assistant"] == ["(ответ удалён)", "(ответ удалён)"]
+    assert "Земля плоская" not in str(web.calls[-1])
+
+    smart = FakeLLM(SONG)
+    checker = FakeChecker(videos={"BBBBBBBBBBB": "КИНО - Группа крови"}, spotify={SPOTIFY: "Группа крови"})
+    bot, llm, feed = make_env(smart=smart, checker=checker)
+    favourite = message(12, "обожаю «Группа крови» Кино", uid=333)
+    await feed(update("message", favourite))
+    await feed(update("message", message(13, "нестор, включи эту песню", reply_to_message=favourite)))
+    card = bot.sent[-1]
+    await feed(update("message", message(14, "а концертную версию?", reply_to_message=bot_answer(card))))
+    songs = await conn.fetch("SELECT quoted_user_ids FROM bot_requests WHERE scenario = 'music' ORDER BY id")
+    assert [r["quoted_user_ids"] for r in songs] == [[333], [333]]
+    await feed(update("message", message(15, "/forget_me", uid=333)))
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE user_id = $1 AND text LIKE '%Группа крови%'",
+                               BOT_ID) == 0
