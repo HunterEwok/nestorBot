@@ -14,9 +14,9 @@ import logging
 import re
 import secrets
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time as dtime, timedelta, timezone
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Collection
 from zoneinfo import ZoneInfo
 
 import asyncpg
@@ -70,6 +70,8 @@ class Job:
     question: str
     since: datetime | None = None       # /summary period, «что я пропустил»
     think: bool = False                 # «нестор, подумай …»: the bigger model
+    seen: dict[int, int | None] = field(default_factory=dict)   # messages shown to the model: id -> author
+    quoted: set[int] = field(default_factory=set)   # people whose words the answer carries besides its refs
 
 
 @dataclass
@@ -299,7 +301,7 @@ class Answerer:
         if emoji is None or _reply_target(msg, inv) is not None:
             return False
         replied = (msg.get("reply_to_message") or {}).get("text") or ""
-        if inv.replied_to_bot is not None and re.search(r"\?\W*$", replied):
+        if inv.replied_to_bot is not None and "?" in replied:
             return False
         allowed = await self.reactor.allowed(msg["chat"]["id"])
         emoji = next((e for e in (emoji, "👍", "👌", "❤") if e in allowed), None)
@@ -327,20 +329,37 @@ class Answerer:
                    WHERE raw ? 'quote' AND raw->'reply_to_message'->'from'->>'id' = $1::text""", str(user_id))
             await conn.execute("UPDATE bot_requests SET question = NULL WHERE user_id = $1", user_id)
             await conn.execute("DELETE FROM reminders WHERE user_id = $1", user_id)
-            # The bot's answers that quoted them (quote-links, nestor.bot.markup): out of the
-            # archive, and out of the conversation history that goes back to the model.
-            for r in await conn.fetch(
-                    "SELECT chat_id, answer_msg_ids FROM bot_requests WHERE $1 = ANY(quoted_user_ids) "
-                    "AND answer_msg_ids IS NOT NULL", user_id):
-                await conn.execute("DELETE FROM messages WHERE chat_id = $1 AND message_id = ANY($2::bigint[]) "
-                                   "AND user_id = $3", r["chat_id"], r["answer_msg_ids"], self.me.user_id)
-                await conn.execute(
-                    """UPDATE messages SET raw = raw - 'quote'
-                       WHERE chat_id = $1 AND raw ? 'quote'
-                         AND raw->'reply_to_message'->>'message_id' = ANY($2::text[])""",
-                    r["chat_id"], [str(i) for i in r["answer_msg_ids"]])
-            await conn.execute("UPDATE bot_requests SET answer = NULL WHERE $1 = ANY(quoted_user_ids)", user_id)
+            await self._scrub_answers(conn, user_id)
         return int(status.split()[-1])
+
+    async def _scrub_answers(self, conn, user_id: int, request_id: int | None = None) -> None:
+        """The bot's answers that carried the user's words (quote-links and the rest that
+        bot_requests.quoted_user_ids records): out of the archive, and out of the conversation
+        history that goes back to the model. All of them, or one request's."""
+        for r in await conn.fetch(
+                """SELECT chat_id, answer_msg_ids FROM bot_requests
+                   WHERE $1 = ANY(quoted_user_ids) AND answer_msg_ids IS NOT NULL
+                     AND ($2::bigint IS NULL OR id = $2)""", user_id, request_id):
+            await conn.execute("DELETE FROM messages WHERE chat_id = $1 AND message_id = ANY($2::bigint[]) "
+                               "AND user_id = $3", r["chat_id"], r["answer_msg_ids"], self.me.user_id)
+            await conn.execute(
+                """UPDATE messages SET raw = raw - 'quote'
+                   WHERE chat_id = $1 AND raw ? 'quote'
+                     AND raw->'reply_to_message'->>'message_id' = ANY($2::text[])""",
+                r["chat_id"], [str(i) for i in r["answer_msg_ids"]])
+        await conn.execute("UPDATE bot_requests SET answer = NULL WHERE $1 = ANY(quoted_user_ids) "
+                           "AND ($2::bigint IS NULL OR id = $2)", user_id, request_id)
+
+    async def _scrub_if_opted_out(self, conn, request_id: int, quoted: list[int] | None) -> None:
+        """A /forget_me that came while the answer was being written: scrub the row at once.
+        The lock waits for a /forget_me in flight to finish, so neither side misses the other."""
+        if not quoted:
+            return
+        rows = await conn.fetch("SELECT user_id, opted_out FROM users WHERE user_id = ANY($1::bigint[]) FOR SHARE",
+                                quoted)
+        for r in rows:
+            if r["opted_out"]:
+                await self._scrub_answers(conn, r["user_id"], request_id)
 
     # ---- reminders ----
 
@@ -358,6 +377,7 @@ class Answerer:
                 return Outgoing(prompts.REMINDERS_TOO_MANY.format(limit=self.cfg.max_reminders), html=True)
             rid = await reminders.create(conn, chat_id=chat_id, thread_id=_topic(msg), user_id=user_id,
                                          request_msg_id=msg["message_id"], text=parsed.text, due=parsed.due)
+        job.quoted.add(user_id)         # the confirmation repeats their words: /forget_me removes it too
         return Outgoing(prompts.REMINDER_SET.format(when=reminders.format_due(parsed.due, self.cfg.tz, now),
                                                     about=html.escape(reminders.about(parsed.text)), id=rid),
                         html=True)
@@ -367,13 +387,22 @@ class Answerer:
         async with self.pool.acquire() as conn:
             rows = await reminders.pending_for(conn, msg["chat"]["id"], msg["from"]["id"])
         if not rows:
-            await self._say(msg, prompts.REMINDERS_EMPTY)
+            await self._say(msg, prompts.REMINDERS_EMPTY, save=False)
             return
-        items = "\n".join(prompts.REMINDER_ITEM.format(
-            id=r["id"], when=reminders.format_due(r["due_at"], self.cfg.tz, now),
-            about=html.escape(reminders.about(r["text"])))
-            for r in rows)
-        await self._say(msg, prompts.REMINDERS_LIST.format(items=items))
+        items = [prompts.REMINDER_ITEM.format(id=r["id"], when=reminders.format_due(r["due_at"], self.cfg.tz, now),
+                                              about=html.escape(reminders.about(r["text"]))) for r in rows]
+        # Their own reminders, not archived: /forget_me deletes reminders. Many long ones go in
+        # several messages, the header with the first and the hint with the last.
+        chunks = markup.chunk_lines(items, TELEGRAM_LIMIT - len(prompts.REMINDERS_LIST))
+        for i, chunk in enumerate(chunks):
+            text = "\n".join(chunk)
+            if len(chunks) == 1:
+                text = prompts.REMINDERS_LIST.format(items=text)
+            elif i == 0:
+                text = prompts.REMINDERS_LIST_HEADER + "\n" + text
+            elif i == len(chunks) - 1:
+                text += "\n\n" + prompts.REMINDERS_LIST_FOOTER
+            await self._say(msg, text, save=False)
 
     async def _unremind(self, msg: dict, args: str) -> None:
         m = re.search(r"\d+", args or "")
@@ -402,7 +431,7 @@ class Answerer:
             if now - r["due_at"] > timedelta(hours=1):
                 text += prompts.REMINDER_LATE.format(when=reminders.format_due(r["due_at"], self.cfg.tz, now))
             try:
-                sent = await self.bot.send_message(
+                await self.bot.send_message(
                     r["chat_id"], text, parse_mode="HTML", message_thread_id=r["thread_id"],
                     reply_parameters=ReplyParameters(message_id=r["request_msg_id"], allow_sending_without_reply=True),
                     link_preview_options=LinkPreviewOptions(is_disabled=True))
@@ -429,8 +458,7 @@ class Answerer:
                 continue
             async with self.pool.acquire() as conn:
                 await reminders.mark_sent(conn, r["id"])
-            await self._archive(sent, r["chat_id"])
-            delivered += 1
+            delivered += 1      # not archived: it repeats their words, and /forget_me deletes reminders
         return delivered
 
     # ---- /export ----
@@ -524,7 +552,7 @@ class Answerer:
             out = await self._produce(job, parent, ticket)
             status = out.status
             # Counted before sending: tokens spent stay spent even if delivery fails.
-            fields.update(answer=out.log_text or out.text, quoted_user_ids=_quoted(out.refs))
+            fields.update(answer=out.log_text or out.text, quoted_user_ids=_quoted(out.refs, job.quoted))
             if out.completion is not None:
                 c = out.completion
                 fields.update(model=c.model, input_tokens=c.input_tokens, output_tokens=c.output_tokens,
@@ -542,7 +570,9 @@ class Answerer:
             fields["latency_ms"] = int((time.monotonic() - started) * 1000)
             async with self.pool.acquire() as conn:
                 await conn.execute("DELETE FROM request_tickets WHERE ticket = $1 OR expires_at < now()", ticket)
-                await self._log(conn, job, status, **fields)
+                async with conn.transaction():
+                    rid = await self._log(conn, job, status, **fields)
+                    await self._scrub_if_opted_out(conn, rid, fields.get("quoted_user_ids"))
             await self._react(msg, None)
         log.info("answered", extra={"chat_id": msg["chat"]["id"], "scenario": job.scenario, "status": status,
                                     "latency_ms": fields["latency_ms"], "input_tokens": fields.get("input_tokens"),
@@ -582,7 +612,9 @@ class Answerer:
                                                         timeout=self._timeout(task))
         if prompts.WEB_MARKER in completion.text:
             return _out(await self._answer_from_web(job, completion))
-        return _out(completion, await self._refs(job.msg["chat"]["id"], completion.text))
+        refs, authors = await self._refs(job.msg["chat"]["id"], completion.text, job.seen)
+        job.quoted |= authors
+        return _out(completion, refs)
 
     async def _deliver(self, msg: dict, out: Outgoing) -> list[Message | None]:
         if out.html or out.keyboard or out.preview_url:
@@ -599,32 +631,55 @@ class Answerer:
             return [await self._reply(msg, part, html=True, plain=markup.to_plain(part)) for part in parts]
         return [await self._reply(msg, part) for part in split_text(out.text)]
 
-    async def _refs(self, chat_id: int, text: str) -> dict[int, markup.Ref]:
-        """The archive messages an answer refers to (#id, [«…»](#id), t.me/c links), with
-        their links, a piece of their text and their author. Deleted messages and authors who
-        used /forget_me are not found, so their references stay without a link or quote. In a
-        group migrated from a basic group both chats number from 1: an id found in both is
-        left as it is, it cannot be told which message the model meant."""
-        ids = markup.ref_ids(text, chat_id)
+    async def _refs(self, chat_id: int, text: str,
+                    seen: dict[int, int | None] | None = None) -> tuple[dict[int, markup.Ref], set[int]]:
+        """The archive messages an answer refers to ([«…»](#id), t.me/c links, a bare #id the
+        model was shown), with their links, a piece of their text and their author. Deleted
+        messages and authors who used /forget_me are not found, so their references stay without
+        a link or quote. In a group migrated from a basic group both chats number from 1: an id
+        found in both is left as it is, it cannot be told which message the model meant.
+
+        Also returns the authors whose words the answer carries without a usable reference, so
+        that /forget_me still removes it: of such ambiguous ids, of messages gone since the prompt
+        was built (a /forget_me in flight), and of the people quoted in the bot's own answers it
+        refers to."""
+        ids = markup.ref_ids(text, chat_id, known=seen)       # None: no prompt was built (tests, imports)
         if not ids:
-            return {}
+            return {}, set()
+        linked = markup.linked_ids(text, chat_id)
         found: dict[int, list] = {}
+        refs, authors = {}, set()
         async with self.pool.acquire() as conn:
             for cid in await context.chat_lineage(conn, chat_id):
-                for r in await context.messages_by_id(conn, cid, ids):
+                wanted = ids if cid == chat_id else [i for i in ids if i not in linked]
+                for r in await context.messages_by_id(conn, cid, wanted):
                     found.setdefault(r["message_id"], []).append(r)
-        return {mid: markup.Ref(
-                    context.message_link(r["chat_id"], r["message_id"], r["thread_id"], r["is_topic_message"]),
-                    markup.quote(r["text"]), r["user_id"])
-                for mid, (r, *more) in found.items() if not more}
+            for mid in ids:
+                rows = found.get(mid, [])
+                if len(rows) == 1:
+                    r = rows[0]
+                    own = r["user_id"] == self.me.user_id
+                    refs[mid] = markup.Ref(
+                        context.message_link(r["chat_id"], r["message_id"], r["thread_id"], r["is_topic_message"]),
+                        markup.quote(r["text"]), None if own else r["user_id"], bare=seen is None or mid in seen)
+                    if own:     # the bot's answer: whoever it quoted is quoted again
+                        authors |= set(await conn.fetchval(
+                            "SELECT quoted_user_ids FROM bot_requests WHERE chat_id = $1 AND $2 = ANY(answer_msg_ids)",
+                            r["chat_id"], mid) or [])
+                elif rows:
+                    authors |= {r["user_id"] for r in rows if r["user_id"] is not None}
+                elif (seen or {}).get(mid) is not None:
+                    authors.add(seen[mid])
+        return refs, authors - {self.me.user_id}
 
     async def _parent(self, conn, job: Job):
         """The earlier request whose answer this message replies to, if any."""
         if job.inv.replied_to_bot is None:
             return None
         return await conn.fetchrow(
-            "SELECT id, chat_id, trigger_msg_id, question, answer, scenario, parent_id FROM bot_requests "
-            "WHERE chat_id = $1 AND $2 = ANY(answer_msg_ids)", job.msg["chat"]["id"], job.inv.replied_to_bot)
+            "SELECT id, chat_id, trigger_msg_id, question, answer, scenario, parent_id, quoted_user_ids "
+            "FROM bot_requests WHERE chat_id = $1 AND $2 = ANY(answer_msg_ids)",
+            job.msg["chat"]["id"], job.inv.replied_to_bot)
 
     async def _start_catchup(self, job: Job) -> str | None:
         """«Что я пропустил»: the period starts at the asker's previous message here (at most a
@@ -684,6 +739,7 @@ class Answerer:
             claim, opted_out = await self._replied_text(conn, job.msg)
         if claim is None:
             return Outgoing(prompts.REPLIED_OPTED_OUT if opted_out else prompts.FACTCHECK_NO_TEXT, html=True)
+        job.quoted.add(_replied_author(job.msg))    # the verdict restates their claim
         now = datetime.now(self.cfg.tz).strftime("%Y-%m-%d %H:%M")
         user = (f"Сейчас {now} ({self.cfg.tz.key}). Утверждение из чата: «{claim}»\n"
                 f"Вопрос участника: {job.question or 'проверь'}")
@@ -708,6 +764,7 @@ class Answerer:
                 extra, opted_out = await self._replied_text(conn, job.msg)
                 if extra is None:
                     return Outgoing(prompts.REPLIED_OPTED_OUT if opted_out else prompts.MUSIC_NO_TEXT, html=True)
+                job.quoted.add(_replied_author(job.msg))
             history = await self._history(conn, job, ("music",))
         user = f"Запрос: {job.question}"
         if extra:
@@ -764,7 +821,12 @@ class Answerer:
         lines += ["", f"<b>{html.escape(prompts.STATS_TOPICS)}</b>"]
         for i, (b, rows) in enumerate(branches, 1):
             first = rows[0]
-            name = html.escape((names[i - 1] if i <= len(names) else None) or _snippet(first["text"]))
+            name = names[i - 1] if i <= len(names) else None
+            if name is None:        # the first words of the branch: its author's own
+                name = _snippet(first["text"])
+                if first["user_id"] is not None:
+                    job.quoted.add(first["user_id"])
+            name = html.escape(name)
             size = b["size"]
             link = context.message_link(first["chat_id"], first["message_id"], first["thread_id"],
                                         first["is_topic_message"])
@@ -852,6 +914,11 @@ class Answerer:
         who = context.author({"first_name": msg["from"].get("first_name"), "last_name": msg["from"].get("last_name"),
                               "username": msg["from"].get("username")})
 
+        def show(rows, title: str) -> str:
+            """Rendered for the model, and remembered: these ids may be referred to."""
+            job.seen.update({r["message_id"]: r["user_id"] for r in rows})
+            return context.render(rows, tz, title=title)
+
         reply = msg.get("reply_to_message") or {}
         target = reply.get("message_id")
         if target and (msg.get("is_topic_message") and target == msg.get("message_thread_id")):
@@ -860,33 +927,34 @@ class Answerer:
             chain = await context.reply_chain(conn, chat_id, target)
             below = await context.replies_to(conn, chat_id, target)
             blocks.append(f"Запрос — ответ на сообщение #{target}; оно и его ветка:")
-            blocks.append(context.render(chain + [r for r in below if r["message_id"] != msg["message_id"]],
-                                         tz, title="ветка"))
+            blocks.append(show(chain + [r for r in below if r["message_id"] != msg["message_id"]], "ветка"))
+            if _replied_author(msg) is not None:    # the answer is about their message: theses, who is right
+                job.quoted.add(_replied_author(msg))
 
         for user in await context.mentioned_users(conn, msg, self.me.username):
             rows = await context.user_messages(conn, ids, thread, user["user_id"])
-            blocks.append(context.render(rows, tz, title=f"сообщения {context.author(user)} за сутки"))
+            blocks.append(show(rows, f"сообщения {context.author(user)} за сутки"))
 
         if job.since is not None:
             rows = await context.period_messages(conn, ids, thread, job.since, limit=500)
-            blocks.append(context.render([r for r in rows if r["message_id"] != msg["message_id"]], tz,
-                                         title="сообщения за период"))
+            blocks.append(show([r for r in rows if r["message_id"] != msg["message_id"]], "сообщения за период"))
             if job.scenario == "catchup":
                 rows = await context.addressed_to(conn, ids, thread, msg["from"]["id"], msg["from"].get("username"),
                                                   job.since)
-                blocks.append(context.render(rows, tz, title=f"ответы и упоминания для {who}"))
+                blocks.append(show(rows, f"ответы и упоминания для {who}"))
         else:
             rows = await context.recent(conn, ids, thread)
-            blocks.append(context.render([r for r in rows if r["message_id"] != msg["message_id"]], tz,
-                                         title="последние сообщения чата"))
+            blocks.append(show([r for r in rows if r["message_id"] != msg["message_id"]], "последние сообщения чата"))
 
         history: list[dict] = []
         depth = 0
         while parent and depth < 3:
             history[:0] = [{"role": "user", "content": parent["question"] or "(вопрос удалён)"},
-                           {"role": "assistant", "content": parent["answer"] or ""}]
-            parent = await conn.fetchrow("SELECT id, question, answer, scenario, parent_id FROM bot_requests "
-                                         "WHERE id = $1", parent["parent_id"]) if parent["parent_id"] else None
+                           {"role": "assistant", "content": parent["answer"] or "(ответ удалён)"}]
+            job.quoted |= set(parent["quoted_user_ids"] or [])     # a follow-up may repeat the quotes
+            parent = await conn.fetchrow("SELECT id, question, answer, scenario, parent_id, quoted_user_ids "
+                                         "FROM bot_requests WHERE id = $1",
+                                         parent["parent_id"]) if parent["parent_id"] else None
             depth += 1
 
         title = msg["chat"].get("title") or ""
@@ -962,13 +1030,15 @@ class Answerer:
         text = prompts.DIGEST_HEADER.format(date=daily.day_name(yesterday)) + "\n\n" + completion.text
         # Always one message, cut if the model overran its length limit: a post is then either
         # delivered whole or retried whole, never left half-sent.
-        refs = await self._refs(chat_id, completion.text)
+        refs, authors = await self._refs(chat_id, completion.text, {r["message_id"]: r["user_id"] for r in rows})
         parts = markup.render(text, refs, chat_id, TELEGRAM_LIMIT - 1)
         first = parts[0] + ("…" if len(parts) > 1 else "")
         sent = await self._post(chat_id, first, html=True, plain=markup.to_plain(first))
-        async with self.pool.acquire() as conn:
-            await self._log_scheduled(conn, chat_id, "digest", completion, [sent], started,
-                                      status="ok" if sent else "error", quoted_user_ids=_quoted(refs))
+        async with self.pool.acquire() as conn, conn.transaction():
+            quoted = _quoted(refs, authors)
+            rid = await self._log_scheduled(conn, chat_id, "digest", completion, [sent], started,
+                                            status="ok" if sent else "error", quoted_user_ids=quoted)
+            await self._scrub_if_opted_out(conn, rid, quoted)
         if sent is None:
             return "failed", {}
         return "posted", {"message_id": sent.message_id}
@@ -1076,12 +1146,12 @@ class Answerer:
 
     async def _log_scheduled(self, conn, chat_id: int, scenario: str, completion: Completion,
                              sent: list[Message | None], started: float, status: str = "ok",
-                             quoted_user_ids: list[int] | None = None) -> None:
+                             quoted_user_ids: list[int] | None = None) -> int:
         """Scheduled posts have no asker; their tokens still count toward the daily limit."""
-        await conn.execute(
+        return await conn.fetchval(
             """INSERT INTO bot_requests (chat_id, scenario, answer, model, input_tokens, output_tokens,
                                          latency_ms, status, answer_msg_ids, profile, quoted_user_ids)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)""",
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id""",
             chat_id, scenario, completion.text, completion.model, completion.input_tokens, completion.output_tokens,
             int((time.monotonic() - started) * 1000), status, [m.message_id for m in sent if m is not None],
             completion.profile, quoted_user_ids)
@@ -1165,9 +1235,11 @@ def _out(completion: Completion, refs: dict[int, markup.Ref] | None = None) -> O
     return Outgoing(completion.text or "Мне нечего ответить по этим данным.", completion, markdown=True, refs=refs)
 
 
-def _quoted(refs: dict[int, markup.Ref] | None) -> list[int] | None:
-    """Authors whose words an answer quotes: /forget_me removes the answer with their messages."""
-    users = sorted({r.user_id for r in (refs or {}).values() if r.user_id is not None})
+def _quoted(refs: dict[int, markup.Ref] | None, more: Collection[int] = ()) -> list[int] | None:
+    """People whose words an answer carries (quote-links and the rest): /forget_me removes the
+    answer with their messages."""
+    users = sorted({r.user_id for r in (refs or {}).values() if r.user_id is not None}
+                   | {u for u in more if u is not None})
     return users or None
 
 
@@ -1184,6 +1256,12 @@ def _numbered(text: str, n: int) -> list[str | None]:
 def _snippet(text: str | None, limit: int = 60) -> str:
     text = re.sub(r"\s+", " ", text or "").strip() or "без текста"
     return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+def _replied_author(msg: dict) -> int | None:
+    """Who wrote the message the request replies to."""
+    reply = _reply_target(msg)
+    return ((reply or {}).get("from") or {}).get("id")
 
 
 def _reply_target(msg: dict, inv: Invocation | None = None) -> dict | None:

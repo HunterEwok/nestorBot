@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import html
 import re
+from collections.abc import Collection
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
@@ -29,20 +30,44 @@ class Ref:
     url: str | None         # None: no t.me link exists (basic groups)
     quote: str              # a short piece of its text, for a bare #id
     user_id: int | None = None   # its author: /forget_me also removes answers that quote them
+    bare: bool = True       # a bare #id may mean it; False: the model was not shown it («issue #1234»)
 
 
 def split_text(text: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
-    """SC-6: split on paragraph, then line, then word boundaries."""
+    """SC-6: split on paragraph, then line, then word boundaries, never inside a link, a
+    quote-link or a bold span. Only the separator goes at the cut, so an indented line (code,
+    a nested list item) keeps its indentation in the next part."""
     parts: list[str] = []
     rest = text.strip()
     while len(rest) > limit:
-        cut = next((at for at in (rest.rfind(sep, 0, limit) for sep in ("\n\n", "\n", " ")) if at > limit // 2),
-                   limit)
+        cut = _cut_point(rest, limit)
         parts.append(rest[:cut].rstrip())
-        rest = rest[cut:].lstrip()
+        rest = rest[cut:].lstrip("\n" if rest[cut] == "\n" else " ")
     if rest:
         parts.append(rest)
     return parts
+
+
+def chunk_lines(lines: list[str], limit: int = TELEGRAM_LIMIT) -> list[list[str]]:
+    """Whole lines of HTML grouped into messages within the limit (a long list, one item a line)."""
+    chunks: list[list[str]] = [[]]
+    for line in lines:
+        if chunks[-1] and visible_len("\n".join(chunks[-1] + [line])) > limit:
+            chunks.append([])
+        chunks[-1].append(line)
+    return chunks
+
+
+def _cut_point(text: str, limit: int) -> int:
+    for sep in ("\n\n", "\n"):
+        at = text.rfind(sep, 0, limit)
+        if at > limit // 2:
+            return at
+    spans = [m.span() for m in _INLINE.finditer(text) if m.start() < limit]
+    at = text.rfind(" ", 0, limit)
+    while at > limit // 2 and any(start < at < end for start, end in spans):
+        at = text.rfind(" ", 0, at)
+    return at if at > limit // 2 else limit
 
 
 # ---- references to archive messages ----
@@ -64,11 +89,13 @@ def _internal(chat_id: int | None) -> str | None:
     return str(-chat_id - 1000000000000)
 
 
-def ref_ids(text: str, chat_id: int | None = None) -> list[int]:
-    """Message ids an answer refers to, first seen first (at most MAX_REFS)."""
+def ref_ids(text: str, chat_id: int | None = None, known: Collection[int] | None = None) -> list[int]:
+    """Message ids an answer refers to, first seen first (at most MAX_REFS). known: the ids the
+    model was shown; a bare #id outside them is a number («issue #1234»), not a reference."""
     internal = _internal(chat_id)
-    found = [(m.start(), int(m.group(1)))
-             for pattern in (_BARE_REF, _LINK_REF) for m in pattern.finditer(text or "")]
+    found = [(m.start(), int(m.group(1))) for m in _BARE_REF.finditer(text or "")
+             if known is None or int(m.group(1)) in known]
+    found += [(m.start(), int(m.group(1))) for m in _LINK_REF.finditer(text or "")]
     if internal is not None:
         found += [(m.start(), int(m.group("message"))) for m in _TME_LINK.finditer(text or "")
                   if m.group("internal") == internal]
@@ -77,6 +104,15 @@ def ref_ids(text: str, chat_id: int | None = None) -> list[int]:
         if value not in ids:
             ids.append(value)
     return ids[:MAX_REFS]
+
+
+def linked_ids(text: str, chat_id: int | None) -> set[int]:
+    """Ids given as t.me/c links into this chat: they name the supergroup itself, never the
+    basic group it was migrated from."""
+    internal = _internal(chat_id)
+    if internal is None:
+        return set()
+    return {int(m.group("message")) for m in _TME_LINK.finditer(text or "") if m.group("internal") == internal}
 
 
 def quote(text: str | None, limit: int = 60) -> str:
@@ -98,10 +134,10 @@ _INLINE = re.compile(
     r"|\[(?P<badlabel>[^\[\]\n]{1,300})\]\((?!\s*(?:#|https?://))[^()\s]*(?:\([^()\s]*\)[^()\s]*)*\)"
     r"|(?P<url>https?://[^\s<>]+)"
     r"|(?<![\w#&/])#(?P<ref>[1-9]\d{2,11})(?!\w)"
-    r"|(?<!\w)\*\*\*(?P<bolditalic>[^\s*](?:[^\n]*?[^\s*])?)\*\*\*(?!\w)"
-    r"|(?<!\w)\*\*(?P<bold>[^\s*](?:[^\n]*?[^\s*])?)\*\*(?!\w)"
-    r"|~~(?P<strike>[^\s~](?:[^\n]*?[^\s~])?)~~"
-    r"|\|\|(?P<spoiler>[^\s|](?:[^\n]*?[^\s|])?)\|\|"
+    r"|(?<!\w)\*\*\*(?P<bolditalic>[^\s*](?:[^\n]*?[^\s*])??)\*\*\*(?!\w)"
+    r"|(?<!\w)\*\*(?P<bold>[^\s*](?:[^\n]*?[^\s*])??)\*\*(?!\w)"
+    r"|~~(?P<strike>[^\s~](?:[^\n]*?[^\s~])??)~~"
+    r"|\|\|(?P<spoiler>[^\s|](?:[^\n]*?[^\s|])??)\|\|"
     r"|(?<![\w*])\*(?P<italic>[^\s*](?:[^*\n]*?[^\s*])?)\*(?![\w*])"
 )
 
@@ -123,9 +159,15 @@ def _a(url: str, label_html: str) -> str:
     return f'<a href="{html.escape(url, quote=True)}">{label_html}</a>'
 
 
+_MIXED = re.compile(r"(?=.*[a-z])(?=.*[^\x00-\x7f])")     # Latin and other letters in one label
+_BIDI = re.compile("[\u200e\u200f\u202a-\u202e\u2066-\u2069]")      # direction overrides reverse what follows
+
+
 def _host(url: str) -> str | None:
     """The domain a browser opens, or None when it is unclear: userinfo («a.com@b.com»),
-    backslashes and percent signs are read differently by browsers and by Python."""
+    backslashes and percent signs are read differently by browsers and by Python. A label
+    that mixes scripts («sbеrbank.ru» with a Cyrillic е) is shown the way the address bar
+    shows it, in its xn-- form; «сбер.рф» stays readable."""
     try:
         parts = urlsplit(url)
         host = parts.hostname
@@ -133,7 +175,14 @@ def _host(url: str) -> str | None:
         return None
     if not host or re.search(r"[@\\%]", parts.netloc) or "\\" in url:
         return None
-    return host.lower().removeprefix("www.")
+    host = host.lower().removeprefix("www.")
+    if host.isascii():
+        return host
+    try:
+        ascii_host = host.encode("idna").decode()
+    except UnicodeError:
+        return None
+    return ascii_host if any(_MIXED.match(label) for label in host.split(".")) else host
 
 
 def _names_host(label: str, host: str) -> bool:
@@ -199,7 +248,8 @@ class _Renderer:
                 else:
                     out.append(_esc(value))
             elif kind == "ref":
-                out.append(self._ref(int(value), None) if links else _esc(m.group(0)))
+                ref = self.refs.get(int(value))
+                out.append(self._ref(int(value), None) if links and ref is not None and ref.bare else _esc(m.group(0)))
             elif kind == "spoiler" and not links:     # inside a link label: nothing may be hidden
                 out.append(self.inline(value, links=False))
             elif kind == "bolditalic":
@@ -222,6 +272,32 @@ _TABLE_SEPARATOR = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)*\|?\
 _TABLE_ROW = re.compile(r"^\s*\|.*\|\s*$")
 
 
+def _one_line_block(line: str) -> bool:
+    """```ls -la```: a block that opens and closes on one line."""
+    rest = line.strip()[3:]
+    return rest.endswith("```") and len(rest) > 3
+
+
+def _cells(line: str) -> list[str]:
+    """Table cells: a «|» inside ||spoilers||, `code` or a link does not split."""
+    keep = [m.span() for m in _INLINE.finditer(line)]
+    cells, start = [], 0
+    for i, ch in enumerate(line):
+        if ch == "|" and not any(s <= i < e for s, e in keep):
+            cells.append(line[start:i])
+            start = i + 1
+    cells.append(line[start:])
+    return [c.strip() for c in cells]
+
+
+def _ends_in_code(text: str) -> bool:
+    inside = False
+    for line in text.split("\n"):
+        if _FENCE.match(line) and (inside or not _one_line_block(line)):
+            inside = not inside
+    return inside
+
+
 def _pre(lines: list[str]) -> str:
     body = "\n".join(lines).strip("\n")
     return f"<pre>{_esc(body)}</pre>" if body.strip() else ""
@@ -230,6 +306,7 @@ def _pre(lines: list[str]) -> str:
 def to_html(text: str, refs: dict[int, Ref] | None = None, chat_id: int | None = None) -> str:
     """Markdown from the model -> Telegram HTML."""
     r = _Renderer(refs, chat_id)
+    text = _BIDI.sub("", text or "")
     text = _REF_AND_LINK.sub(lambda m: f"[#{m.group('id')}](#{m.group('id')})" if m.group("id") == m.group("message")
                              and m.group("internal") == r.internal else m.group(0), text or "")
     out: list[str] = []
@@ -252,9 +329,8 @@ def to_html(text: str, refs: dict[int, Ref] | None = None, chat_id: int | None =
             continue
         if _FENCE.match(line):
             flush_quote()
-            rest = line.strip()[3:]
-            if rest.endswith("```") and len(rest) > 3:      # ```one line```
-                out.append(_pre([rest[:-3].strip()]))
+            if _one_line_block(line):
+                out.append(_pre([line.strip()[3:-3].strip()]))
             else:
                 code = []
             continue
@@ -266,9 +342,8 @@ def to_html(text: str, refs: dict[int, Ref] | None = None, chat_id: int | None =
         if _RULE.match(line) or _TABLE_SEPARATOR.match(line) and "|" in line:
             out.append("")
             continue
-        if _TABLE_ROW.match(line) and not line.lstrip().startswith("||"):    # «||spoiler||» is not a table
-            cells = [c.strip() for c in line.strip().strip("|").split("|")]
-            out.append(r.inline(" — ".join(c for c in cells if c)))
+        if _TABLE_ROW.match(line):
+            out.append(r.inline(" — ".join(c for c in _cells(line) if c)))
             continue
         m = _HEADING.match(line)
         if m:
@@ -306,7 +381,7 @@ def _split_markdown(text: str, limit: int) -> list[str]:
     at the end of one part and opened again at the start of the next."""
     parts = split_text(text, limit)
     for i in range(len(parts) - 1):
-        if sum(1 for line in parts[i].split("\n") if _FENCE.match(line)) % 2:
+        if _ends_in_code(parts[i]):
             parts[i] += "\n```"
             parts[i + 1] = "```\n" + parts[i + 1]
     return parts

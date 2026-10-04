@@ -60,7 +60,8 @@ _RULES: tuple[tuple[str | None, re.Pattern, bool], ...] = tuple((emoji, re.compi
            r"\b(?=[ha]{4,}\b)[ha]*?(?:hah|aha)|\bх[аеи](?:[\s-]+х[аеи])+\b|"
            r"\bлол\b|\blol\b|\bржу\b|\blmao\b|😂|🤣|😆|😹|\bxd\b", True),
     ("😁", r"\){3,}|😄|😃|😀|😁", True),
-    ("🎉", r"\bура+\b|поздравля|\bс\s+дн[её]м\s+рождени|\bс\s+др\b|🎉|🥳|🎊", True),
+    # «не поздравляйте меня, отец в больнице», «с др. стороны»: only the plain forms are sure.
+    ("🎉", r"\bура+\b|(?<!не )\bпоздравля(?:ю|ем)\b|\bс\s+дн[её]м\s+рождени|🎉|🥳|🎊", True),
     ("🏆", r"\bпобедил|\bвыиграл|\bчемпион", False),
     ("👏", r"\bполучилось\b|\bсдал[аи]?\b|\bнаконец-то\b|\bгоржусь|\bмолод(?:ец|цы)\b", False),
     ("❤", r"❤|😍|🥰|💕|💖", True),
@@ -73,6 +74,7 @@ _RULES: tuple[tuple[str | None, re.Pattern, bool], ...] = tuple((emoji, re.compi
     # Words that only the model can read right: «ору» is laughter or shouting, «люблю» may be «не люблю».
     ("🤣", r"\bору\b|\bугар(?:но)?\b", False),
     ("❤", r"\bлюблю\b|\bобожаю\b", False),
+    ("🎉", r"поздравля|\bс\s+др\b", False),
     (None, r"!{3,}|[?!]{4,}", False),       # strong, but which feeling: only the model can tell
 ))
 

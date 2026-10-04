@@ -1,7 +1,7 @@
 """Stage 3 through the real dispatcher with a fake Telegram and a fake LLM."""
 import asyncio
 import itertools
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from aiogram import Dispatcher
@@ -462,6 +462,76 @@ async def test_ids_shared_by_a_migrated_chat_and_its_old_group_are_not_linked(ma
     await feed(update("message", message(9, "нестор, кто что сказал?", uid=111)))
     assert bot.sent[-1]["text"] == 'Это сказал Петя: «едем в Грецию», а Вася: ' \
                                    '<a href="https://t.me/c/1000000001/8">«ок»</a>'
+    # Both people who might have written #7 are recorded: the quote itself is in the answer.
+    assert await conn.fetchval("SELECT quoted_user_ids FROM bot_requests") == [111, 222]
+    # A t.me/c link names the supergroup itself, so it is never ambiguous.
+    llm.answer = "Вот: [«новая группа 7»](https://t.me/c/1000000001/7)"
+    await feed(update("message", message(10, "нестор, а ссылкой?", uid=111)))
+    assert bot.sent[-1]["text"] == 'Вот: <a href="https://t.me/c/1000000001/7">«новая группа 7»</a>'
+
+
+async def test_a_number_the_model_was_not_shown_stays_a_number(make_env, conn):
+    bot, llm, feed = make_env(FakeLLM("Про issue #1234 спорили, см. [«купил хлеб»](#1234)"))
+    three_days_ago = int((datetime.now(timezone.utc) - timedelta(days=3)).timestamp())
+    await feed(update("message", message(1234, "купил хлеб и молоко", uid=333, date=three_days_ago)))
+    await feed(update("message", message(2000, "/summary", uid=111, date=int(datetime.now(timezone.utc).timestamp()))))
+    assert "#1234" not in llm.calls[0][-1]["content"]
+    assert bot.sent[-1]["text"] == \
+        'Про issue #1234 спорили, см. <a href="https://t.me/c/1000000001/1234">«купил хлеб»</a>'
+    # Shown to the model, the same bare number is a reference.
+    await feed(update("message", message(2001, "нестор, что там с хлебом?", uid=111)))
+    assert "#1234" in llm.calls[1][-1]["content"]
+    assert bot.sent[-1]["text"].startswith(
+        'Про issue <a href="https://t.me/c/1000000001/1234">«купил хлеб и молоко»</a>')
+
+
+async def test_forget_me_during_an_answer_in_flight_still_removes_it(make_env, conn):
+    bot, llm, feed = make_env(FakeLLM("Петя берёт: [«палатку и секретный котелок»](#1)", delay=0.4))
+    await feed(update("message", message(1, "беру палатку и секретный котелок", uid=222)))
+    asking = asyncio.create_task(feed(update("message", message(2, "нестор, кто что берёт?", uid=111))))
+    await asyncio.sleep(0.15)                       # the model is thinking
+    await feed(update("message", message(3, "/forget_me", uid=222)))
+    await asking
+    answer = next(m for m in bot.sent if m["text"].startswith("Петя берёт"))
+    assert "секретный котелок" in answer["text"]   # the model's own label: nothing else was left to quote
+    req = await conn.fetchrow("SELECT answer, quoted_user_ids FROM bot_requests WHERE scenario = 'other'")
+    assert (req["answer"], req["quoted_user_ids"]) == (None, [222])
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE message_id = $1", answer["message_id"]) == 0
+    await feed(update("message", message(4, "нестор, а теперь?", uid=111)))
+    assert "котелок" not in str(llm.calls[-1])
+
+
+async def test_answers_that_repeat_an_earlier_answer_go_with_it(make_env, conn):
+    bot, llm, feed = make_env(FakeLLM("Петя берёт: [«палатку»](#1)"))
+    await feed(update("message", message(1, "беру палатку", uid=222)))
+    await feed(update("message", message(2, "нестор, кто что берёт?", uid=111)))
+    first = bot.sent[-1]
+    # An answer that quotes the bot's own answer: the people quoted there are quoted again.
+    llm.answer = f"Я уже отвечал: [«Петя берёт: палатку»](#{first['message_id']})"
+    await feed(update("message", message(3, "нестор, повтори, кто что берёт?", uid=333)))
+    second = bot.sent[-1]
+    assert second["text"] == \
+        f'Я уже отвечал: <a href="https://t.me/c/1000000001/{first["message_id"]}">«Петя берёт: палатку»</a>'
+    # A follow-up in the same conversation may repeat the quotes without a reference.
+    llm.answer = "Да, Петя так и сказал про палатку."
+    bot_msg = {"message_id": first["message_id"], "date": 1, "chat": {"id": CHAT_ID, "type": "supergroup"},
+               "from": {"id": BOT_ID, "is_bot": True, "first_name": "Нестор"}, "text": first["text"]}
+    await feed(update("message", message(4, "точно?", uid=111, reply_to_message=bot_msg)))
+    third = bot.sent[-1]
+    rows = await conn.fetch("SELECT quoted_user_ids FROM bot_requests ORDER BY id")
+    assert [r["quoted_user_ids"] for r in rows] == [[222], [222], [222]]
+    await feed(update("message", message(5, "/forget_me", uid=222)))
+    gone = [first["message_id"], second["message_id"], third["message_id"]]
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE message_id = ANY($1::bigint[])", gone) == 0
+    assert await conn.fetchval("SELECT count(*) FROM bot_requests WHERE answer IS NOT NULL") == 0
+
+
+async def test_an_answer_about_a_replied_message_goes_with_its_author(make_env, conn):
+    bot, llm, feed = make_env()
+    claim = message(1, "налоги надо снизить срочно", uid=222)
+    await feed(update("message", claim))
+    await feed(update("message", message(2, "нестор, оцени тезисы", uid=111, reply_to_message=claim)))
+    assert await conn.fetchval("SELECT quoted_user_ids FROM bot_requests WHERE scenario = 'theses'") == [222]
 
 
 async def test_refused_formatting_is_sent_as_plain_text(make_env, conn):

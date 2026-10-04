@@ -70,6 +70,11 @@ def test_the_bot_uses_only_standard_and_friendly_reactions():
     ("ха-ха, смешно", Guess("🤣", True)), ("хехе", Guess("🤣", True)), ("haha", Guess("🤣", True)),
     ("Я на детей постоянно ору, не знаю что делать", Guess("🤣", False)),   # the model reads it
     ("Я не люблю, когда так делают", Guess("❤", False)),
+    ("Поздравляю с победой!", Guess("🎉", True)),
+    ("Не поздравляйте меня в этом году, не до праздников", Guess("🎉", False)),   # the model reads it
+    ("С др. стороны, это опасно", Guess("🎉", False)),
+    ("Надо поздравлять Петю?", Guess("🎉", False)),
+    ("С др!", Guess("🎉", False)),
 ])
 def test_guess(text, expected):
     assert guess(text) == expected
@@ -279,6 +284,12 @@ async def test_a_yes_to_the_bots_question_or_to_someone_else_is_a_request(make_e
     assert len(llm.calls) == 2 and (2, ["👌"]) not in bot.reactions
     await feed(update("message", message(3, "нестор 👍", uid=222, reply_to_message=message(1, "x", uid=333))))
     assert len(llm.calls) == 3
+    # The question need not be the last sentence of the bot's message.
+    llm.answer = "Ты про «Группа крови» Кино? Напиши «да» или исполнителя."
+    await feed(update("message", message(4, "нестор, расскажи про группу крови", uid=222)))
+    bot_msg = bot_msg | {"message_id": bot.sent[-1]["message_id"], "text": bot.sent[-1]["text"]}
+    await feed(update("message", message(5, "угу", uid=222, reply_to_message=bot_msg)))
+    assert len(llm.calls) == 5 and (5, ["👌"]) not in bot.reactions
 
 
 async def test_candidates_that_come_during_a_batch_get_the_next_one(make_env):

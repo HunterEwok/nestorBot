@@ -21,7 +21,7 @@
 ## Установка на Pi
 
 1. Профиль: `hermes profile create group` (или вручную создать `~/.hermes/profiles/group/`).
-2. Скопировать `config.yaml` и `SOUL.md` из этой папки в профиль. В `config.yaml` вписать пароль `hermes_reader` и адрес базы в `READER_DATABASE_URL`.
+2. Скопировать `config.yaml` и `SOUL.md` из этой папки в профиль. В `config.yaml` вписать пароль `hermes_reader` и адрес базы в `READER_DATABASE_URL`. `TIMEZONE` там же должен совпадать с `TIMEZONE` в `/opt/nestor/.env` (по умолчанию `Europe/Moscow`), иначе время в результатах инструментов разойдётся с контекстом бота.
 3. В `~/.hermes/profiles/group/.env`:
    ```
    ANTHROPIC_API_KEY=...        # ключ, лимит $20/мес выставить в консоли Anthropic

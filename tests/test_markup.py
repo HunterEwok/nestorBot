@@ -4,7 +4,8 @@ import time
 
 import pytest
 
-from nestor.bot.markup import Ref, quote, ref_ids, render, to_html, to_plain, visible_len
+from nestor.bot.markup import (Ref, chunk_lines, linked_ids, quote, ref_ids, render, split_text, to_html,
+                               to_plain, visible_len)
 
 CHAT = -1001000000001
 REFS = {37285: Ref("https://t.me/c/1000000001/37285", "«налоги надо снизить»"), 12: Ref(None, "«в старой группе»"),
@@ -189,3 +190,78 @@ def test_the_bots_own_texts_are_well_formed_telegram_html():
     help_text = prompts.HELP.format(username="ewok_nestor_bot")
     assert "<b>Команды</b>" in help_text and "/reactions on|off" in help_text
     assert to_plain(help_text).startswith("👋 Я Нестор: молча веду архив")
+
+
+def test_a_one_line_code_block_does_not_open_a_block_for_the_splitter():
+    lines = [f"- **Пункт {i}**: проверь [доку](https://docs.python.org/3/) и *всё* остальное…" for i in range(80)]
+    parts = render("Запусти так:\n```ls -la```\n" + "\n".join(lines), {}, CHAT)
+    assert len(parts) >= 2 and parts[0].startswith("Запусти так:\n<pre>ls -la</pre>\n• <b>Пункт 0</b>")
+    assert all("<pre>" not in p and "**" not in p and "](" not in p for p in parts[1:])
+    # A one-line block before a long real block: the real block stays code in every part.
+    code = "\n".join(f"    x_{i} = compute(*args)  # step {i}" for i in range(200))
+    parts = render("```pip install x```\n\n```python\n" + code + "\n```\n\nИтог: **готово**.", limit=2000)
+    assert parts[0].startswith("<pre>pip install x</pre>\n\n<pre>    x_0 = compute(*args)")
+    assert all(p.startswith("<pre>    x_") for p in parts[1:-1]) and parts[-1].endswith("Итог: <b>готово</b>.")
+    # A block continued in the next part keeps the indentation of its first line.
+    assert all("<pre>    x_" in p for p in parts[:-1])
+
+
+def test_a_long_paragraph_is_not_cut_inside_a_link_or_a_bold_span():
+    refs = {i: Ref(f"https://t.me/c/1000000001/{i}", "«x»") for i in range(1, 41)}
+    text = " ".join(f"**Петя {i} сказал** [«давайте поедем на дачу в субботу утром»](#{i % 40 + 1})"
+                    for i in range(300))
+    parts = render(text, refs, CHAT)
+    assert len(parts) >= 2 and all("](" not in p and "**" not in p and "[«" not in p for p in parts)
+    assert all(visible_len(p) <= 4096 for p in parts)
+    # The last space before the limit is inside a label: the cut moves back to the one before it.
+    assert split_text("слово " * 10 + "[«длинная цитата из сообщения»](#5) хвост", limit=75) == [
+        "слово слово слово слово слово слово слово слово слово слово", "[«длинная цитата из сообщения»](#5) хвост"]
+    # A nested list item that starts the next part keeps its depth.
+    items = "\n".join(f"- пункт {i}\n  - вложенный {i}" for i in range(60))
+    parts = render(items, limit=800)
+    assert len(parts) >= 2 and all(not p.startswith("• вложенный") for p in parts)
+
+
+def test_adjacent_spans_and_spoilers_in_tables():
+    assert to_html("**a** и **b**") == "<b>a</b> и <b>b</b>"
+    assert to_html("||a|| и ||b||") == "<tg-spoiler>a</tg-spoiler> и <tg-spoiler>b</tg-spoiler>"
+    assert to_html("~~a~~ и ~~b~~") == "<s>a</s> и <s>b</s>"
+    assert to_html("| Кто | Ответ |\n|---|---|\n| Убийца | ||дворецкий|| |") == \
+        "Кто — Ответ\n\nУбийца — <tg-spoiler>дворецкий</tg-spoiler>"
+    assert to_html("|ответ: ||42||") == "ответ: <tg-spoiler>42</tg-spoiler>"
+    assert to_html("| `a|b` | [x](https://a.example/a|b) |") == \
+        '<code>a|b</code> — <a href="https://a.example/a|b">x</a> (a.example)'
+
+
+def test_look_alike_hosts_and_direction_overrides():
+    # A host that mixes scripts is shown as the address bar shows it; «сбер.рф» stays readable.
+    assert to_html("[Войти в Сбербанк](https://sbеrbank.ru/login)") == \
+        '<a href="https://sbеrbank.ru/login">Войти в Сбербанк</a> (xn--sbrbank-8gg.ru)'
+    assert to_html("[sbеrbank.ru](https://sbеrbank.ru/login)") == \
+        '<a href="https://sbеrbank.ru/login">sbеrbank.ru</a> (xn--sbrbank-8gg.ru)'
+    assert to_html("[Сбер](https://сбер.рф/x)") == '<a href="https://сбер.рф/x">Сбер</a> (сбер.рф)'
+    assert to_html("[сбер.рф](https://сбер.рф/x)") == '<a href="https://сбер.рф/x">сбер.рф</a>'
+    # A right-to-left override in a label would show the domain hint reversed: dropped.
+    assert to_html("[Госуслуги\u202e](https://evil.com/x) и \u2066текст\u2069") == \
+        '<a href="https://evil.com/x">Госуслуги</a> (evil.com) и текст'
+
+
+def test_bare_numbers_are_references_only_when_the_model_saw_them():
+    refs = {1234: Ref("https://t.me/c/1000000001/1234", "«купил хлеб»"), 500: Ref(None, "«x»")}
+    assert ref_ids("issue #1234 и #500 и [x](#9)", CHAT, known={500}) == [500, 9]
+    assert ref_ids("issue #1234 и #500", CHAT, known=set()) == []
+    assert ref_ids("issue #1234 (https://t.me/c/1000000001/1234)", CHAT, known=set()) == [1234]
+    assert linked_ids("см. https://t.me/c/1000000001/7 и https://t.me/c/999/8 и #9", CHAT) == {7}
+    assert linked_ids("https://t.me/c/1000000001/7", -4242) == set()
+    # Unresolved, a bare number stays a number; the explicit form is always a reference.
+    assert to_html("issue #1234 и [«купил хлеб»](#1234)", {}, CHAT) == "issue #1234 и «купил хлеб»"
+    assert to_html("issue #1234", refs, CHAT) == 'issue <a href="https://t.me/c/1000000001/1234">«купил хлеб»</a>'
+    refs[1234] = Ref(refs[1234].url, refs[1234].quote, bare=False)
+    assert to_html("issue #1234 и [«купил хлеб»](#1234)", refs, CHAT) == \
+        'issue #1234 и <a href="https://t.me/c/1000000001/1234">«купил хлеб»</a>'
+
+
+def test_chunk_lines():
+    assert chunk_lines([], 10) == [[]]
+    assert chunk_lines(["a" * 6, "b" * 6, "c" * 6, "d" * 20], 13) == [["aaaaaa", "bbbbbb"], ["cccccc"], ["d" * 20]]
+    assert chunk_lines(["<b>x</b>", "y"], 3) == [["<b>x</b>", "y"]]

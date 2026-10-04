@@ -8,7 +8,9 @@ from zoneinfo import ZoneInfo
 
 import asyncpg
 
-TZ = ZoneInfo(os.environ.get("TIMEZONE") or "Europe/Moscow")     # the bot's time zone, see nestor.config
+# The bot's time zone: the same TIMEZONE as in /opt/nestor/.env, passed by the Hermes profile
+# (mcp_servers.nestor.env in deploy/hermes/config.yaml), so tool results and the prompt agree.
+TZ = ZoneInfo((os.environ.get("TIMEZONE") or "").split("#")[0].strip() or "Europe/Moscow")
 MAX_LIMIT = 100
 
 
