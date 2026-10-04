@@ -419,6 +419,15 @@ def test_biorxiv_topic_word_past_the_clip():
     assert len(abstract) > biorxiv.SUMMARY_MAX >= len(item.summary) and "cannabis" not in item.summary
     assert item.full_text == abstract and "cannabis" in item.full_text
     assert drop_reason(item, SRC["medrxiv"]) is None
+    # Every filter reads the whole abstract, the crime check as well: arrests in the Results drop it.
+    arrests = biorxiv.parse_details(_json({"messages": [{"status": "ok", "total": "1"}], "collection": [{
+        "doi": "10.64898/2026.10.02.26364998", "title": "Cannabis use disorder and social outcomes in a cohort",
+        "version": "1", "date": "2026-10-03", "category": "psychiatry and clinical psychology",
+        "abstract": abstract[:-len("Results: cannabis use predicted psychosis.")]
+        + "Results: participants with cannabis use disorder were more often arrested and jailed during follow-up."}]}),
+        "medrxiv").items[0]
+    assert "arrested" not in arrests.summary and "arrested" in arrests.full_text
+    assert drop_reason(arrests, SRC["medrxiv"]) == "crime"
     long = biorxiv.parse_details(_json({"messages": [{"status": "ok", "total": "1"}], "collection": [{
         "doi": "10.64898/2026.10.02.26365000", "title": "Long", "version": "1", "abstract": "word " * 5000}]}),
         "medrxiv").items[0]

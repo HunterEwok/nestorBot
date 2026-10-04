@@ -9,8 +9,11 @@ Quirks:
   HTTP 400: fields= is never sent, the full objects come back.
 - Score and num_comments stay 0-1 for about 36 h, so the run asks once a day for the posts
   36-60 h old, already scored; ranking is client side (the API cannot sort by score). The
-  cursor keeps where the last window ended: a late run, or one after an outage, starts there
-  (at most CATCH_UP_H earlier), so no slice of posts falls between two windows.
+  cursor keeps where the last window ended: a late run, or one after an outage, starts there,
+  so no slice of posts falls between two windows. Up to CATCH_UP_H earlier than usual: the
+  posts are then 96 h old, as far as service.MAX_AGE keeps anything new, and a host refusing
+  for a day (15 + 30 min of retries, then REFUSED_BACKOFF) is caught up whole. A longer
+  outage starts CATCH_UP_H early and loses only what lies before that.
 - At most 100 posts per page: a full page is followed by another with before=<oldest
   created_utc>, up to MAX_PAGES. Pages may overlap, posts are deduped by id.
 - removed_by_category is ABSENT on live posts and "reddit", "moderator", "deleted"... on
@@ -39,7 +42,7 @@ PAGE_SIZE = 100
 MAX_PAGES = 5
 WINDOW_START_H = 60     # after=now-60h
 WINDOW_END_H = 36       # before=now-36h: scores are settled by then
-CATCH_UP_H = 24         # a late run or an outage: start where the last window ended, at most this much earlier
+CATCH_UP_H = 36         # a late run or an outage: start where the last window ended, at most this much earlier
 TITLE_MAX = 300
 SUMMARY_MAX = 1500
 SELFTEXT_MAX = 10_000       # of the up to 40 000 chars of Markdown, enough for a 1500-char summary
@@ -75,8 +78,9 @@ class Page(NamedTuple):
 
 
 async def fetch(http: Http, source: Source, cursor: dict, now: datetime) -> FetchResult:
-    """The posts created 36-60 h ago, newest first, from where the last window ended if that is
-    later than due; the store dedupes the overlap by post id. The cursor keeps the window's end."""
+    """The posts created 36-60 h ago, newest first. A late run starts where the last window ended
+    instead, up to CATCH_UP_H earlier; an early one keeps the usual start and the store dedupes
+    the overlap by post id. The cursor keeps the window's end."""
     sub = source.params.get("subreddit")
     if not isinstance(sub, str) or not _SUB.fullmatch(sub):
         raise ValueError(f"arctic: bad subreddit {str(sub)[:30]!r}")
@@ -85,8 +89,8 @@ async def fetch(http: Http, source: Source, cursor: dict, now: datetime) -> Fetc
     before = int((now - timedelta(hours=WINDOW_END_H)).timestamp())
     end = before
     until = cursor.get("until") if isinstance(cursor, dict) else None
-    if isinstance(until, int) and not isinstance(until, bool) and after - CATCH_UP_H * 3600 <= until < after:
-        after = until - 1   # the bounds may be exclusive; the overlap is deduped by id
+    if isinstance(until, int) and not isinstance(until, bool) and until < after:
+        after = max(until, after - CATCH_UP_H * 3600) - 1   # the bounds may be exclusive; the overlap is deduped
     items: list[Item] = []
     seen: set[str] = set()
     for _ in range(MAX_PAGES):

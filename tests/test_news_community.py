@@ -99,8 +99,9 @@ async def test_arctic_window_does_not_depend_on_the_timezone_of_now():
 
 @pytest.mark.parametrize("cursor, after", [
     ({"until": AFTER - 3600}, AFTER - 3601),            # a run an hour late: from where the last window ended
-    ({"until": AFTER - 24 * 3600}, AFTER - 24 * 3600 - 1),  # a day lost: still caught up
-    ({"until": AFTER - 24 * 3600 - 1}, AFTER),          # longer outages: only the usual window
+    ({"until": AFTER - 36 * 3600}, AFTER - 36 * 3600 - 1),  # a day and a half lost: still caught up
+    ({"until": AFTER - 36 * 3600 - 1}, AFTER - 36 * 3600 - 1),  # longer outages: 36 h early, posts 96 h old
+    ({"until": AFTER - 30 * 24 * 3600}, AFTER - 36 * 3600 - 1),
     ({"until": AFTER}, AFTER),                          # on time
     ({"until": AFTER + 600}, AFTER),                    # an early run only overlaps; the store dedupes
     ({"until": True}, AFTER), ({"until": str(AFTER - 60)}, AFTER), ({"until": None}, AFTER), ({}, AFTER),
@@ -112,12 +113,17 @@ async def test_arctic_late_run_starts_where_the_last_window_ended(cursor, after)
     assert result.cursor == {"until": BEFORE}
 
 
-async def test_arctic_consecutive_late_runs_leave_no_gap():
+@pytest.mark.parametrize("late", [
+    timedelta(minutes=7),
+    # a host refusing for 45 minutes: retries after 15 and 30 minutes, then service.REFUSED_BACKOFF
+    timedelta(minutes=15 + 30) + timedelta(hours=24),
+])
+async def test_arctic_consecutive_late_runs_leave_no_gap(late):
     windows = []
     http = FakeHttp([("GET", ARCTIC_URL, lambda call: windows.append(call["params"]) or fixture("arctic_empty.json"))])
     first = await arctic.fetch(http, SRC["reddit_dub"], {}, NOW)
-    await arctic.fetch(http, SRC["reddit_dub"], first.cursor, NOW + timedelta(hours=24, minutes=7))
-    assert windows[1]["after"] < windows[0]["before"]   # 7 minutes late: the slice in between is asked for too
+    await arctic.fetch(http, SRC["reddit_dub"], first.cursor, NOW + timedelta(hours=24) + late)
+    assert windows[1]["after"] < windows[0]["before"]   # the slice in between is asked for too
 
 
 def test_arctic_link_and_self_posts():

@@ -175,6 +175,21 @@ async def test_a_refusing_host_is_asked_once_a_day(pool, conn):
     assert (await store.states(conn))["mm"]["failures"] == 0
 
 
+async def test_one_refusal_among_other_errors_keeps_the_usual_retries(pool, conn):
+    # A WAF that answers timeouts and 503s, then one 403: an hour as for any error; only a second 403 in a row waits a day
+    adapter = FakeAdapter()
+    service = make_service(pool, adapter)
+    url = "https://mm.example/feed/"
+    t = NOW
+    for n, (error, wait) in enumerate(((TimeoutError(), 15), (HttpError(503, url), 30), (HttpError(403, url), 60),
+                                       (HttpError(403, url), 24 * 60)), start=1):
+        adapter.results = {"mm": error}
+        await service.collect(t, only=("mm",))
+        st = (await store.states(conn))["mm"]
+        assert st["failures"] == n and st["next_run_at"] == t + timedelta(minutes=wait)
+        t += timedelta(minutes=wait)
+
+
 async def test_stale_sources_are_reported(pool, conn):
     adapter = FakeAdapter()
     service = make_service(pool, adapter)

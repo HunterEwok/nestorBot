@@ -856,7 +856,7 @@ def test_module_has_no_runtime_state():
     assert (i.title, i.summary, dict(i.meta)) == before
 
 
-def test_russian_sources_are_not_judged_by_english_only_rules():
+def test_the_source_language_plays_no_part_in_the_verdict():
     # lang plays no part in the filters: the same text drops the same way on an English broad feed
     for title in ("Псилоцибин ослабил симптомы анорексии", "Новый телескоп увидел галактику",
                   "В Москве задержан курьер с марихуаной"):

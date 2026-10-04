@@ -14,8 +14,8 @@ Quirks:
 - Dates are days without a timezone; the window overlaps the previous runs and the store dedupes.
 - www.biorxiv.org rate-limits scrapers: the article pages are only linked, never fetched.
 - Structured medRxiv abstracts run past SUMMARY_MAX, and a substance may be named only in the
-  Results: the summary is clipped for storage, the topic filter reads the whole abstract
-  (Item.full_text, never stored).
+  Results: the summary is clipped for storage, every filter reads the whole abstract
+  (Item.full_text, never stored). The crime check too: a cohort whose Results count arrests drops.
 """
 from __future__ import annotations
 
