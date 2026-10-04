@@ -66,8 +66,8 @@ SOURCES: tuple[Source, ...] = (
     Source("norml_blog", "NORML", "rss", "https://norml.org/feed/", "policy", every_h=2, max_age_days=14),
     Source("leafly_politics", "Leafly", "rss", "https://www.leafly.com/news/category/politics/feed", "policy",
            every_h=12, max_age_days=120),
-    Source("hightimes", "High Times", "rss", "https://hightimes.com/category/news/feed/", "policy", every_h=2,
-           max_age_days=14, params={"drop_categories": ("sponsored", "grow", "products", "strains", "deals")}),
+    # Not High Times: its server refuses self-identified bots (HTTP 403 to our User-Agent, feed and robots.txt
+    # alike, while plain curl gets 200; checked from the Pi 2026-10-04), and we never pose as another client.
     Source("psychedelicalpha", "Psychedelic Alpha", "rss", "https://psychedelicalpha.com/feed", "policy",
            every_h=3, max_age_days=21, params={"paid_marker": "Pα+"}),
     Source("lucidnews", "Lucid News", "rss", "https://www.lucid.news/feed/", "policy", every_h=3, max_age_days=21),
