@@ -474,8 +474,10 @@ def test_links_only_subreddits_take_research_and_news_links():
 def test_research_domains():
     assert "youtube.com" not in RESEARCH_NEWS_DOMAINS and "reddit.com" not in RESEARCH_NEWS_DOMAINS
     for host in ("marijuanamoment.net", "norml.org", "reggaeville.com", "dailyreggae.com", "lucid.news",
-                 "doi.org", "biorxiv.org", "nih.gov"):
+                 "doi.org", "biorxiv.org", "nih.gov", "hightimes.com"):
         assert host in RESEARCH_NEWS_DOMAINS
+    # Not polled since it refuses bots, still a fine link for a Reddit post: the bot never opens it.
+    assert drop_reason(post("Cannabis rescheduling hearing", link="https://hightimes.com/news/x/"), LINKS_ONLY) is None
 
 
 @pytest.mark.parametrize("title, summary", [
