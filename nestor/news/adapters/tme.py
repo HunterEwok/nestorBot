@@ -14,14 +14,13 @@ What the preview page looks like:
 - Forwards show div.tgme_widget_message_forwarded_from with a link to the original post.
   meta forwarded_from (that link) and links (hrefs of the post, Telegram ones past the cap
   too) let filters.py catch reposts of and links to blocked channels; they are never fetched.
-- Since April 2024 the preview double-escapes "&" in hrefs (RSSHub), maybe in text too, so
-  both are unescaped once more.
+- Since April 2024 the preview double-escapes "&" in hrefs (RSSHub), maybe in text too: hrefs
+  are unescaped once more, the text and the forward label to the end.
 - A channel with the preview disabled (copyright, porn, politics), a user, a bot or a missing
   name all answer 200 with the "tgme_page" contact/info card instead of posts: "no_preview".
 """
 from __future__ import annotations
 
-import html
 import re
 from datetime import datetime, timezone
 from typing import Any, NamedTuple
@@ -32,6 +31,7 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 from ..http import Http
 from ..model import FetchResult, Item, Source
 from ..sources import BLOCKED_CHANNELS
+from ..text import INVISIBLE, squash, unescape
 
 BASE = "https://t.me"
 TITLE_MAX = 120
@@ -45,11 +45,7 @@ MESSAGES_MAX = 50
 _CHANNEL = re.compile(r"[A-Za-z][A-Za-z0-9_]{3,31}")
 _POST = re.compile(r"([A-Za-z][A-Za-z0-9_]{3,31})/(\d{1,12})")
 _TELEGRAM = re.compile(r"https?://(?:www\.)?(?:t\.me|telegram\.(?:me|dog))/", re.I)
-# Only complete entities: html.unescape alone also decodes "&sect" in a URL's "&section=" to "§".
-_ENTITY = re.compile(r"&(?:[A-Za-z][A-Za-z0-9]{1,31}|#\d{1,7}|#[xX][0-9A-Fa-f]{1,6});")
 _LINE_TAGS = ("blockquote", "pre", "div", "p", "li")
-# NUL breaks Postgres TEXT; soft hyphens and zero-width spaces break the keyword filters.
-_INVISIBLE = dict.fromkeys([*range(0x00, 0x09), 0x0B, 0x0C, *range(0x0E, 0x20), 0x7F, 0xAD, 0x200B, 0x2060, 0xFEFF])
 
 
 class Page(NamedTuple):
@@ -114,7 +110,7 @@ def _item(msg: Tag, channel: str, post_id: int) -> Item | None:
     if isinstance(forward, Tag):
         # where it came from, so filters.py can catch reposts of blocked channels
         name = forward.find(class_="tgme_widget_message_forwarded_from_name")
-        label = " ".join((name or forward).get_text(" ").split()).removeprefix("Forwarded from").strip()
+        label = squash((name or forward).get_text(" ")).removeprefix("Forwarded from").strip()
         meta["forwarded"] = True
         meta["forwarded_from"] = (_href(name.get("href")) if isinstance(name, Tag) else None) or label or None
     links: list[str] = []
@@ -139,7 +135,7 @@ def _href(value: Any) -> str | None:
     """An absolute http(s) link; "&amp;" left in hrefs by the preview's double escaping is undone."""
     if not isinstance(value, str):
         return None
-    value = _unescape(value).strip()
+    value = unescape(value, rounds=1).strip()
     if not value or len(value) > URL_MAX or any(c.isspace() or ord(c) < 0x20 for c in value):
         return None
     try:
@@ -165,13 +161,9 @@ def _text_lines(node: Tag) -> list[str]:
             stack.extend(reversed(el.contents))
         elif type(el) is NavigableString:   # not comments
             parts.append(str(el))
-    text = _unescape("".join(parts))
-    lines = (" ".join(line.translate(_INVISIBLE).split()) for line in text.split("\n"))
+    text = unescape("".join(parts))
+    lines = (" ".join(line.translate(INVISIBLE).split()) for line in text.split("\n"))
     return [line for line in lines if line]
-
-
-def _unescape(text: str) -> str:
-    return _ENTITY.sub(lambda m: html.unescape(m.group()), text)
 
 
 def _time(msg: Tag) -> datetime | None:

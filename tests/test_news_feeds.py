@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 import nestor.news
+from nestor.news.filters import drop_reason
 from nestor.news.http import HttpError, Response
 from nestor.news.model import FetchResult, Source
 from nestor.news.sources import SOURCES
@@ -374,6 +375,18 @@ def test_knife_cyrillic_categories():
     assert first.published_at == datetime(2026, 10, 3, 13, 50, 13, tzinfo=UTC)
 
 
+@pytest.mark.parametrize("key, topical", [
+    ("nplus1", "Псилоцибин ослабил симптомы нервной анорексии в небольшом исследовании"),
+    ("knife", "Как психоделики вернулись в науку: краткая история «психоделического ренессанса»"),
+    ("meduza", "В Германии разрешили продажу каннабиса в аптеках по рецепту врача общей практики"),
+])
+def test_russian_feeds_keep_their_topical_entry(key, topical):
+    # A guard for the whole path (registry source, parser, filters): one item on topic, one not, in each feed.
+    reasons = {i.title: drop_reason(i, SRC[key]) for i in _parse(FIXTURE_OF[key], SRC[key])}
+    assert reasons.pop(topical) is None
+    assert list(reasons.values()) == ["offtopic"]
+
+
 def test_windows_1251_declared_in_the_xml_header():
     body = fixture("feeds_cp1251.xml")
     assert b'encoding="windows-1251"' in body and "Учёные".encode("cp1251") in body
@@ -466,6 +479,26 @@ def test_bare_ampersands_in_a_malformed_feed():
     item = feeds.parse(body, GENERIC)[0]
     assert item.title == "Q&A: R&D money for psilocybin trials"
     assert item.summary == "Hemp & CBD" and item.url == "https://example.org/q?a=1&b=2"
+
+
+def test_entities_of_deeper_levels_inside_cdata_are_decoded():
+    # CDATA is not decoded by the XML layer: two passes of HTML parsing left "It&#39;s" before.
+    body = _rss("<item><title><![CDATA[It&amp;amp;#39;s &amp;amp;regex; &amp;copy2026]]></title>"
+                "<link>https://example.org/c</link><description><![CDATA[<p>Remission held &amp;amp;amp;#8212; "
+                "relapse fell&amp;amp;#x200B;.</p>]]></description></item>")
+    item = feeds.parse(body, GENERIC)[0]
+    assert item.title == "It's &regex; &copy2026"     # unknown names and names without ";" stay as written
+    assert item.summary == "Remission held — relapse fell."
+
+
+def test_a_bare_ampersand_at_the_end_of_cdata_text_is_kept():
+    # html.parser drops an "&..." at the very end of its input: "R&D" became "RD".
+    for cdata, text in (("<em>Hemp</em> R&D", "Hemp R&D"), ("It&#8217;s R&D", "It’s R&D"),
+                        ("<p>Q&A</p> on R&D", "Q&A on R&D")):
+        body = _rss(f"<item><title><![CDATA[{cdata}]]></title><link>https://example.org/r</link>"
+                    f"<description><![CDATA[{cdata}]]></description></item>")
+        item = feeds.parse(body, SRC["psypost"])[0]
+        assert (item.title, item.summary) == (text, ""), cdata   # the summary only repeated the title
 
 
 def test_long_title_and_summary_are_cut_on_a_word_boundary():

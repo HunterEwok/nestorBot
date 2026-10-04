@@ -1,0 +1,61 @@
+{
+ "studies": [
+  {
+   "protocolSection": {
+    "identificationModule": {
+     "nctId": "NCT06111222",
+     "briefTitle": "Cannabigerol for Chronic Pain"
+    },
+    "statusModule": {
+     "overallStatus": "NOT_YET_RECRUITING",
+     "lastUpdatePostDateStruct": {
+      "date": "2026-08-30",
+      "type": "ACTUAL"
+     }
+    },
+    "armsInterventionsModule": {
+     "interventions": [
+      {
+       "name": "Cannabigerol"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "protocolSection": {
+    "identificationModule": {
+     "nctId": "NCT06777777",
+     "briefTitle": "COMP360 in Treatment-Resistant Depression"
+    },
+    "statusModule": {
+     "overallStatus": "ACTIVE_NOT_RECRUITING",
+     "lastUpdatePostDateStruct": {
+      "date": "2026-10-02",
+      "type": "ACTUAL"
+     }
+    },
+    "armsInterventionsModule": {
+     "interventions": [
+      {
+       "name": "COMP360",
+       "otherNames": [
+        "Psilocybin"
+       ]
+      },
+      {
+       "name": "Placebo"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "protocolSection": {
+    "identificationModule": {
+     "nctId": "broken"
+    }
+   }
+  }
+ ]
+}

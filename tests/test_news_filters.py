@@ -91,6 +91,34 @@ def test_topic_match_takes_only_strings():
     assert not topic_match(None)
 
 
+@pytest.mark.parametrize("text", [
+    "Noribogaine reduces opioid withdrawal in rats", "Tabernanthe iboga root bark",
+    # Russian: inflection, case, ё and the spellings in use
+    "КАННАБИС ПОМОГ ПРИ ХРОНИЧЕСКОЙ БОЛИ", "Курильщики конопли спят хуже", "Поле засеяли коноплёй",
+    "Марихуаны в Канаде стало больше", "Каннабиноиды снизили тревожность у мышей", "Канабис в аптеках",
+    "ТГК нашли в грудном молоке", "Психоделиков стали изучать снова", "Исследование псилоцибиновых грибов",
+    "5-MeO-ДМТ в клинике", "Айяуаска помогла ветеранам", "Аяваска и горе", "Аяхуаска в Перу", "Ибога в Габоне",
+    "Пейот и коренные народы", "Волшебные грибы легализовали в Колорадо", "Магические грибы в Орегоне",
+    "Лизергиновая кислота", "Диметилтриптамин и околосмертный опыт", "Король даба Кинг Табби",
+    "В дабе главное — бас", "Дабовый ремикс", "Раста-культура на Ямайке", "Зигги Марли выпустил альбом",
+    "Денсхолл-вечеринка",
+])
+def test_topic_match_more_spellings(text):
+    assert topic_match(text)
+
+
+@pytest.mark.parametrize("text", [
+    "Дабы избежать штрафов, банки подняли ставки", "Грибы в лесу", "Скорость роста экономики",
+    "ТГК-2 подняла тарифы", "Ибо так решил суд", "Ribosome profiling of yeast",
+])
+def test_topic_match_more_lookalikes(text):
+    assert not topic_match(text)
+
+
+def test_noribogaine_preprint_passes():
+    assert drop_reason(item("Noribogaine reduces opioid withdrawal in rats", meta={"version": "1"}), PREPRINTS) is None
+
+
 @pytest.mark.parametrize("text, expected", [
     ("Microdosing and mood", True), ("Микродозинг и креативность", True), ("Microdose psilocybin study", True),
     ("Microdosing Ozempic is the new wellness trend", False), ("Microdosing semaglutide for weight loss", False),
@@ -228,6 +256,25 @@ def test_drug_crime_still_caught_on_preprint_feeds(title, summary):
     "Trafficking of illegal drugs such as cannabis rises", "Cannabis trafficking network dismantled",
     "Arrested for psilocybin possession", "Суд в Москве осудил продавца ЛСД", "Его осудили на 8 лет за марихуану",
     "Осуждённый за марихуану вышел на свободу",
+    "В Москве задержан курьер с марихуаной", "Полиция задержала начальника отдела с гашишем",
+    "Полиция задержала ростовчанина с коноплёй", "Задержали рецидивиста с ЛСД",
+    "Сенатора арестовали за хранение кокаина и марихуаны", "Экс-депутата Госдумы задержали с марихуаной",
+    "Двоих депутатов задержали с гашишем", "Каннабидиол задержал рост опухоли, а полиция задержала курьера с ЛСД",
+    "Полиция задержала курьера с марихуаной: по законодательству ему грозит 15 лет",
+    # courts and arrests that read like idioms or delays
+    "Суд в Сочи приговорил бизнесмена к шести годам колонии за выращивание конопли",
+    "В Петербурге приговорили бизнесмена, продававшего марихуану через Telegram",
+    "В Москве вынесли приговор бизнесмену, торговавшему марихуаной",
+    "Суд вынес приговор бизнес-партнёру торговца марихуаной",
+    "Подростка задержали после смерти друга от передозировки: в его квартире нашли гашиш",
+    "Музыканта задержали до начала концерта, у него нашли марихуану",
+    "Задержали до начала суда: продавца каннабиса отправили в СИЗО",
+    "Полиция задержала подозреваемого в гибели подростка, отравившегося марихуаной",
+    "В Петербурге задержали подозреваемого в смерти студента после употребления мефедрона и гашиша",
+    "Полиция задержала виновника гибели подростка, отравившегося марихуаной",
+    "МВД задержало курьера и начало проверку: у него нашли марихуану",
+    "В Москве задержали главу отдела развития компании с марихуаной",
+    "На Сенатской площади задержали закладчика с марихуаной", "Депутаты горсовета задержаны с марихуаной",
 ])
 def test_drug_crime_still_caught(title):
     source = BROAD_RU if any("а" <= c <= "я" for c in title.lower()) else BROAD_EN
@@ -319,6 +366,8 @@ def test_drop_categories_are_per_source():
     ("Новинки", "Закажите сегодня, бесплатная доставка по всей России"),
     ("Новинки", "Заказать можно в нашем магазине"),
     ("Новинки", "Заказать можно в нашем интернет-магазине"),
+    ("Каннабис", "Заказать можно у нас на сайте"), ("Каннабис", "Где заказать КБД-масло? Пишите"),
+    ("Каннабис", "Успейте заказать со скидкой"), ("Каннабис", "Заказывайте по ссылке"),
     ("Новинки", "Пишите в ЛС"),
     ("Новинки", "Подробности в личку"),
 ])
@@ -338,6 +387,7 @@ def test_curated_trade_on_explicit_shop_signals(title, summary):
     ("В Таиланде запретили доставку каннабиса", "Магазины обязаны получать лицензию"),
     ("Роскомнадзор заблокировал интернет-магазины CBD-масел", ""),
     ("Минздрав решил заказать исследование медицинского каннабиса", ""),
+    ("Минздрав решил заказать исследование каннабиса на сайте госзакупок", ""),
     # ЛС: лекарственные средства
     ("Каннабиноиды в ЛС: обзор рынка", "ЛС на основе каннабиса зарегистрированы в 12 странах"),
     ("Trump signs executive order to reschedule marijuana", "Details: https://www.dea.gov/products/scheduling"),
@@ -804,3 +854,10 @@ def test_module_has_no_runtime_state():
     before = (i.title, i.summary, dict(i.meta))
     assert filters.drop_reason(i, LINKS_ONLY) == filters.drop_reason(i, LINKS_ONLY) == "offtopic"
     assert (i.title, i.summary, dict(i.meta)) == before
+
+
+def test_russian_sources_are_not_judged_by_english_only_rules():
+    # lang plays no part in the filters: the same text drops the same way on an English broad feed
+    for title in ("Псилоцибин ослабил симптомы анорексии", "Новый телескоп увидел галактику",
+                  "В Москве задержан курьер с марихуаной"):
+        assert drop_reason(item(title, lang="ru"), BROAD_RU) == drop_reason(item(title, lang="ru"), BROAD_EN)

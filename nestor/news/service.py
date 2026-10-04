@@ -30,6 +30,10 @@ FIRST_RUN_WINDOW = timedelta(hours=24)  # the first fetch keeps only the last da
 TRIAGE_WAIT = timedelta(hours=3)      # a small backlog waits this long for company
 CANDIDATE_WINDOW = timedelta(hours=36)
 MIN_CANDIDATES = 3
+# The host refuses us (bot protection, a block): not an overload that passes. After the third refusal
+# in a row it is asked once a day, not every few hours; stale() reports it from then on.
+REFUSED = frozenset({"http_401", "http_403", "http_451"})
+REFUSED_BACKOFF = timedelta(hours=24)
 
 
 class NotEnoughNews(Exception):
@@ -152,6 +156,8 @@ class NewsService:
     async def _failed(self, source: Source, now: datetime, status: str, failures: int,
                       retry_after: float | None = None) -> str:
         backoff = min(timedelta(minutes=15 * 2 ** min(failures, 5)), timedelta(hours=max(source.every_h, 1)))
+        if status in REFUSED and failures >= 2:
+            backoff = max(backoff, REFUSED_BACKOFF)
         if retry_after:
             backoff = min(max(backoff, timedelta(seconds=retry_after)), timedelta(hours=24))
         async with self.pool.acquire() as conn:

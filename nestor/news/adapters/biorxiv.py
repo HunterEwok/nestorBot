@@ -13,6 +13,9 @@ Quirks:
   10.64898 in 2026, so it is never hard-coded.
 - Dates are days without a timezone; the window overlaps the previous runs and the store dedupes.
 - www.biorxiv.org rate-limits scrapers: the article pages are only linked, never fetched.
+- Structured medRxiv abstracts run past SUMMARY_MAX, and a substance may be named only in the
+  Results: the summary is clipped for storage, the topic filter reads the whole abstract
+  (Item.full_text, never stored).
 """
 from __future__ import annotations
 
@@ -26,6 +29,7 @@ from bs4 import BeautifulSoup
 
 from ..http import Http
 from ..model import FetchResult, Item, Source
+from ..text import squash
 
 API = "https://api.biorxiv.org/details"
 SERVERS = {"biorxiv": "bioRxiv", "medrxiv": "medRxiv"}
@@ -33,6 +37,7 @@ PAGE_SIZE = 30
 MAX_PAGES = 40
 WINDOW_DAYS = 2
 SUMMARY_MAX = 1500
+TEXT_MAX = 10_000       # the whole abstract for the filters
 
 _DOI = re.compile(r"10\.\d{4,9}/\S+")
 _WS = re.compile(r"\s+")
@@ -115,9 +120,10 @@ def _post(p: Any, server: str) -> Item | None:
     published = p.get("published").strip().lower() if isinstance(p.get("published"), str) else ""
     if _DOI.fullmatch(published):  # the journal version, "NA" until there is one
         meta["published_doi"] = published
+    abstract = _plain(p.get("abstract"))
     return Item(ext_id=doi, url=f"https://www.{server}.org/content/{quote(doi, safe='/:;()._-')}v{version}",
-                title=title, summary=_clip(_plain(p.get("abstract")), SUMMARY_MAX), published_at=_day(p.get("date")),
-                doi=doi, lang="en", meta=meta)
+                title=title, summary=_clip(abstract, SUMMARY_MAX), published_at=_day(p.get("date")),
+                doi=doi, lang="en", meta=meta, full_text=abstract[:TEXT_MAX])
 
 
 def _day(value: Any) -> datetime | None:
@@ -138,7 +144,7 @@ def _plain(value: Any) -> str:
         for tag in soup(["script", "style"]):
             tag.decompose()
         value = soup.get_text()
-    return _WS.sub(" ", value).strip()
+    return squash(value)
 
 
 def _clip(text: str, limit: int) -> str:

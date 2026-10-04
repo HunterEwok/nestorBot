@@ -2,6 +2,7 @@
 responses (tests/news_fixtures/), without network or database."""
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import importlib
 import json
@@ -14,7 +15,8 @@ from pathlib import Path
 import pytest
 
 import nestor.news
-from nestor.news.http import Response
+from nestor.news.filters import drop_reason
+from nestor.news.http import HttpError, Response
 from nestor.news.sources import SOURCES
 
 from .news_helpers import FakeHttp, fixture
@@ -207,6 +209,12 @@ def test_pubmed_unlabelled_part_and_fallbacks():
     assert item.doi == "10.1016/j.euroneuro.2026.10.003"  # the invalid ELocationID is passed over
 
 
+def test_pubmed_double_escaped_text():
+    (item,) = pubmed.parse_efetch(_one_article("Q&amp;amp;A: MDMA &amp;amp;amp; PTSD",
+                                               "<AbstractText>A &amp;amp;lt; B&amp;#x200B; held.</AbstractText>"))
+    assert item.title == "Q&A: MDMA & PTSD" and item.summary == "A < B held."
+
+
 # ---- Europe PMC ----
 
 MARK = "AoIIQJK98Sg1NjU0ODAyOQ=="
@@ -272,6 +280,14 @@ def test_europepmc_literal_lt_and_amp_kept():
     (item,) = page.items
     assert item.title == "Cannabis R&D"
     assert item.summary == "THC was <LOD in 30% of samples; IL-6<IL-10 when A<B and C>D. Q&A & more."
+
+
+def test_europepmc_double_escaped_text():
+    page = europepmc.parse_search(_json({"hitCount": 1, "resultList": {"result": [{
+        "id": "PPR1340002", "source": "PPR", "title": "MDMA &amp;amp; PTSD &amp;#8212; a review",
+        "abstractText": "<p>A &amp;amp;lt; B, &amp;regex; stays</p>", "firstIndexDate": "2026-10-03"}]}}))
+    (item,) = page.items
+    assert item.title == "MDMA & PTSD — a review" and item.summary == "A < B, &regex; stays"
 
 
 def _epmc_page(ids: list[str], mark: str | None, hits: int = 1000) -> bytes:
@@ -383,6 +399,49 @@ def test_biorxiv_literal_lt_kept():
     assert item.summary == "Anandamide stayed <LLOQ in most samples (n<10); CB1<CB2 binding. Results held."
 
 
+def test_biorxiv_double_escaped_text():
+    page = biorxiv.parse_details(_json({"messages": [{"status": "ok", "total": "1"}], "collection": [{
+        "doi": "10.64898/2026.10.02.700004", "title": "MDMA &amp;amp; PTSD", "version": "1", "date": "2026-10-03",
+        "abstract": "Remission held &amp;amp;#8212; R&D"}]}), "biorxiv")
+    (item,) = page.items
+    assert item.title == "MDMA & PTSD" and item.summary == "Remission held — R&D"
+
+
+def test_biorxiv_topic_word_past_the_clip():
+    # A structured medRxiv abstract that names the exposure only in its Results, past the 1500 chars of the summary.
+    abstract = ("Background: Psychosis risk in young adults. " + "Methods: a cohort of 12,000 people followed for "
+                "ten years with yearly interviews and record linkage. " * 18 + "Results: cannabis use predicted psychosis.")
+    page = biorxiv.parse_details(_json({"messages": [{"status": "ok", "total": "1"}], "collection": [{
+        "doi": "10.64898/2026.10.02.26364999", "title": "Exposures in early adulthood and later psychosis",
+        "version": "1", "date": "2026-10-03", "category": "psychiatry and clinical psychology",
+        "abstract": abstract}]}), "medrxiv")
+    (item,) = page.items
+    assert len(abstract) > biorxiv.SUMMARY_MAX >= len(item.summary) and "cannabis" not in item.summary
+    assert item.full_text == abstract and "cannabis" in item.full_text
+    assert drop_reason(item, SRC["medrxiv"]) is None
+    long = biorxiv.parse_details(_json({"messages": [{"status": "ok", "total": "1"}], "collection": [{
+        "doi": "10.64898/2026.10.02.26365000", "title": "Long", "version": "1", "abstract": "word " * 5000}]}),
+        "medrxiv").items[0]
+    assert len(long.full_text) == biorxiv.TEXT_MAX
+
+
+async def test_biorxiv_paging_with_100_per_page():
+    def page(call):
+        offset = int(call["url"].rsplit("/", 2)[-2])
+        return _json({"messages": [{"status": "ok", "count": 100, "total": "250"}], "collection": [
+            {"doi": f"10.64898/2026.10.02.{offset + k:06d}", "title": f"Preprint {offset + k}", "version": "1",
+             "date": "2026-10-03"} for k in range(min(100, 250 - offset))]})
+    http = FakeHttp([("GET", r"/medrxiv/", page)])
+    result = await biorxiv.fetch(http, SRC["medrxiv"], {}, NOW)
+    assert [c["url"].rsplit("/", 2)[-2] for c in http.calls] == ["0", "100", "200"] and len(result.items) == 250
+
+    def exact(call):
+        return _json({"messages": [{"status": "ok", "count": 100, "total": "100"}], "collection": [
+            {"doi": f"10.64898/2026.10.02.{k:06d}", "title": f"Preprint {k}", "version": "1"} for k in range(100)]})
+    http = FakeHttp([("GET", r"/medrxiv/", exact)])
+    assert len((await biorxiv.fetch(http, SRC["medrxiv"], {}, NOW)).items) == 100 and len(http.calls) == 1
+
+
 def test_biorxiv_odd_version_is_not_a_crash():
     body = _json({"messages": [{"status": "ok", "total": 2}], "collection": [
         {"doi": "10.64898/2026.10.01.700003", "title": "Psilocybin in rats", "version": v, "date": "2026-10-03"}
@@ -431,8 +490,13 @@ STAMP = "2026-10-03T09:00:04"
 NOT_SHOWN = ("80 mg", "40 mg", "25 mg", "Split dose", "Microcrystalline")  # descriptions (doses), other names
 
 
-def _ctgov_http(version: bytes | None = None) -> FakeHttp:
+BASELINE = r"/api/v2/studies\?.*pageSize=1000"
+
+
+def _ctgov_http(version: bytes | None = None, baseline=None) -> FakeHttp:
     return FakeHttp([("GET", r"/api/v2/version$", version or fixture("ctgov_version.json")),
+                     ("GET", BASELINE + ".*pageToken=QmFzZWxpbmUy", fixture("ctgov_baseline_2.json")),
+                     ("GET", BASELINE, baseline or fixture("ctgov_baseline_1.json")),
                      ("GET", r"/api/v2/studies\?.*pageToken=ZVNj7o2Elu8o3lpo", fixture("ctgov_studies_2.json")),
                      ("GET", r"/api/v2/studies\?", fixture("ctgov_studies_1.json"))])
 
@@ -447,8 +511,8 @@ async def test_ctgov_skips_when_data_unchanged():
 
 async def test_ctgov_requests():
     http = _ctgov_http()
-    await ctgov.fetch(http, SRC["ctgov"], {"data_timestamp": "2026-10-02T09:00:03"}, NOW)
-    assert len(http.calls) == 3 and all(c["curl_fallback"] is True for c in http.calls)
+    await ctgov.fetch(http, SRC["ctgov"], {"data_timestamp": "2026-10-02T09:00:03", "baseline": True}, NOW)
+    assert len(http.calls) == 3 and all(c["curl_fallback"] is True for c in http.calls)  # the baseline is done
     first, second = http.calls[1]["params"], http.calls[2]["params"]
     assert http.calls[1]["url"].startswith("https://clinicaltrials.gov/api/v2/studies?")
     assert first == {
@@ -456,7 +520,7 @@ async def test_ctgov_requests():
         "query.intr": 'psilocybin OR MDMA OR midomafetamine OR "lysergic acid diethylamide" OR LSD OR DMT '
                       'OR dimethyltryptamine OR "5-MeO-DMT" OR mebufotenin OR lysergide OR ayahuasca OR ibogaine '
                       "OR mescaline OR cannabidiol OR CBD OR cannabis OR tetrahydrocannabinol OR THC OR dronabinol "
-                      "OR nabilone OR nabiximols",
+                      "OR nabilone OR nabiximols OR marijuana OR marihuana OR cannabinoid OR cannabigerol OR psilocin",
         "filter.advanced": "AREA[LastUpdatePostDate]RANGE[2026-10-02,MAX]",
         "fields": "NCTId,BriefTitle,BriefSummary,OverallStatus,LastUpdatePostDate,StudyFirstPostDate,"
                   "ResultsFirstPostDate,Phase,HasResults,Condition,InterventionName,InterventionOtherName,"
@@ -466,7 +530,7 @@ async def test_ctgov_requests():
 
 
 async def test_ctgov_items_and_labels():
-    cursor = {"data_timestamp": "2026-10-02T09:00:03",
+    cursor = {"data_timestamp": "2026-10-02T09:00:03", "baseline": True,
               "statuses": {"NCT05222222": "RECRUITING", "NCT06666666": "RECRUITING", "NCT00000001": "COMPLETED",
                            "NCT06777777": "ACTIVE_NOT_RECRUITING"}}
     result = await ctgov.fetch(_ctgov_http(), SRC["ctgov"], cursor, NOW)
@@ -508,24 +572,105 @@ async def test_ctgov_items_and_labels():
         blob = json.dumps([item.title, item.summary, item.meta])
         assert not any(word in blob for word in NOT_SHOWN)
 
-    assert result.cursor == {"data_timestamp": STAMP, "statuses": {
+    assert result.cursor == {"data_timestamp": STAMP, "baseline": True, "statuses": {
         "NCT00000001": "COMPLETED", "NCT07012345": "NOT_YET_RECRUITING", "NCT05222222": "ACTIVE_NOT_RECRUITING",
         "NCT03444444": "COMPLETED", "NCT06666666": "RECRUITING", "NCT06777777": "ACTIVE_NOT_RECRUITING"}}
 
 
 async def test_ctgov_first_run_has_no_status_label():
-    result = await ctgov.fetch(_ctgov_http(), SRC["ctgov"], {}, NOW)
+    # no cursor (the first run, and always --check): no history, and no baseline requests either
+    http = _ctgov_http()
+    result = await ctgov.fetch(http, SRC["ctgov"], {}, NOW)
     assert {i.meta["nct"]: i.meta["change"] for i in result.items} == {
         "NCT07012345": "new", "NCT05222222": "update", "NCT03444444": "results", "NCT06666666": "update",
         "NCT06777777": "update"}
-    assert result.cursor["data_timestamp"] == STAMP and len(result.cursor["statuses"]) == 5
+    assert len(http.calls) == 3 and not [c for c in http.calls if c["params"].get("pageSize") == "1000"]
+    assert result.cursor["data_timestamp"] == STAMP and "baseline" not in result.cursor
+
+
+async def test_ctgov_status_baseline_once_then_status_changes_are_seen():
+    http = _ctgov_http()
+    first = await ctgov.fetch(http, SRC["ctgov"], {"data_timestamp": "2026-10-02T09:00:03"}, NOW)
+    window = [c for c in http.calls[1:] if c["params"]["pageSize"] == "100"]
+    base = [c for c in http.calls[1:] if c["params"]["pageSize"] == "1000"]
+    assert len(window) == 2 and len(base) == 2 and len(http.calls) == 5 and all(c["curl_fallback"] for c in base)
+    assert base[0]["params"] == {"format": "json", "query.intr": window[0]["params"]["query.intr"],
+                                 "fields": "NCTId,BriefTitle,OverallStatus,LastUpdatePostDate,InterventionName,"
+                                           "InterventionOtherName", "pageSize": "1000"}
+    assert base[1]["params"] == {**base[0]["params"], "pageToken": "QmFzZWxpbmUy"}
+    # ours only: by name ("Smoked marijuana", "Cannabigerol") or other name ("Psilocybin" for COMP360);
+    # not sertraline, not the LSD1 inhibitor, not the unparsable record
+    statuses = first.cursor["statuses"]
+    assert {k: statuses.get(k) for k in ("NCT04111111", "NCT03222333", "NCT06111222", "NCT05222222")} == {
+        "NCT04111111": "RECRUITING", "NCT03222333": "ENROLLING_BY_INVITATION", "NCT06111222": "NOT_YET_RECRUITING",
+        "NCT05222222": "ACTIVE_NOT_RECRUITING"}
+    assert not {"NCT04999999", "NCT02555555", "NCT04333333"} & set(statuses) and len(statuses) == 8
+
+    # The next day a study known only from the baseline completes: a status change, which the filters keep.
+    moved = json.loads(fixture("ctgov_baseline_1.json"))["studies"][1]
+    moved["protocolSection"]["statusModule"] = {"overallStatus": "COMPLETED",
+                                                "lastUpdatePostDateStruct": {"date": "2026-10-04"},
+                                                "studyFirstPostDateStruct": {"date": "2021-02-01"}}
+    version = _json({"dataTimestamp": "2026-10-04T09:00:04"})
+    http = FakeHttp([("GET", r"/version$", version), ("GET", r"/studies\?", _json({"studies": [moved]}))])
+    second = await ctgov.fetch(http, SRC["ctgov"], first.cursor, NOW)
+    assert len(http.calls) == 2  # no second baseline
+    item, = second.items
+    assert item.meta["change"] == "status" and drop_reason(item, SRC["ctgov"]) is None
+    assert second.cursor["baseline"] is True and second.cursor["statuses"]["NCT04111111"] == "COMPLETED"
+
+
+async def test_ctgov_window_goes_out_when_the_baseline_fails():
+    cursor = {"data_timestamp": "2026-10-02T09:00:03"}
+    result = await ctgov.fetch(_ctgov_http(baseline=HttpError(403, ctgov.API)), SRC["ctgov"], cursor, NOW)
+    assert len(result.items) == 5
+    assert "baseline" not in result.cursor and len(result.cursor["statuses"]) == 5   # tried again next run
+    result = await ctgov.fetch(_ctgov_http(baseline=b"<html>Access Denied</html>"), SRC["ctgov"], cursor, NOW)
+    assert len(result.items) == 5 and "baseline" not in result.cursor
+
+    def timeout(call):
+        raise asyncio.TimeoutError
+    result = await ctgov.fetch(_ctgov_http(baseline=timeout), SRC["ctgov"], cursor, NOW)
+    assert len(result.items) == 5 and "baseline" not in result.cursor
+
+
+async def test_ctgov_slow_baseline_gives_up_within_its_budget(monkeypatch):
+    class SlowBaseline(FakeHttp):
+        async def get(self, url, **kw):
+            if (kw.get("params") or {}).get("pageSize") == "1000":
+                await asyncio.sleep(30)
+            return await super().get(url, **kw)
+    monkeypatch.setattr(ctgov, "BASELINE_DEADLINE_S", 0.05)
+    http = SlowBaseline(_ctgov_http().routes)
+    result = await asyncio.wait_for(
+        ctgov.fetch(http, SRC["ctgov"], {"data_timestamp": "2026-10-02T09:00:03"}, NOW), 5)
+    assert len(result.items) == 5 and "baseline" not in result.cursor and result.cursor["data_timestamp"] == STAMP
+
+
+async def test_ctgov_baseline_pages_are_capped():
+    def page(call):
+        if call["params"]["pageSize"] == "100":
+            return _json({"studies": []})
+        n = int(call["params"].get("pageToken", "t0")[1:])
+        return _json({"studies": [], "nextPageToken": f"t{n + 1}"})
+    http = FakeHttp([("GET", r"/version$", fixture("ctgov_version.json")), ("GET", r"/studies\?", page)])
+    result = await ctgov.fetch(http, SRC["ctgov"], {"data_timestamp": "x"}, NOW)
+    assert len(http.calls) == 2 + ctgov.BASELINE_PAGES and result.cursor["baseline"] is True
+
+    http = FakeHttp([("GET", r"/version$", fixture("ctgov_version.json")),
+                     ("GET", r"/studies\?", _json({"studies": [], "nextPageToken": "same"}))])
+    await ctgov.fetch(http, SRC["ctgov"], {"baseline": True}, NOW)
+    await ctgov.fetch(http, SRC["ctgov"], {"data_timestamp": "x"}, NOW)
+    assert [c["params"].get("pageToken") for c in http.calls if c["params"].get("pageSize") == "1000"] == [
+        None, "same"]
 
 
 async def test_ctgov_statuses_capped():
-    old = {f"NCT{n:08d}": "COMPLETED" for n in range(1, 3001)}
-    result = await ctgov.fetch(_ctgov_http(), SRC["ctgov"], {"data_timestamp": "x", "statuses": old}, NOW)
+    old = {f"NCT{n:08d}": "COMPLETED" for n in range(1, ctgov.MAX_STATUSES + 1)}
+    result = await ctgov.fetch(_ctgov_http(), SRC["ctgov"], {"data_timestamp": "x", "statuses": old, "baseline": True},
+                               NOW)
     statuses = result.cursor["statuses"]
-    assert len(statuses) == 3000
+    assert len(statuses) == ctgov.MAX_STATUSES
     assert "NCT00000001" not in statuses and "NCT00000005" not in statuses  # the oldest five made room
     assert "NCT00000006" in statuses and list(statuses)[-1] == "NCT06777777"
 
@@ -535,7 +680,7 @@ async def test_ctgov_at_most_five_pages():
         n = int(call["params"].get("pageToken", "t0")[1:])
         return _json({"studies": [], "nextPageToken": f"t{n + 1}"})
     http = FakeHttp([("GET", r"/version$", fixture("ctgov_version.json")), ("GET", r"/studies\?", page)])
-    result = await ctgov.fetch(http, SRC["ctgov"], {}, NOW)
+    result = await ctgov.fetch(http, SRC["ctgov"], {"baseline": True}, NOW)
     assert len(http.calls) == 6 and result.items == []
     assert [c["params"].get("pageToken") for c in http.calls[1:]] == [None, "t1", "t2", "t3", "t4"]
 
@@ -544,8 +689,18 @@ async def test_ctgov_stops_on_repeated_token():
     def page(call):
         return _json({"studies": [], "nextPageToken": "same"})
     http = FakeHttp([("GET", r"/version$", fixture("ctgov_version.json")), ("GET", r"/studies\?", page)])
-    await ctgov.fetch(http, SRC["ctgov"], {}, NOW)
+    await ctgov.fetch(http, SRC["ctgov"], {"baseline": True}, NOW)
     assert [c["params"].get("pageToken") for c in http.calls[1:]] == [None, "same"]
+
+
+def test_ctgov_text_keeps_query_strings_and_decodes_every_level():
+    study = json.loads(fixture("ctgov_studies_1.json"))["studies"][0]
+    study["protocolSection"]["identificationModule"]["briefTitle"] = "MDMA &amp;amp; PTSD"
+    study["protocolSection"]["descriptionModule"]["briefSummary"] = (
+        "Details: https://x.org/?a=1&section=2&reg=3 &amp; more\\&amp;#8212;fine")
+    (s,) = ctgov.parse_studies(_json({"studies": [study]}))[0]
+    assert s.title == "MDMA & PTSD"
+    assert s.summary == "Details: https://x.org/?a=1&section=2&reg=3 & more—fine"
 
 
 @pytest.mark.parametrize("version, studies, reason", [
@@ -570,6 +725,8 @@ async def test_ctgov_bad_response(version, studies, reason):
     ("3,4-Methylenedioxymethamphetamine (MDMA)", True), ("Disease-Modifying Therapy (DMT)", False),
     ("Dance/Movement Therapy (DMT)", False), ("DMT (dance movement therapy) or 5-MeO-DMT", True),
     ("Delta-9-tetrahydrocannabinol", True), ("Medical cannabis oil", True), ("", False),
+    ("Marijuana", True), ("Smoked marijuana cigarettes", True), ("Marihuana", True), ("Cannabinoids", True),
+    ("Synthetic cannabinoid", True), ("Cannabigerol", True), ("Psilocin", True),
 ])
 def test_ctgov_intervention_matcher(name, kept):
     assert ctgov.intervention_matcher(SRC["ctgov"].params["interventions"])(name) is kept

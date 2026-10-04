@@ -21,7 +21,6 @@ Quirks:
 """
 from __future__ import annotations
 
-import html
 import re
 from datetime import datetime, timezone
 from typing import NamedTuple
@@ -31,6 +30,7 @@ from bs4 import BeautifulSoup, NavigableString, PageElement, Tag
 
 from ..http import Http
 from ..model import FetchResult, Item, Source
+from ..text import squash
 
 SITE = "https://www.reggaeville.com"
 HOSTS = ("www.reggaeville.com", "reggaeville.com")
@@ -42,14 +42,10 @@ TITLE_MAX = 300
 URL_MAX = 2000
 
 _DATE = re.compile(r"(\d{1,2})/(\d{1,2})/(\d{4})")
-# Only complete entities: html.unescape alone also decodes "&copy" in "&copy2026" to "©".
-_ENTITY = re.compile(r"&(?:[A-Za-z][A-Za-z0-9]{1,31}|#\d{1,7}|#[xX][0-9A-Fa-f]{1,6});")
 _HEADINGS = ("h1", "h2", "h3", "h4", "h5", "h6")
 _DROP_TAGS = ("script", "style", "noscript", "template", "svg")
 _GENERIC = frozenset({"more", "read more", "show more", "load more", "details", "continue", "continue reading",
                       "view", "view more", "click here", "here", "mehr", "weiterlesen", "listen", "watch"})
-# NUL breaks Postgres TEXT; soft hyphens and zero-width spaces break the keyword filters.
-_INVISIBLE = dict.fromkeys([*range(0x00, 0x09), 0x0B, 0x0C, *range(0x0E, 0x20), 0x7F, 0xAD, 0x200B, 0x2060, 0xFEFF])
 
 
 class _Seen(NamedTuple):
@@ -190,9 +186,9 @@ def _meaningful(text: str) -> bool:
 
 
 def _plain(text: str) -> str:
-    """Whitespace collapsed; entities the parser left (double-escaped markup) unescaped."""
-    text = _ENTITY.sub(lambda m: html.unescape(m.group()), text)
-    return " ".join(text.translate(_INVISIBLE).split())
+    """Whitespace collapsed; entities the parser left unescaped: TYPO3 escapes some titles twice
+    over ("&amp;amp;#39;"), so whatever levels are left, not just one."""
+    return squash(text)
 
 
 def _clip(text: str, limit: int) -> str:
