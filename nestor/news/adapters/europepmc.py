@@ -27,6 +27,7 @@ from bs4 import BeautifulSoup
 
 from ..http import Http
 from ..model import FetchResult, Item, Source
+from ..text import squash
 
 PAGE_SIZE = 100
 MAX_PAGES = 5
@@ -161,7 +162,7 @@ def _plain(value: Any) -> str:
         for tag in soup(["script", "style"]):
             tag.decompose()
         value = soup.get_text()
-    return _WS.sub(" ", value).strip()
+    return squash(value)
 
 
 def _clip(text: str, limit: int) -> str:

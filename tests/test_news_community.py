@@ -74,7 +74,8 @@ def _by_id(items) -> dict:
 async def test_arctic_request_parameters():
     http = FakeHttp([("GET", ARCTIC_URL, fixture("arctic_psychonaut.json"))])
     result = await arctic.fetch(http, SRC["reddit_psychonaut"], {}, NOW)
-    assert isinstance(result, FetchResult) and result.cursor is None and not result.skipped
+    assert isinstance(result, FetchResult) and not result.skipped
+    assert result.cursor == {"until": BEFORE}  # where the next run's window starts if it comes late
     assert len(http.calls) == 1  # fewer than 100 posts: no second page
     call = http.calls[0]
     assert call["url"].startswith(ARCTIC_SHIFT + "?")
@@ -94,6 +95,35 @@ async def test_arctic_window_does_not_depend_on_the_timezone_of_now():
     assert result.items == []
     assert http.calls[0]["params"]["after"] == AFTER and http.calls[0]["params"]["before"] == BEFORE
     assert http.calls[0]["params"]["subreddit"] == "reggae"
+
+
+@pytest.mark.parametrize("cursor, after", [
+    ({"until": AFTER - 3600}, AFTER - 3601),            # a run an hour late: from where the last window ended
+    ({"until": AFTER - 36 * 3600}, AFTER - 36 * 3600 - 1),  # a day and a half lost: still caught up
+    ({"until": AFTER - 36 * 3600 - 1}, AFTER - 36 * 3600 - 1),  # longer outages: 36 h early, posts 96 h old
+    ({"until": AFTER - 30 * 24 * 3600}, AFTER - 36 * 3600 - 1),
+    ({"until": AFTER}, AFTER),                          # on time
+    ({"until": AFTER + 600}, AFTER),                    # an early run only overlaps; the store dedupes
+    ({"until": True}, AFTER), ({"until": str(AFTER - 60)}, AFTER), ({"until": None}, AFTER), ({}, AFTER),
+])
+async def test_arctic_late_run_starts_where_the_last_window_ended(cursor, after):
+    http = FakeHttp([("GET", ARCTIC_URL, fixture("arctic_empty.json"))])
+    result = await arctic.fetch(http, SRC["reddit_dub"], cursor, NOW)
+    assert http.calls[0]["params"]["after"] == after and http.calls[0]["params"]["before"] == BEFORE
+    assert result.cursor == {"until": BEFORE}
+
+
+@pytest.mark.parametrize("late", [
+    timedelta(minutes=7),
+    # a host refusing for 45 minutes: retries after 15 and 30 minutes, then service.REFUSED_BACKOFF
+    timedelta(minutes=15 + 30) + timedelta(hours=24),
+])
+async def test_arctic_consecutive_late_runs_leave_no_gap(late):
+    windows = []
+    http = FakeHttp([("GET", ARCTIC_URL, lambda call: windows.append(call["params"]) or fixture("arctic_empty.json"))])
+    first = await arctic.fetch(http, SRC["reddit_dub"], {}, NOW)
+    await arctic.fetch(http, SRC["reddit_dub"], first.cursor, NOW + timedelta(hours=24) + late)
+    assert windows[1]["after"] < windows[0]["before"]   # the slice in between is asked for too
 
 
 def test_arctic_link_and_self_posts():
@@ -124,12 +154,15 @@ def test_arctic_link_and_self_posts():
 
 def test_arctic_removed_flags():
     items = _by_id(arctic.parse_posts(fixture("arctic_psychonaut.json"), "Psychonaut").items)
-    # Spam-filtered: removed_by_category "reddit" and selftext "[removed]".
+    # Spam-filtered: removed_by_category "reddit" and selftext "[removed]"; the raw category is kept for --check -v.
     assert items["1ww1zz0"].meta["removed"] is True and items["1ww1zz0"].summary == ""
+    assert items["1ww1zz0"].meta["removed_by"] == "reddit"
     # Deleted by the author: removed_by_category "deleted", selftext "[deleted]" is not a summary.
     assert items["1ww0q7f"].meta["removed"] is True and items["1ww0q7f"].summary == ""
+    assert items["1ww0q7f"].meta["removed_by"] == "deleted"
     # Live posts: the key is absent (1ww4k2p, 1ww2c9x) or, defensively, null (1ww0g3a).
     assert not any(items[k].meta["removed"] for k in ("1ww4k2p", "1ww2c9x", "1ww0g3a"))
+    assert not any("removed_by" in items[k].meta for k in ("1ww4k2p", "1ww2c9x", "1ww0g3a"))
 
     def post(**kw) -> dict:
         return {"id": "1abc", "title": "t", "subreddit": "dub", "created_utc": BEFORE - 100, "is_self": True, **kw}
@@ -138,10 +171,18 @@ def test_arctic_removed_flags():
         post(id="a1", selftext="[removed]"),                     # no category yet, body already gone
         post(id="a2", removed_by_category="moderator", selftext="still archived text"),
         post(id="a3", removed_by_category=None, selftext="live"),
-        post(id="a4", selftext="[deleted]"),
+        post(id="a4", selftext="[deleted]"),                     # deleted, no category: the body was never seen
+        post(id="a5", removed_by_category="", selftext="live too"),
     ]}).encode()
-    flags = {i.ext_id: (i.meta["removed"], i.summary) for i in arctic.parse_posts(body, "dub").items}
-    assert flags == {"a1": (True, ""), "a2": (True, "still archived text"), "a3": (False, "live"), "a4": (False, "")}
+    items = arctic.parse_posts(body, "dub").items
+    flags = {i.ext_id: (i.meta["removed"], i.summary) for i in items}
+    assert flags == {"a1": (True, ""), "a2": (True, "still archived text"), "a3": (False, "live"), "a4": (True, ""),
+                     "a5": (False, "live too")}
+    assert {i.ext_id: i.meta.get("removed_by") for i in items} == {
+        "a1": None, "a2": "moderator", "a3": None, "a4": None, "a5": None}
+    deleted = next(i for i in items if i.ext_id == "a4")
+    therapy = dataclasses.replace(deleted, meta={**deleted.meta, "subreddit": "PsychedelicTherapy", "score": 20})
+    assert drop_reason(therapy, SRC["reddit_psychedelictherapy"]) == "removed"
 
 
 def test_arctic_fallback_url_and_malformed_posts():
@@ -219,6 +260,8 @@ async def test_arctic_pages_at_most_five_times():
     result = await arctic.fetch(http, SRC["reddit_dub"], {}, NOW)
     assert len(http.calls) == arctic.MAX_PAGES == 5
     assert len(result.items) == 500
+    # The older part of the window is unread: the next run starts at this window's start, not its end.
+    assert result.cursor == {"until": AFTER}
 
 
 async def test_arctic_stops_when_the_page_does_not_move_back():
@@ -226,6 +269,7 @@ async def test_arctic_stops_when_the_page_does_not_move_back():
     http = FakeHttp([("GET", ARCTIC_URL, _page(BEFORE - 1, 100))])
     result = await arctic.fetch(http, SRC["reddit_dub"], {}, NOW)
     assert len(http.calls) == 2 and len(result.items) == 100
+    assert result.cursor == {"until": BEFORE}
 
 
 async def test_arctic_empty_window():
@@ -276,6 +320,25 @@ def test_arctic_markdown_leftovers_and_query_strings():
     assert item.summary == ("spoiler here and Psilocybin wiki nested quote "
                             "see https://example.org/a?x=1&section=news&param=2&currency=EUR & more")
     assert raw.meta["link"] == "https://example.org/b?x=1&section=news&notify=1"
+
+
+def test_arctic_entities_of_pasted_titles_are_decoded_to_the_end():
+    # Seen live on r/reggae: the title already held "&#39;", the API escaped it once more.
+    body = json.dumps({"data": [{
+        "id": "f1", "title": "It&amp;#39;s Bandcamp Friday &amp;amp; more, raw &region=eu", "subreddit": "reggae",
+        "created_utc": BEFORE - 100, "is_self": False, "link_flair_text": "Bandcamp &amp;amp; Friday",
+        "url": "https://e.org/a?x=1&amp;section=news&amp;copy2026=1",
+    }, {
+        "id": "f2", "title": "Tickets 20&amp;#8364; at the door", "subreddit": "reggae", "created_utc": BEFORE - 200,
+        "is_self": True, "score": 40, "selftext": "Write &amp;amp;#64;someone &amp;regex; &amp;sect;ion &amp;amp;#x200B;",
+    }]}).encode()
+    pasted, tickets = arctic.parse_posts(body, "reggae").items
+    assert pasted.title == "It's Bandcamp Friday & more, raw &region=eu"
+    assert pasted.meta["flair"] == "Bandcamp & Friday"
+    assert pasted.meta["link"] == "https://e.org/a?x=1&section=news&copy2026=1"  # a link keeps the API's one level
+    assert tickets.title == "Tickets 20€ at the door"
+    assert tickets.summary == "Write @someone &regex; §ion"   # exact names only; the zero-width space is gone
+    assert drop_reason(tickets, SRC["reddit_reggae"]) == "trade"
 
 
 def _self_post(post_id: str, selftext: str, **kw) -> dict:
@@ -494,6 +557,23 @@ def test_tme_entities_in_links_and_text():
                                   "https://example.org/?a=1&section=news"]
 
 
+def test_tme_text_and_forward_label_are_decoded_to_the_end():
+    # A third level of escaping in the text, and in the label of a forward without a link: "€" and "@"
+    # must reach the trade and blocklist patterns as themselves. Unknown names stay as written.
+    body = _tme_page(_tme_post(420, (
+        '<div class="tgme_widget_message_forwarded_from">Forwarded from <span class="tgme_widget_message_'
+        'forwarded_from_name">Grow &amp;amp;amp; Co &amp;amp;#64;growbud</span></div>'
+        '<div class="tgme_widget_message_text">Eintritt &amp;amp;amp;#8364;20 &amp;amp;regex; '
+        '&amp;amp;copy2026</div>')))
+    item, = tme.parse_page(body, PSV).items
+    assert item.title == "Eintritt €20 &regex; &copy2026"
+    assert item.meta["forwarded_from"] == "Grow & Co @growbud"
+    source = telegram_source(PSV)
+    assert drop_reason(item, source) == "blocklist"
+    clean = dataclasses.replace(item, meta={"channel": PSV, "forwarded": False})
+    assert drop_reason(clean, source) == "trade"
+
+
 def test_tme_filters_read_the_whole_post():
     body = _tme_page(_tme_post(410, f'<div class="tgme_widget_message_text">{LONG_POST.replace(". ", ".<br>", 5)}</div>'))
     item, = tme.parse_page(body, PSV).items
@@ -575,9 +655,10 @@ async def test_reggaeville_news():
 
 def test_reggaeville_duplicate_hrefs_and_titles():
     items = _rv(reggaeville.parse_page(fixture("reggaeville_news.html"), "news", "https://www.reggaeville.com/news/"))
-    # image link (alt "Lake Anthony"), featured image link and title link: the title link's text wins
+    # image link (alt "Lake Anthony"), featured image link and title link: the title link's text wins;
+    # TYPO3 escaped this title twice over ("&amp;amp;#39;", seen live), every level is decoded
     lake = items["lake-anthony/news/view/lake-anthony-unites-global-reggae-artists-for-world-needs-love/"]
-    assert lake.title == "Lake Anthony Unites Global Reggae Artists For World Needs Love"
+    assert lake.title == "Lake Anthony Unites Global Reggae Artists For 'World Needs Love'"
     # absolute with ?utm_*#comments and relative to <base href> without the trailing slash: one item
     protoje = items["protoje/news/view/protoje-drops-new-single-in-search-of-lost-time/"]
     assert protoje.title == 'Protoje Drops New Single "In Search Of Lost Time"'
@@ -683,6 +764,15 @@ def test_reggaeville_dates_inside_cards_and_unclosed_links():
     got = [(i.title, i.published_at.date().isoformat()) for i in reggaeville.parse_page(cards, "news")]
     assert got == [("Story A", "2026-10-03"), ("Story B", "2026-10-01"), ("Story C & Co", "2026-09-30"),
                    ("Story D &copy2026", "2026-09-30")]
+
+    # Every level the parser left is decoded, from the anchor and from an img alt alike; only exact names
+    # count ("&regex;" is not "&reg;" + "ex;").
+    triple = """<div>10/04/2026</div>
+      <h3><a href="/artist-details/x/news/view/x/">For &amp;amp;#39;World Needs Love&amp;amp;#39;</a></h3>
+      <a href="/artist-details/y/news/view/y/"><img alt="For &amp;amp;#39;Alt Text&amp;amp;#39;"></a>
+      <a href="/artist-details/z/news/view/z/">Raw &amp;amp;regex; &amp;amp;sect;ion</a>"""
+    assert [i.title for i in reggaeville.parse_page(triple, "news")] == [
+        "For 'World Needs Love'", "For 'Alt Text'", "Raw &regex; §ion"]
 
     # A template without </a>: html.parser nests every later link (and the next header) in the first one,
     # where a browser closes it. Each entry keeps its own text and the header before it.

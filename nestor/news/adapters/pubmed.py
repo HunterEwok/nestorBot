@@ -31,6 +31,7 @@ from typing import Any
 
 from ..http import Http
 from ..model import FetchResult, Item, Source
+from ..text import squash
 
 EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
 TOOL = "nestorbot"
@@ -112,7 +113,7 @@ def parse_efetch(body: bytes) -> list[Item]:
 
 
 def _text(el: ET.Element | None) -> str:
-    return "" if el is None else _WS.sub(" ", "".join(el.itertext())).strip()
+    return "" if el is None else squash("".join(el.itertext()))
 
 
 def _clip(text: str, limit: int) -> str:

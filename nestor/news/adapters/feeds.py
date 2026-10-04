@@ -39,6 +39,7 @@ from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
 
 from ..http import Http
 from ..model import FetchResult, Item, Source
+from ..text import INVISIBLE, squash
 
 log = logging.getLogger("nestor.news")
 # Short titles such as "https://..." or "file.mp3" make bs4 warn that it got a URL, not markup.
@@ -66,8 +67,6 @@ _DROP_TAGS = ("script", "style", "noscript", "template", "iframe", "figcaption")
 _BLOCK_TAGS = ("address", "article", "aside", "blockquote", "br", "dd", "div", "dl", "dt", "figure", "footer",
                "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "li", "ol", "p", "pre", "section", "table",
                "td", "th", "tr", "ul")
-# NUL breaks Postgres TEXT; soft hyphens and zero-width spaces break the keyword filters.
-_INVISIBLE = dict.fromkeys([*range(0x00, 0x09), 0x0B, 0x0C, *range(0x0E, 0x20), 0x7F, 0xAD, 0x200B, 0x2060, 0xFEFF])
 _APPEARED = re.compile(r"The post .{1,400} appeared first on .{1,200}")   # WordPress/Yoast footer
 # doi.org links, publisher links like /doi/full/10.1177/..., and "doi: 10.1038/..." in the text.
 # The suffix is printable ASCII except "#&'<>?, so closing quotes like ” and » are not taken in.
@@ -143,20 +142,22 @@ def normalize_link(value: Any) -> str | None:
 
 def plain_text(value: Any, markup: bool = True) -> str:
     """Tags stripped, entities decoded, whitespace collapsed. A second pass only runs on entities
-    or common tags left by double escaping, so an escaped "<" in the text survives the first one.
+    or common tags left by double escaping, so an escaped "<" in the text survives the first one;
+    entities of deeper levels (a CDATA title "It&amp;amp;#39;s") are decoded at the end.
     markup=False (feedparser's text/plain): "<" is text unless such markup is in the value."""
     text = value if isinstance(value, str) else ""
     for pattern in (_MARKUP if markup else _ESCAPED, _ESCAPED):
         if not pattern.search(text):
             break
-        soup = BeautifulSoup(text, "html.parser")
+        # the space: html.parser holds back an "&..." at the very end of its input and drops it ("R&D" -> "RD")
+        soup = BeautifulSoup(text + " ", "html.parser")
         for tag in soup.find_all(_DROP_TAGS):
             tag.decompose()
         for tag in soup.find_all(_BLOCK_TAGS):
             tag.insert_before(" ")
             tag.insert_after(" ")
         text = soup.get_text()
-    return " ".join(text.translate(_INVISIBLE).split())
+    return squash(text)
 
 
 def _item(entry: Any, source: Source) -> Item | None:
@@ -166,7 +167,7 @@ def _item(entry: Any, source: Source) -> Item | None:
     if not url or not title:
         return None
     guid = entry.get("id")
-    guid = guid.strip().translate(_INVISIBLE) if isinstance(guid, str) else ""
+    guid = guid.strip().translate(INVISIBLE) if isinstance(guid, str) else ""
     ext_id = url if source.params.get("id_from_link") or not guid or len(guid) > URL_MAX else guid
 
     contents = [c for c in entry.get("content") or () if hasattr(c, "get") and isinstance(c.get("value"), str)]

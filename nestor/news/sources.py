@@ -31,6 +31,8 @@ TRIAL_INTERVENTIONS = (
     "5-MeO-DMT", "mebufotenin", "lysergide", "ayahuasca", "ibogaine",
     "mescaline", "cannabidiol", "CBD", "cannabis", "tetrahydrocannabinol", "THC", "dronabinol", "nabilone",
     "nabiximols",
+    # names "cannabis" is no part of: "Smoked marijuana", "Synthetic cannabinoid", "Cannabigerol", "Psilocin"
+    "marijuana", "marihuana", "cannabinoid", "cannabigerol", "psilocin",
 )
 ARCTIC_SHIFT = "https://arctic-shift.photon-reddit.com/api/posts/search"
 
@@ -53,9 +55,10 @@ SOURCES: tuple[Source, ...] = (
     Source("sciencedaily_marijuana", "ScienceDaily", "rss",
            "https://www.sciencedaily.com/rss/mind_brain/marijuana.xml", "research", every_h=6, max_age_days=60,
            params={"cache_buster": True, "keep_text": False}),
+    # One or two stories a month, gaps of 60+ days are normal: stale only after four months.
     Source("sciencedaily_psychedelics", "ScienceDaily", "rss",
            "https://www.sciencedaily.com/rss/mind_brain/psychedelic_drugs.xml", "research", every_h=6,
-           max_age_days=60, params={"cache_buster": True, "keep_text": False}),
+           max_age_days=120, params={"cache_buster": True, "keep_text": False}),
     # ---- policy and industry ----
     Source("marijuanamoment", "Marijuana Moment", "rss", "https://www.marijuanamoment.net/feed/", "policy",
            every_h=1, max_age_days=3),

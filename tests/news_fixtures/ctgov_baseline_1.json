@@ -1,0 +1,127 @@
+{
+ "studies": [
+  {
+   "protocolSection": {
+    "identificationModule": {
+     "nctId": "NCT05222222",
+     "briefTitle": "MDMA-Assisted Therapy for PTSD in First Responders"
+    },
+    "statusModule": {
+     "overallStatus": "ACTIVE_NOT_RECRUITING",
+     "lastUpdatePostDateStruct": {
+      "date": "2026-10-02",
+      "type": "ACTUAL"
+     }
+    },
+    "armsInterventionsModule": {
+     "interventions": [
+      {
+       "name": "MDMA"
+      },
+      {
+       "name": "Therapy"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "protocolSection": {
+    "identificationModule": {
+     "nctId": "NCT04111111",
+     "briefTitle": "Smoked Marijuana and Driving Performance"
+    },
+    "statusModule": {
+     "overallStatus": "RECRUITING",
+     "lastUpdatePostDateStruct": {
+      "date": "2026-03-11",
+      "type": "ACTUAL"
+     }
+    },
+    "armsInterventionsModule": {
+     "interventions": [
+      {
+       "name": "Smoked marijuana"
+      },
+      {
+       "name": "Placebo cigarette"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "protocolSection": {
+    "identificationModule": {
+     "nctId": "NCT03222333",
+     "briefTitle": "Psilocybin for Anorexia Nervosa"
+    },
+    "statusModule": {
+     "overallStatus": "ENROLLING_BY_INVITATION",
+     "lastUpdatePostDateStruct": {
+      "date": "2025-11-20",
+      "type": "ACTUAL"
+     }
+    },
+    "armsInterventionsModule": {
+     "interventions": [
+      {
+       "name": "COMP360",
+       "otherNames": [
+        "Psilocybin"
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "protocolSection": {
+    "identificationModule": {
+     "nctId": "NCT04999999",
+     "briefTitle": "Sertraline in Adolescents Who Use Cannabis"
+    },
+    "statusModule": {
+     "overallStatus": "COMPLETED",
+     "lastUpdatePostDateStruct": {
+      "date": "2025-06-01",
+      "type": "ACTUAL"
+     }
+    },
+    "armsInterventionsModule": {
+     "interventions": [
+      {
+       "name": "Sertraline"
+      },
+      {
+       "name": "Placebo"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "protocolSection": {
+    "identificationModule": {
+     "nctId": "NCT02555555",
+     "briefTitle": "Iadademstat in Acute Myeloid Leukemia"
+    },
+    "statusModule": {
+     "overallStatus": "RECRUITING",
+     "lastUpdatePostDateStruct": {
+      "date": "2026-01-05",
+      "type": "ACTUAL"
+     }
+    },
+    "armsInterventionsModule": {
+     "interventions": [
+      {
+       "name": "Iadademstat (LSD1 inhibitor)"
+      }
+     ]
+    }
+   }
+  }
+ ],
+ "nextPageToken": "QmFzZWxpbmUy"
+}

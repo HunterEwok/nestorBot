@@ -8,18 +8,26 @@ Quirks:
   {"data": null, "error": "..."}. A fields= list with permalink or removed_by_category is
   HTTP 400: fields= is never sent, the full objects come back.
 - Score and num_comments stay 0-1 for about 36 h, so the run asks once a day for the posts
-  36-60 h old, already scored; ranking is client side (the API cannot sort by score).
+  36-60 h old, already scored; ranking is client side (the API cannot sort by score). The
+  cursor keeps where the last window ended: a late run, or one after an outage, starts there,
+  so no slice of posts falls between two windows. Up to CATCH_UP_H earlier than usual: the
+  posts are then 96 h old, as far as service.MAX_AGE keeps anything new, and a host refusing
+  for a day (15 + 30 min of retries, then REFUSED_BACKOFF) is caught up whole. A longer
+  outage starts CATCH_UP_H early and loses only what lies before that.
 - At most 100 posts per page: a full page is followed by another with before=<oldest
   created_utc>, up to MAX_PAGES. Pages may overlap, posts are deduped by id.
 - removed_by_category is ABSENT on live posts and "reddit", "moderator", "deleted"... on
-  removed ones; spam-filtered posts also carry selftext "[removed]".
-- Titles, selftext and url are HTML-escaped (&amp; &lt; &gt;); selftext is Markdown.
+  removed ones; spam-filtered posts also carry selftext "[removed]", deleted ones "[deleted]".
+  The archive's snapshot is taken seconds after posting: meta removed_by keeps the raw category,
+  so `python -m nestor.news --check -v` shows what the archive said.
+- Titles, selftext and url are HTML-escaped (&amp; &lt; &gt;); selftext is Markdown. Titles
+  pasted from elsewhere carry entities of their own ("It&amp;#39;s"): text is decoded to the end,
+  links only the API's one level.
 - Personal posts in r/Psychonaut and r/microdosing are dosing reports by nature:
   meta is_self and link let filters.py keep link posts only (params links_only).
 """
 from __future__ import annotations
 
-import html
 import json
 import re
 from datetime import datetime, timedelta, timezone
@@ -28,11 +36,13 @@ from urllib.parse import urlsplit
 
 from ..http import Http
 from ..model import FetchResult, Item, Source
+from ..text import squash, unescape
 
 PAGE_SIZE = 100
 MAX_PAGES = 5
 WINDOW_START_H = 60     # after=now-60h
 WINDOW_END_H = 36       # before=now-36h: scores are settled by then
+CATCH_UP_H = 36         # a late run or an outage: start where the last window ended, at most this much earlier
 TITLE_MAX = 300
 SUMMARY_MAX = 1500
 SELFTEXT_MAX = 10_000       # of the up to 40 000 chars of Markdown, enough for a 1500-char summary
@@ -57,11 +67,7 @@ _MD_SPOILER = re.compile(r">!([^\n]{1,500}?)!<")
 _MD_EMPHASIS = re.compile(r"(\*\*|__|~~|>!|!<)")
 _MD_ITALIC = re.compile(r"(?<![\w*\\])([*_])(?=\S)([^\n]{1,300}?)(?<=\S)\1(?![\w*])")
 _MD_LINE = re.compile(r"(?m)^[ \t]*(?:#{1,6}[ \t]+|(?:>[ \t]?)+|[*+-][ \t]+)")
-# Only complete entities: html.unescape alone also decodes "&sect" in a URL's "&section=" to "§".
-_ENTITY = re.compile(r"&(?:[A-Za-z][A-Za-z0-9]{1,31}|#\d{1,7}|#[xX][0-9A-Fa-f]{1,6});")
 _MD_ESCAPE = re.compile(r"\\([\\`*_{}\[\]()#+\-.!>~|^])")
-# NUL breaks Postgres TEXT; zero-width spaces (Reddit's "&#x200B;" paragraphs) break the keyword filters.
-_INVISIBLE = dict.fromkeys([*range(0x00, 0x09), 0x0B, 0x0C, *range(0x0E, 0x20), 0x7F, 0xAD, 0x200B, 0x2060, 0xFEFF])
 _GONE = ("[removed]", "[deleted]")
 
 
@@ -72,13 +78,20 @@ class Page(NamedTuple):
 
 
 async def fetch(http: Http, source: Source, cursor: dict, now: datetime) -> FetchResult:
-    """The posts created 36-60 h ago, newest first; no cursor, the store dedupes by post id."""
+    """The posts created 36-60 h ago, newest first. A late run starts where the last window ended
+    instead, up to CATCH_UP_H earlier; an early one keeps the usual start and the store dedupes
+    the overlap by post id. The cursor keeps the window's end, or its start when MAX_PAGES did
+    not reach the oldest posts."""
     sub = source.params.get("subreddit")
     if not isinstance(sub, str) or not _SUB.fullmatch(sub):
         raise ValueError(f"arctic: bad subreddit {str(sub)[:30]!r}")
     now = now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
     after = int((now - timedelta(hours=WINDOW_START_H)).timestamp())
     before = int((now - timedelta(hours=WINDOW_END_H)).timestamp())
+    end = before
+    until = cursor.get("until") if isinstance(cursor, dict) else None
+    if isinstance(until, int) and not isinstance(until, bool) and until < after:
+        after = max(until, after - CATCH_UP_H * 3600) - 1   # the bounds may be exclusive; the overlap is deduped
     items: list[Item] = []
     seen: set[str] = set()
     for _ in range(MAX_PAGES):
@@ -92,7 +105,9 @@ async def fetch(http: Http, source: Source, cursor: dict, now: datetime) -> Fetc
         if page.posts < PAGE_SIZE or page.oldest is None or not after < page.oldest < before:
             break
         before = page.oldest
-    return FetchResult(items)
+    else:
+        end = after   # the page cap cut the window short: its oldest part is unread, the next run starts there
+    return FetchResult(items, cursor={"until": end})
 
 
 def parse_posts(body: bytes, subreddit: str, lang: str = "en") -> Page:
@@ -154,9 +169,12 @@ def _post(p: Any, subreddit: str, lang: str) -> Item | None:
         "domain": domain.strip(),
         "over_18": p.get("over_18") is True,
         "stickied": p.get("stickied") is True,
-        "removed": rbc not in (None, "") or selftext.strip() == "[removed]",
+        # a body the bot never saw cannot be checked for trade or doses
+        "removed": rbc not in (None, "") or gone,
         "flair": _plain(p.get("link_flair_text")) or None,
     }
+    if isinstance(rbc, str) and rbc.strip():
+        meta["removed_by"] = rbc.strip()[:40]
     links = [] if gone else _links(selftext)
     if links:
         meta["links"] = links
@@ -170,7 +188,7 @@ def _link(value: Any) -> str | None:
     """The external URL of a link post (unescaped), http(s) only."""
     if not isinstance(value, str):
         return None
-    value = _unescape(value).strip()
+    value = unescape(value, rounds=1).strip()
     if not value or len(value) > URL_MAX or any(c.isspace() or ord(c) < 0x20 for c in value):
         return None
     try:
@@ -183,7 +201,7 @@ def _link(value: Any) -> str | None:
 def _links(selftext: str) -> list[str]:
     """Where the post links to, for filters.py (the summary keeps only link texts): Markdown
     link targets up to LINKS_MAX, Telegram links all of them. Never fetched."""
-    text = _unescape(selftext[:SELFTEXT_MAX])
+    text = unescape(selftext[:SELFTEXT_MAX], rounds=1)
     found = [_MD_ESCAPE.sub(r"\1", m.group(2)) for m in _MD_LINK.finditer(text)]
     found += ("https://" + m.group(1) for m in _TG_LINK.finditer(_MD_ESCAPE.sub(r"\1", text)))
     links: list[str] = []
@@ -215,24 +233,21 @@ def _plain(value: Any) -> str:
     """Entities unescaped, tags stripped, whitespace collapsed."""
     if not isinstance(value, str):
         return ""
-    return " ".join(_TAG.sub(" ", _unescape(value)).translate(_INVISIBLE).split())
+    return squash(_TAG.sub(" ", unescape(value)))
 
 
 def _markdown(value: str) -> str:
     """Reddit Markdown as plain text: link texts kept, emphasis, headers, quotes and escapes dropped.
-    The API escapes &, < and >; the Markdown source has entities of its own ("&#x200B;" lines)."""
-    text = _unescape(value[:SELFTEXT_MAX])
+    The API escapes &, < and >; the Markdown source has entities of its own ("&#x200B;" lines):
+    the Markdown is read after the API's level, the text decoded to the end."""
+    text = unescape(value[:SELFTEXT_MAX], rounds=1)
     text = _MD_SPOILER.sub(r"\1", text)
     text = _MD_LINK.sub(r"\1", text)
     text = _MD_LINE.sub("", text)
     text = _MD_EMPHASIS.sub("", text)
     text = _MD_ITALIC.sub(r"\2", text)
-    text = _unescape(_MD_ESCAPE.sub(r"\1", text))
-    return " ".join(_TAG.sub(" ", text).translate(_INVISIBLE).split())
-
-
-def _unescape(text: str) -> str:
-    return _ENTITY.sub(lambda m: html.unescape(m.group()), text)
+    text = unescape(_MD_ESCAPE.sub(r"\1", text))
+    return squash(_TAG.sub(" ", text))
 
 
 def _clip(text: str, limit: int) -> str:

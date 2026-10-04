@@ -156,12 +156,63 @@ async def test_errors_back_off_and_respect_retry_after(pool, conn):
     assert st["mm"]["failures"] == 0 and st["mm"]["next_run_at"] is None and st["mm"]["seeded"]
 
 
+async def test_a_refusing_host_is_asked_once_a_day(pool, conn):
+    adapter = FakeAdapter()
+    service = make_service(pool, adapter)
+    adapter.results = {"mm": HttpError(403, "https://mm.example/feed/"), "norml": HttpError(503, "https://norml.example/")}
+    t = NOW
+    # 15 and 30 minutes as for any error; after the third refusal a day, while an overload keeps every_h (1 h)
+    for n, (mm_wait, norml_wait) in enumerate(((15, 15), (30, 30), (24 * 60, 60)), start=1):
+        assert await service.collect(t, only=("mm", "norml")) == {"mm": "http_403", "norml": "http_503"}
+        st = await store.states(conn)
+        assert st["mm"]["failures"] == st["norml"]["failures"] == n
+        assert st["mm"]["next_run_at"] == t + timedelta(minutes=mm_wait)
+        assert st["norml"]["next_run_at"] == t + timedelta(minutes=norml_wait)
+        t += timedelta(minutes=mm_wait)
+    assert {"mm", "norml"} <= set(await service.stale(conn, t))
+    adapter.results["mm"] = FetchResult([item("a", "Cannabis bill passes the House", 1)])
+    assert (await service.collect(t, only=("mm",)))["mm"] == "ok"
+    assert (await store.states(conn))["mm"]["failures"] == 0
+
+
+async def test_one_refusal_among_other_errors_keeps_the_usual_retries(pool, conn):
+    # A WAF that answers timeouts and 503s, then one 403: an hour as for any error; only a second 403 in a row waits a day
+    adapter = FakeAdapter()
+    service = make_service(pool, adapter)
+    url = "https://mm.example/feed/"
+    t = NOW
+    for n, (error, wait) in enumerate(((TimeoutError(), 15), (HttpError(503, url), 30), (HttpError(403, url), 60),
+                                       (HttpError(403, url), 24 * 60)), start=1):
+        adapter.results = {"mm": error}
+        await service.collect(t, only=("mm",))
+        st = (await store.states(conn))["mm"]
+        assert st["failures"] == n and st["next_run_at"] == t + timedelta(minutes=wait)
+        t += timedelta(minutes=wait)
+
+
 async def test_stale_sources_are_reported(pool, conn):
     adapter = FakeAdapter()
     service = make_service(pool, adapter)
     adapter.results = {"mm": FetchResult([item("a", "Cannabis bill passes the House", 24 * 20)])}
     await service.collect(NOW)
     assert await service.stale(conn, NOW) == ["mm"]   # max_age_days 14 by default
+
+
+
+async def test_a_sparse_feed_is_not_stale_after_two_quiet_months(pool, conn):
+    # ScienceDaily's psychedelics topic gets one or two stories a month; 56 days without one was seen live.
+    from nestor.news.sources import SOURCES as REGISTRY
+    sparse = next(s for s in REGISTRY if s.key == "sciencedaily_psychedelics")
+    adapter = FakeAdapter()
+
+    async def wanted():
+        return True
+    service = NewsService(pool, (sparse,), triage_llm=None, is_wanted=wanted, tz=TZ, daily_token_limit=10**6,
+                          http_factory=lambda contact: FakeHttp(contact=contact), adapters={"rss": adapter})
+    adapter.results = {sparse.key: FetchResult([item("m", "Magic mushrooms may reshape the brain", 24 * 70)])}
+    await service.collect(NOW)
+    assert await service.stale(conn, NOW) == []
+    assert await service.stale(conn, NOW + timedelta(days=55)) == [sparse.key]
 
 
 # ---- triage ----

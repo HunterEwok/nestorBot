@@ -30,6 +30,11 @@ FIRST_RUN_WINDOW = timedelta(hours=24)  # the first fetch keeps only the last da
 TRIAGE_WAIT = timedelta(hours=3)      # a small backlog waits this long for company
 CANDIDATE_WINDOW = timedelta(hours=36)
 MIN_CANDIDATES = 3
+# The host refuses us (bot protection, a block): not an overload that passes. A refusal right after a
+# refusal, on the third failure in a row or later, and it is asked once a day, not every few hours; stale()
+# reports it from then on. One refusal among timeouts or 503s keeps the usual retries.
+REFUSED = frozenset({"http_401", "http_403", "http_451"})
+REFUSED_BACKOFF = timedelta(hours=24)
 
 
 class NotEnoughNews(Exception):
@@ -105,10 +110,11 @@ class NewsService:
         cursor = dict(state["cursor"] or {}) if state is not None else {}
         seeded = bool(state["seeded"]) if state is not None else False
         failures = state["failures"] if state is not None else 0
+        last = state["status"] if state is not None else None
         try:
             result = await asyncio.wait_for(self.adapters[source.kind](http, source, cursor, now), SOURCE_TIMEOUT_S)
         except HttpError as e:
-            return await self._failed(source, now, f"http_{e.status}", failures, e.retry_after)
+            return await self._failed(source, now, f"http_{e.status}", failures, e.retry_after, last=last)
         except asyncio.TimeoutError:
             return await self._failed(source, now, "timeout", failures)
         except ValueError as e:
@@ -150,8 +156,10 @@ class NewsService:
         return "new", None
 
     async def _failed(self, source: Source, now: datetime, status: str, failures: int,
-                      retry_after: float | None = None) -> str:
+                      retry_after: float | None = None, last: str | None = None) -> str:
         backoff = min(timedelta(minutes=15 * 2 ** min(failures, 5)), timedelta(hours=max(source.every_h, 1)))
+        if status in REFUSED and last in REFUSED and failures >= 2:
+            backoff = max(backoff, REFUSED_BACKOFF)
         if retry_after:
             backoff = min(max(backoff, timedelta(seconds=retry_after)), timedelta(hours=24))
         async with self.pool.acquire() as conn:

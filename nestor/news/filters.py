@@ -20,7 +20,7 @@ drug-crime reports; legalization and other policy news stays.
 
 Sources are in English, Russian and German. Patterns use stems and word boundaries
 tuned against common false hits: "Dubai", "Alaska", «скачать», «дабл», "cardiac
-arrest", "G2/M arrest", "receptor trafficking", «осуждать», «задержка», "best-selling",
+arrest", "G2/M arrest", "receptor trafficking", «осуждать», «задержка», «дабы», "best-selling",
 "8 pm for", «в 2025 г.», "daily dose of dub", "how to make dub delays".
 """
 from __future__ import annotations
@@ -93,7 +93,8 @@ _TOPIC = _rx(
     r"\b(?:dronabinol|nabilone|nabiximols|sativex|epidiolex)\b", r"\bhanf(?!ord)", r"\bkiff(?:en|er)\b",
     # psychedelics
     r"psychedeli", r"psilocyb", r"psilocin", r"\bmagic\s+mushrooms?\b", r"\bshrooms\b", r"\bzauberpilz",
-    r"\blsd\b", r"lysergi", r"\bmdma\b", r"\b(?:5-meo-)?dmt\b", r"dimethyltryptamin", r"ayahuasca", r"\biboga",
+    r"\blsd\b", r"lysergi", r"\bmdma\b", r"\b(?:5-meo-)?dmt\b", r"dimethyltryptamin", r"ayahuasca",
+    r"iboga",                            # ibogaine, noribogaine, Tabernanthe iboga
     r"\bme(?:sc|sk)alin", r"\bpeyote\b", r"\bhall?u[cz]inogen", r"\bentheogen",
     r"\b(?:es|ar)ketamin", r"\bspravato\b",
     # ketamine counts in therapy only: rodent anaesthesia in preprints is not the topic
@@ -107,11 +108,14 @@ _TOPIC = _rx(
     r"\bdub(?:wise|plates?)?\b(?!\s+(?:it|them|him|her|this|that|these|those|the|a|an)\b)",
     r"(?-i:\b[Ss]ka\b)",                 # not "SKA" (Square Kilometre Array) or «СКА»
     # Russian
-    r"каннаби", r"марихуан", r"конопл", r"\bгашиш", r"\b(?:тгк|кбд)\b(?!-?\d)",   # not «ТГК-1», a power company
-    r"психодел", r"псилоци", r"\bлсд\b", r"\bмдма\b", r"\bдмт\b", r"галлюциноген", r"энтеоген", r"аяуаск",
-    r"ибогаин", r"мескалин", r"кетамин",
-    r"\bхиппи\b", r"\bр[еэ]гг(?:и|ей)\b", r"\bдаб\b", r"растаман", r"растафар", r"д[эа]нсхол",
-    r"\bбоб\w{0,2}\s+марли\b", r"(?-i:\b[Сс]ка\b)",
+    r"кан+аби", r"марихуан", r"конопл", r"\bгашиш", r"\b(?:тгк|кбд)\b(?!-?\d)",   # not «ТГК-1», a power company
+    r"психодел", r"псилоци", r"\bлсд\b", r"лизерги", r"\bмдма\b", r"\bдмт\b", r"диметилтриптамин", r"галлюциноген",
+    r"энтеоген", r"а[йи]?я(?:у|ху|в)аск",           # аяуаска, айяуаска, аяваска, аяхуаска
+    r"\bибог[аиеуо]", r"мескалин", r"\bпейот", r"\b(?:волшебн|магическ)\w*\s+гриб", r"кетамин",
+    r"\bхиппи\b", r"\bр[еэ]гг(?:и|ей)\b", r"\bраста\b", r"растаман", r"растафар", r"д[эае]нсхол",
+    # «даб», «даба», «дабом», «дабовый»; not «дабы» (in order to) or «дабл»
+    r"\bдаб(?:а|е|у|ом|ов(?:ый|ая|ое|ые|ого|ой|ом|ых|ую|ым|ыми))?\b", r"\bкинг\w*\s+табби",
+    r"\b(?:боб|зигги|д[эе]миан|стив[еи]н|джулиан|рит)\w{0,2}\s+марли\b", r"(?-i:\b[Сс]ка\b)",
 )
 # Microdosing alone counts, unless it is the GLP-1 fad or a phase 0 drug trial.
 _MICRODOSE = _rx(r"\bmi[ck]ro-?dos", r"микродоз")
