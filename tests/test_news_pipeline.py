@@ -11,7 +11,7 @@ from nestor.bot.llm import Completion
 from nestor.news import digest, rank, store, triage
 from nestor.news.http import HttpError
 from nestor.news.model import FetchResult, Item, Source
-from nestor.news.service import NewsService
+from nestor.news.service import NewsService, NotEnoughNews
 
 from .news_helpers import FakeHttp
 
@@ -355,10 +355,11 @@ async def test_digest_is_written_once_a_day(digest_ready, conn):
     logged = [tuple(r) for r in await conn.fetch("SELECT chat_id, scenario, profile FROM bot_requests ORDER BY id")]
     assert logged == [(None, "news_triage", "news"), (None, "news", "smart")]
     # The next day nothing from these stories comes back.
-    assert await service.digest(date(2026, 10, 5), smart, max_topics=10, timeout_s=5) is None
+    with pytest.raises(NotEnoughNews):
+        await service.digest(date(2026, 10, 5), smart, max_topics=10, timeout_s=5)
 
 
-async def test_digest_bad_answer_is_an_error_and_too_little_news_is_a_skip(digest_ready, conn):
+async def test_digest_bad_answer_is_an_error_and_too_little_news_waits(digest_ready, conn):
     service = digest_ready
     from nestor.bot.llm import LLMError
 
@@ -367,7 +368,8 @@ async def test_digest_bad_answer_is_an_error_and_too_little_news_is_a_skip(diges
     assert await conn.fetchval("SELECT count(*) FROM news_digests") == 0
     assert await conn.fetchval("SELECT count(*) FROM news_items WHERE status = 'used'") == 0
     await conn.execute("UPDATE news_items SET status = 'rejected' WHERE ext_id <> 'a'")
-    assert await service.digest(date(2026, 10, 4), ScriptedLLM("{}"), max_topics=10, timeout_s=5) is None
+    with pytest.raises(NotEnoughNews):
+        await service.digest(date(2026, 10, 4), ScriptedLLM("{}"), max_topics=10, timeout_s=5)
 
 
 async def test_cleanup_keeps_only_identifiers(pool, conn):

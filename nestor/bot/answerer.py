@@ -490,7 +490,8 @@ class Answerer:
             return await self._music(job, parent)
         if scenario == "factcheck":
             return await self._factcheck(job)
-        if self.router.llm("web") is not None and (scenario == "web" or followed in ("web", "factcheck")):
+        web_task = "think_web" if job.think else "web"
+        if self.router.llm(web_task) is not None and (scenario == "web" or followed in ("web", "factcheck")):
             # Plain web question or a follow-up to a web answer: the archive model is not needed.
             return _out(await self._answer_from_web(job, None))
         if scenario == "catchup":
@@ -905,7 +906,14 @@ class Answerer:
         llm = self.router.llm("news")
         if self.news is None or llm is None or not await self._bot_is_member(chat_id):
             return "skipped", {}
-        text = await self.news.digest(day, llm, max_topics=self.cfg.news_max_topics, timeout_s=self._timeout("news"))
+        from ..news.service import NotEnoughNews
+
+        try:
+            text = await self.news.digest(day, llm, max_topics=self.cfg.news_max_topics,
+                                          timeout_s=self._timeout("news"))
+        except NotEnoughNews:
+            # Sources not read yet (first start, or /news on after NEWS_TIME): a later tick tries again.
+            return "waiting", {}
         if text is None:
             return "skipped", {}
         sent = await self._send(chat_id, text, html=True)

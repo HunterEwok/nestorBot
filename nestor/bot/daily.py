@@ -138,14 +138,18 @@ def day_name(day: date) -> str:
 
 async def claim(conn: asyncpg.Connection, chat_id: int, kind: str, day: date) -> int | None:
     """Row id if this call may make the post now: first time today, or a retry of a failed
-    attempt (after 10 minutes, at most 3 attempts) or of one that died mid-way (after 30)."""
+    attempt (after 10 minutes, at most 3 attempts) or of one that died mid-way (after 30).
+    A post still waiting for material (the news before the sources are read) is tried again
+    every 10 minutes, at most 6 attempts."""
     return await conn.fetchval(
         """INSERT INTO daily_posts (chat_id, kind, day, status) VALUES ($1, $2, $3, 'running')
            ON CONFLICT (chat_id, kind, day) DO UPDATE
              SET status = 'running', attempts = daily_posts.attempts + 1, updated_at = now()
-             WHERE daily_posts.attempts < 3
-               AND ((daily_posts.status = 'failed' AND daily_posts.updated_at < now() - interval '10 minutes')
-                 OR (daily_posts.status = 'running' AND daily_posts.updated_at < now() - interval '30 minutes'))
+             WHERE (daily_posts.attempts < 3
+                    AND ((daily_posts.status = 'failed' AND daily_posts.updated_at < now() - interval '10 minutes')
+                      OR (daily_posts.status = 'running' AND daily_posts.updated_at < now() - interval '30 minutes')))
+                OR (daily_posts.attempts < 6 AND daily_posts.status = 'waiting'
+                    AND daily_posts.updated_at < now() - interval '10 minutes')
            RETURNING id""", chat_id, kind, day)
 
 

@@ -38,6 +38,12 @@ async def with_news(make_env, pool, *, smart, **cfg):
     service = make_service(pool, adapter, ScriptedLLM(keep_all))
     service.is_wanted = feed.answerer.news_wanted
     feed.answerer.news = service
+    await read_sources(service, adapter)
+    return bot, llm, feed
+
+
+async def read_sources(service, adapter):
+    """What the news loop does on its own: the first run seeds, the next one brings three stories."""
     now = datetime.now(timezone.utc)
     await service.collect(now - timedelta(hours=7))     # first run: seeds
     adapter.results = {"mm": FetchResult([item("a", "Senate approves cannabis rescheduling", 1),
@@ -46,7 +52,6 @@ async def with_news(make_env, pool, *, smart, **cfg):
     for i in adapter.results["mm"].items + adapter.results["pubmed"].items:
         i.published_at = now - timedelta(hours=1)
     await service.collect(now)
-    return bot, llm, feed
 
 
 async def test_news_digest_is_posted_once_to_groups_that_have_it(make_env, pool, conn):
@@ -72,6 +77,47 @@ async def test_news_digest_is_posted_once_to_groups_that_have_it(make_env, pool,
     await answerer.drain()
     assert bot.sent[-1] is post and len(smart.calls) == 1
     assert llm.calls == []          # the archive model is never involved
+
+
+async def test_news_waits_for_the_sources_when_due_before_they_are_read(make_env, pool, conn):
+    # The first start after NEWS_TIME, or «/news on» in the evening: the post is due before the news loop has run.
+    smart = ScriptedLLM(plan_all, profile="smart")
+    bot, llm, feed = make_env(smart=smart, news_chat_ids=frozenset({CHAT_ID}), news_time=dtime(20, 0))
+    await feed(update("message", message(1, "привет", date=ago(minutes=5))))
+    adapter = FakeAdapter()
+    service = make_service(pool, adapter, ScriptedLLM(keep_all))
+    answerer = feed.answerer
+    answerer.news = service
+    await answerer.run_daily_posts(local(20, 1))
+    await answerer.drain()
+    assert await conn.fetchval("SELECT status FROM daily_posts WHERE kind = 'news'") == "waiting"
+    assert smart.calls == [] and not bot.sent
+
+    await read_sources(service, adapter)
+    await answerer.run_daily_posts(local(20, 5))        # too soon for another try
+    await answerer.drain()
+    assert not bot.sent
+    await conn.execute("UPDATE daily_posts SET updated_at = now() - interval '11 minutes'")
+    await answerer.run_daily_posts(local(20, 12))
+    await answerer.drain()
+    assert bot.sent[-1]["text"].startswith("🗞 <b>Новости дня, ")
+    assert tuple(await conn.fetchrow("SELECT status, attempts FROM daily_posts WHERE kind = 'news'")) == ("posted", 2)
+
+
+async def test_waiting_post_gives_up_after_six_tries(pool, conn):
+    from nestor.bot import daily
+
+    day = datetime.now(TZ).date()
+    post = await daily.claim(conn, CHAT_ID, "news", day)
+    for attempt in range(2, 7):
+        await daily.finish(conn, post, "waiting")
+        assert await daily.claim(conn, CHAT_ID, "news", day) is None        # within 10 minutes
+        await conn.execute("UPDATE daily_posts SET updated_at = now() - interval '11 minutes'")
+        assert await daily.claim(conn, CHAT_ID, "news", day) == post, attempt
+    await daily.finish(conn, post, "waiting")
+    await conn.execute("UPDATE daily_posts SET updated_at = now() - interval '11 minutes'")
+    assert await daily.claim(conn, CHAT_ID, "news", day) is None
+    assert await conn.fetchval("SELECT attempts FROM daily_posts WHERE id = $1", post) == 6
 
 
 async def test_news_command_is_for_admins_and_switches_the_digest(make_env, pool, conn):
@@ -114,6 +160,15 @@ async def test_think_goes_to_the_bigger_models(make_env, conn):
     rows = [tuple(r) for r in await conn.fetch(
         "SELECT trigger_msg_id, scenario, profile FROM bot_requests ORDER BY id")]
     assert rows == [(2, "who_is_right", "deep"), (3, "summary", None), (4, "summary", "deep"), (5, "web", "smart")]
+
+
+async def test_think_about_the_world_needs_only_the_smart_profile(make_env, conn):
+    smart = ScriptedLLM("В Таллине +8, источник: …", profile="smart")
+    bot, llm, feed = make_env(smart=smart)                # no cheap `web` profile
+    await feed(update("message", message(1, "нестор, подумай: какая погода в Таллине?", date=ago())))
+    assert len(smart.calls) == 1 and llm.calls == []
+    assert bot.sent[-1]["text"] == "В Таллине +8, источник: …"
+    assert tuple(await conn.fetchrow("SELECT scenario, profile FROM bot_requests")) == ("web", "smart")
 
 
 async def test_routes_from_settings_keep_disputes_on_the_cheap_profile(make_env, conn):

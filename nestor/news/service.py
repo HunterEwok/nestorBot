@@ -32,6 +32,10 @@ CANDIDATE_WINDOW = timedelta(hours=36)
 MIN_CANDIDATES = 3
 
 
+class NotEnoughNews(Exception):
+    """Fewer than MIN_CANDIDATES stories for the digest yet: worth another try later the same day."""
+
+
 class NewsService:
     def __init__(self, pool: asyncpg.Pool, sources: tuple[Source, ...], *, triage_llm: LLM | None,
                  is_wanted: Callable[[], Awaitable[bool]], tz: ZoneInfo, daily_token_limit: int, contact: str = "",
@@ -206,7 +210,7 @@ class NewsService:
 
     async def digest(self, day: date, llm: LLM, *, max_topics: int, timeout_s: float) -> str | None:
         """The day's digest as Telegram HTML, written at most once a day and shared by every group.
-        None: not enough news today, the token limit is reached, or no model."""
+        None: the token limit is reached. NotEnoughNews: too few stories so far."""
         async with self._digest_lock:
             async with self.pool.acquire() as conn:
                 cached = await store.digest_of(conn, day)
@@ -220,8 +224,8 @@ class NewsService:
                 rows = await store.candidates(conn, now - CANDIDATE_WINDOW)
             candidates = rank.pick(rows, self.by_key, now)
             if len(candidates) < MIN_CANDIDATES:
-                log.info("news digest skipped: not enough news", extra={"candidates": len(candidates)})
-                return None
+                log.info("news digest postponed: not enough news", extra={"candidates": len(candidates)})
+                raise NotEnoughNews(len(candidates))
             started = time.monotonic()
             completion = await asyncio.wait_for(
                 llm.complete(digest.build_prompt(candidates, self.by_key, day, max_topics)), timeout_s)
