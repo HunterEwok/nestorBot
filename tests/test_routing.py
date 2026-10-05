@@ -2,6 +2,7 @@
 reach the internet are refused."""
 import pytest
 
+from nestor.bot import routing
 from nestor.bot.routing import Router, parse_routes, split_think
 
 
@@ -71,3 +72,16 @@ def test_reactions_use_the_profile_without_tools_and_never_fall_back():
     for value in ("react:web", "react:smart", "react:deep"):
         with pytest.raises(ValueError):
             parse_routes(value)
+
+
+def test_address_checks_use_the_profile_without_tools_and_never_fall_back(monkeypatch):
+    assert Router({"group": "G", "news": "N"}).llm("address") == "N"
+    # Without `news` nobody is asked and nothing is answered: no move to the archive or the internet profiles.
+    assert Router({"group": "G", "deep": "D", "web": "W", "smart": "S"}).llm("address") is None
+    assert Router({"group": "G", "news": "N"}, parse_routes("address:group")).llm("address") == "G"
+    for value in ("address:web", "address:smart", "address:deep"):
+        with pytest.raises(ValueError):
+            parse_routes(value)
+    # Not even if `news` fell back to the archive profile one day.
+    monkeypatch.setitem(routing.FALLBACK, "news", ("group",))
+    assert Router({"group": "G"}).llm("address") is None and Router({"group": "G"}).llm("react") is None

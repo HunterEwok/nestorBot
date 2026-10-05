@@ -4,7 +4,9 @@ time (FR-14), conversation continuation (FR-15), scenarios SC-1..SC-6, audit log
 Besides answers, the bot speaks on its own only when someone asked for it: reminders,
 the group digest and the wisdom of the day (started by nestor.bot.scheduler), and the
 /export file in a private chat. Scheduled posts wait in a queue of their own, so they never
-hold up a group's answers.
+hold up a group's answers. Where an admin turned on /address, a message that may be addressed
+to the bot without its name is checked first (nestor.bot.addressing) and, on a yes, answered
+like any other request.
 """
 from __future__ import annotations
 
@@ -32,7 +34,7 @@ from aiogram.types import (BufferedInputFile, InlineKeyboardMarkup, LinkPreviewO
 from .. import forget, promises
 from ..collector.app import dump
 from ..watchdog.alerts import fmt_since, render_status
-from . import context, daily, export, markup, music, prompts, reactions, reminders, routing
+from . import addressing, context, daily, export, markup, music, prompts, reactions, reminders, routing
 from .llm import LLM, Completion
 from .markup import TELEGRAM_LIMIT, split_text
 from .triggers import BotIdentity, Invocation, detect
@@ -102,6 +104,7 @@ class AnswerConfig:
     news_max_topics: int = 10
     reaction_chat_ids: frozenset[int] = frozenset()  # reactions on by default; /reactions on|off overrides
     reactions: reactions.ReactionConfig = reactions.ReactionConfig()
+    address: addressing.AddressConfig = field(default_factory=addressing.AddressConfig)   # /address, off by default
     alert_chat_id: int | None = None    # ALERT_CHAT_ID: /status answers there only, to its admins; None: nowhere
 
 
@@ -170,8 +173,12 @@ class Answerer:
         self.checker = checker or music.HttpChecker()
         self.save_outgoing = save_outgoing
         self.reactor = reactions.Reactor(bot, pool, lambda: self.router.llm("react"), wanted=self._reactions_wanted,
-                                         calls_today=self._reaction_calls_today, may_spend=self._may_spend_on_reactions,
+                                         calls_today=self._reaction_calls_today, may_spend=self._may_spend_on_extras,
                                          log_call=self._log_reaction, cfg=cfg.reactions)
+        self.addresser = addressing.Addresser(pool, lambda: self.router.llm("address"), me,
+                                              wanted=self._address_wanted, checks_today=self._address_checks_today,
+                                              may_spend=self._may_spend_on_extras, log_call=self._log_address,
+                                              answer=self._invoke, declined=self._not_addressed, cfg=cfg.address)
         # A queue per group for its answers and one for its other scheduled posts, and _DIGESTS for the
         # digests of all groups.
         self._queues: dict[_QueueKey, asyncio.Queue[Callable[[], Awaitable[None]]]] = {}
@@ -184,25 +191,41 @@ class Answerer:
 
     async def on_message(self, msg: dict, *, paused: bool) -> None:
         """A new group message that was just stored."""
+        order = next(_ORDER)    # a candidate's answer comes after its check: a /forget_me meanwhile still counts
         async with self.pool.acquire() as conn:
             settings = await conn.fetchval("SELECT settings FROM chats WHERE chat_id = $1", msg["chat"]["id"]) or {}
-        inv = detect(msg, self.me, generic_keyword_enabled=settings.get("keyword_bot", True))
+        generic, address = settings.get("keyword_bot", True), self._address_on(settings)
+        inv = detect(msg, self.me, generic_keyword_enabled=generic, addressing=address)
         if "from" not in msg:
             return
         if inv is None:
-            if not paused and self._reactions_on(msg["chat"]["id"], settings):
-                self.reactor.consider(msg)
+            # A message that may be addressed to the bot without its name is checked first; one that
+            # is not goes on to the reactions (_not_addressed).
+            if not paused and not (address and self.addresser.consider(msg, generic_keyword_enabled=generic,
+                                                                        order=order)):
+                self._not_addressed(msg, settings)
             return
         if paused and inv.command not in ("resume", "status", "forget_me", "privacy"):   # /forget_me never waits
             return
         if inv.kind == "command":
             await self._command(msg, inv)
             return
+        await self._invoke(msg, inv, order)
+
+    async def _invoke(self, msg: dict, inv: Invocation, order: int) -> None:
+        """A request to the bot: queued as a Job, or a reaction for a bare «спасибо». order: when the
+        message came (Job.order)."""
         if await self._acknowledged(msg, inv):    # «спасибо», «ок»: a reaction says it, no model needed
             return
         think, question = routing.split_think(inv.text)
         scenario = context.classify(question, reply_target=_reply_target(msg, inv) is not None)
-        self.submit(Job(msg, inv, scenario, question, think=think))
+        self.submit(Job(msg, inv, scenario, question, think=think, order=order))
+
+    def _not_addressed(self, msg: dict, settings: dict | None = None) -> None:
+        """A group message that is not to the bot, or that its check found not to be: maybe a reaction.
+        settings: the chat's, as just read; without them the reactor checks the chat when its batch is due."""
+        if settings is None or self._reactions_on(msg["chat"]["id"], settings):
+            self.reactor.consider(msg)
 
     async def on_private(self, msg: dict) -> None:
         """Private chats are never archived. Only /export works there (also through the
@@ -228,6 +251,7 @@ class Answerer:
 
     async def drain(self) -> None:
         """Wait until all queued jobs are done (tests, shutdown), in queues made meanwhile too."""
+        await self.addresser.drain()        # a yes queues its answer
         joined = 0
         while joined < len(self._queues):
             joined = len(self._queues)
@@ -255,7 +279,8 @@ class Answerer:
             await self._say(msg, prompts.HELP.format(username=self.me.username))
         elif cmd == "privacy":
             await self._say(msg, prompts.PRIVACY.format(retention=promises.RETENTION_MONTHS,
-                                                        backup_weeks=promises.BACKUP_WEEKS))
+                                                        backup_weeks=promises.BACKUP_WEEKS,
+                                                        address_context=self.cfg.address.context))
         elif cmd in ("forget_me", "export") and _shared_sender(msg):
             await self._say(msg, prompts.PERSONAL_ONLY, save=False)
         elif cmd == "forget_me":
@@ -277,14 +302,14 @@ class Answerer:
             await self._unremind(msg, inv.args)
         elif cmd == "status":
             await self._status(msg)
-        elif cmd in ("pause", "resume", "bot_word", "digest", "wisdom", "news", "reactions"):
+        elif cmd in ("pause", "resume", "bot_word", "digest", "wisdom", "news", "reactions", "address"):
             if not await self._is_admin(msg):
                 await self._say(msg, prompts.ADMINS_ONLY)
                 return
             if cmd == "news" and inv.args.strip().lower() in ("status", "статус"):
                 await self._say(msg, await self._news_status())
                 return
-            if cmd in ("digest", "wisdom", "news", "reactions"):
+            if cmd in ("digest", "wisdom", "news", "reactions", "address"):
                 await self._toggle(msg, cmd, inv.args)
                 return
             async with self.pool.acquire() as conn:
@@ -320,7 +345,7 @@ class Answerer:
         await self._say(msg, text, save=False)
 
     async def _toggle(self, msg: dict, key: str, args: str) -> None:
-        """/digest, /wisdom, /news, /reactions on|off; without an argument shows the current state.
+        """/digest, /wisdom, /news, /reactions, /address on|off; without an argument shows the current state.
         /digest N also sets the group's digest period, in days, and switches the digest on."""
         chat_id, arg = msg["chat"]["id"], args.strip().lower()
         change = {key: arg not in _OFF} if arg else {}
@@ -347,6 +372,8 @@ class Answerer:
             on = self._reactions_on(chat_id, settings)
             text = prompts.REACTIONS_STATE.format(state="включены" if on else "выключены",
                                                   per_hour=self.cfg.reactions.per_hour)
+        elif key == "address":      # /address on is also the announcement to the group
+            text = prompts.ADDRESS_ON if self._address_on(settings) else prompts.ADDRESS_OFF
         else:
             on = self._wisdom_on(chat_id, settings)
             text = prompts.WISDOM_STATE.format(state="включена" if on else "выключена",
@@ -369,6 +396,11 @@ class Answerer:
     def _reactions_on(self, chat_id: int, settings: dict) -> bool:
         value = (settings or {}).get("reactions")
         return bool(value) if value is not None else chat_id in self.cfg.reaction_chat_ids
+
+    @staticmethod
+    def _address_on(settings: dict) -> bool:
+        """/address on: off by default in every group."""
+        return bool((settings or {}).get("address", False))
 
     def _post_on(self, chat_id: int, kind: str, settings: dict) -> bool:
         """Whether the group has this scheduled post on."""
@@ -395,19 +427,45 @@ class Answerer:
         return row is not None and row["enabled"] and self._reactions_on(chat_id, row["settings"] or {})
 
     async def _reaction_calls_today(self, chat_id: int) -> int:
+        return await self._calls_today(chat_id, "reaction")
+
+    async def _calls_today(self, chat_id: int, scenario: str) -> int:
+        """The model calls of this kind made for the chat since the local day began, failed ones too."""
         async with self.pool.acquire() as conn:
             return await conn.fetchval(
-                "SELECT count(*) FROM bot_requests WHERE chat_id = $1 AND scenario = 'reaction' AND created_at >= $2",
-                chat_id, self._day_start())
+                "SELECT count(*) FROM bot_requests WHERE chat_id = $1 AND scenario = $2 AND created_at >= $3",
+                chat_id, scenario, self._day_start())
 
-    async def _may_spend_on_reactions(self) -> bool:
-        """Reactions stop asking the model at half the daily tokens: answers come first."""
+    async def _may_spend_on_extras(self) -> bool:
+        """Reactions and address checks stop asking the model at half the daily tokens: answers come first."""
         async with self.pool.acquire() as conn:
             return await self._tokens_today(conn) < self.cfg.daily_token_limit // 2
 
     async def _log_reaction(self, chat_id: int, completion: Completion, started: float, status: str) -> None:
         async with self.pool.acquire() as conn:
             await self._log_scheduled(conn, chat_id, "reaction", completion, [], started, status=status)
+
+    # ---- addressing in one's own words (nestor.bot.addressing) ----
+
+    async def _address_wanted(self, chat_id: int) -> bool:
+        """Checked before and after a check: the chat may have been paused or switched off meanwhile."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT enabled, settings FROM chats WHERE chat_id = $1", chat_id)
+        return row is not None and row["enabled"] and self._address_on(row["settings"] or {})
+
+    async def _address_checks_today(self, chat_id: int) -> int:
+        return await self._calls_today(chat_id, "address")
+
+    async def _log_address(self, chat_id: int, completion: Completion, started: float, status: str) -> None:
+        """Tokens, model and status only: not a word of the chat, nor the model's yes or no."""
+        async with self.pool.acquire() as conn:
+            await self._log_scheduled(conn, chat_id, "address", completion, [], started, status=status,
+                                      keep_text=False)
+
+    def open_window(self, msg: dict) -> None:
+        """The bot answered this message's author here (a delivered answer to their request): their
+        conversation window opens (nestor.bot.addressing), so their «а ты?» right after it may be to the bot."""
+        self.addresser.opened(msg["chat"]["id"], _topic(msg), msg["from"]["id"])
 
     async def _put_reaction(self, msg: dict, emoji: str) -> bool:
         try:
@@ -683,6 +741,8 @@ class Answerer:
                               profile=c.profile)
             sent = await self._deliver(msg, out)
             fields.update(answer_msg_ids=[m.message_id for m in sent if m is not None])
+            if status == "ok" and fields["answer_msg_ids"]:
+                self.open_window(msg)
         except asyncio.TimeoutError:
             status = "timeout"
             await self._say(msg, prompts.TIMEOUT)

@@ -7,7 +7,8 @@ from dataclasses import dataclass
 # /status (the watchdog's view, nestor.bot.answerer._status) is for the admins of the alert group only:
 # it is in neither HELP nor the BotFather list.
 COMMANDS = {"help", "privacy", "forget_me", "summary", "stats", "pause", "resume", "bot_word", "start",
-            "catchup", "export", "reminders", "unremind", "digest", "wisdom", "news", "reactions", "status"}
+            "catchup", "export", "reminders", "unremind", "digest", "wisdom", "news", "reactions", "address",
+            "status"}
 
 
 @dataclass(frozen=True)
@@ -19,7 +20,7 @@ class BotIdentity:
 
 @dataclass(frozen=True)
 class Invocation:
-    kind: str                # mention | reply | keyword | command
+    kind: str                # mention | reply | keyword | command | address (nestor.bot.addressing)
     text: str                # the request with the trigger stripped
     command: str | None = None
     args: str = ""
@@ -43,7 +44,38 @@ def keyword_pattern(keywords: tuple[str, ...]) -> re.Pattern:
     return re.compile(rf"^\s*(?:{words})(?![\w])[\s,:;!.—-]*", re.IGNORECASE)
 
 
-def detect(msg: dict, me: BotIdentity, *, generic_keyword_enabled: bool = True) -> Invocation | None:
+# Words that speak to someone: «ты» and its forms, requests (the owner's list, and what /help asks
+# the bot to do), «как думаешь». With /address on they tell an address from talk about the bot.
+_SPEAKS_TO = re.compile(
+    r"(?<!\w)(?:ты|тебя|тебе|тобой|тобою|твой|твоя|тво[её]|твои|твоего|твоей|твоему|твоим|твоих|твоими|твою|"
+    r"скажи|подскажи|расскажи|объясни|помоги|напомни|найди|глянь|посмотри|как\s+думаешь|знаешь|можешь|слышишь|"
+    r"слушай|оцени|проверь|включи|подумай|перескажи)(?!\w)", re.IGNORECASE)
+# A mark right after the name: «нестор, ...», «нестор: ...», «нестор — ...», «нестор?».
+_MARK = re.compile(r"[,:;!?.…—–-]")
+
+
+def speaks_to(text: str) -> bool:
+    """Whether the text speaks to someone: a question, «ты», a request."""
+    return "?" in text or _SPEAKS_TO.search(text) is not None
+
+
+def name_forms(keywords: tuple[str, ...]) -> str:
+    """A regex of the bot's names in any case form: нестор, нестора, нестору, нестором, несторе,
+    несторушка, несторчик; бот, бота, боту, ботом, боте. A name that ends in a vowel stays as it is."""
+    forms = []
+    for k in keywords:
+        word = re.escape(k)
+        if re.search(r"[бвгджзклмнпрстфхцчшщ]$", k, re.IGNORECASE):
+            word += r"(?:а|у|ом|е|ушк(?:а|и|е|у|ой|о)|чик(?:а|у|ом|е)?)?"
+        forms.append(word)
+    return "|".join(forms)
+
+
+def detect(msg: dict, me: BotIdentity, *, generic_keyword_enabled: bool = True,
+           addressing: bool = False) -> Invocation | None:
+    """An explicit call: a command, an @mention, a reply to the bot, or the name at the start.
+    addressing (/address on): the name at the start counts only when a comma or another mark comes
+    after it, or the rest speaks to someone; «нестор вчера тупил» is left to nestor.bot.addressing."""
     text = msg.get("text") or msg.get("caption") or ""
     entities = msg.get("entities") or msg.get("caption_entities") or []
 
@@ -71,5 +103,8 @@ def detect(msg: dict, me: BotIdentity, *, generic_keyword_enabled: bool = True) 
     if keywords:
         km = keyword_pattern(keywords).match(text)
         if km:
-            return Invocation("keyword", text[km.end():].strip())
+            rest = text[km.end():]
+            # keyword_pattern takes «,:;!.—-» after the name with it; «?», «…» and «–» stay in the rest.
+            if not addressing or _MARK.search(km.group()) or _MARK.match(rest) or speaks_to(rest):
+                return Invocation("keyword", rest.strip())
     return None

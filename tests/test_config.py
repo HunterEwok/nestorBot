@@ -23,7 +23,7 @@ NAMES = ("ALLOWED_CHAT_IDS", "MODEL_ROUTES", "MUSIC_DAILY_LIMIT", "MUSIC_PLAYER_
          "NEWS_MAX_TOPICS", "NEWS_CONTACT_EMAIL", "NEWS_TELEGRAM_CHANNELS", "WISDOM_TIME", "DIGEST_TIME",
          "DIGEST_EVERY_DAYS", "TIMEZONE",
          "RETENTION_TIME", "ALERT_CHAT_ID", "ALERT_DAILY_AT", "ALERT_QUIET", "ALERT_DISK_MIN_GB", "ALERT_MAX_MEMBERS",
-         "BACKUP_STATUS_FILE")
+         "BACKUP_STATUS_FILE", "ADDRESS_WINDOW_MIN", "ADDRESS_CONTEXT", "ADDRESS_DAILY_CHECKS")
 
 
 @pytest.fixture
@@ -79,6 +79,32 @@ def test_digest_every_days(env):
         env.setenv("DIGEST_EVERY_DAYS", bad)
         with pytest.raises(SystemExit, match=message):
             config.load_settings()
+
+
+def test_addressing_settings(env):
+    s = config.load_settings()
+    assert (s.address_window_min, s.address_context, s.address_daily_checks) == (5, 4, 150)
+    example = dotenv_values(Path(__file__).parent.parent / ".env.example")
+    assert (example["ADDRESS_WINDOW_MIN"], example["ADDRESS_CONTEXT"], example["ADDRESS_DAILY_CHECKS"]) == (
+        "5", "4", "150")
+    env.setenv("ADDRESS_WINDOW_MIN", "10   # минут после ответа")
+    env.setenv("ADDRESS_CONTEXT", "0")
+    env.setenv("ADDRESS_DAILY_CHECKS", "2000")
+    s = config.load_settings()
+    assert (s.address_window_min, s.address_context, s.address_daily_checks) == (10, 0, 2000)
+    for name, bad, message in (("ADDRESS_WINDOW_MIN", "0", "ADDRESS_WINDOW_MIN must be a number of minutes from 1 to 60, got 0"),
+                               ("ADDRESS_WINDOW_MIN", "61", "from 1 to 60, got 61"),
+                               ("ADDRESS_WINDOW_MIN", "пять", "ADDRESS_WINDOW_MIN must be a whole number"),
+                               ("ADDRESS_CONTEXT", "-1", "ADDRESS_CONTEXT must be a number of messages from 0 to 20"),
+                               ("ADDRESS_CONTEXT", "21", "from 0 to 20, got 21"),
+                               ("ADDRESS_DAILY_CHECKS", "2001", "ADDRESS_DAILY_CHECKS must be a number of checks"),
+                               ("ADDRESS_DAILY_CHECKS", "1e3", "ADDRESS_DAILY_CHECKS must be a whole number")):
+        good = config._env(name)
+        env.setenv(name, bad)
+        with pytest.raises(SystemExit, match=message):
+            config.load_settings()
+        env.setenv(name, good)
+    config.load_settings()
 
 
 def test_retention_time_and_timezone_validation(env):

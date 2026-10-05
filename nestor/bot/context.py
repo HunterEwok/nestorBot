@@ -43,6 +43,19 @@ async def recent(conn, chat_ids: list[int], thread_id: int | None, limit: int = 
     return rows[::-1]
 
 
+async def before(conn, chat_ids: list[int], thread_id: int | None, row, limit: int) -> list[asyncpg.Record]:
+    """The `limit` messages before this archive row in its chat and topic, oldest first."""
+    rows = await conn.fetch(
+        f"""SELECT {_COLUMNS} {_FROM}
+            WHERE m.chat_id = ANY($1::bigint[]) AND {_VISIBLE}
+              AND ($2::bigint IS NULL OR (m.thread_id = $2 AND m.is_topic_message))
+              AND (m.sent_at, m.message_id) < ($3, $4)
+            ORDER BY m.sent_at DESC, m.message_id DESC LIMIT $5""",
+        chat_ids, thread_id, row["sent_at"], row["message_id"], limit,
+    )
+    return rows[::-1]
+
+
 async def reply_chain(conn, chat_id: int, message_id: int, depth: int = 10) -> list[asyncpg.Record]:
     """The message and the messages it replies to, oldest first."""
     rows = await conn.fetch(

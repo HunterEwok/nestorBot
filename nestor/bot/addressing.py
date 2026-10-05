@@ -1,0 +1,248 @@
+"""Addressing in the person's own words, the owner's «гибрид В» of 2026-10-05.
+
+The clear cases are decided by code for free (nestor.bot.triggers.detect): a command, an @mention,
+a reply to the bot, the name at the start with a comma. In a group where an admin turned on
+/address, the doubtful ones are candidates: the name elsewhere in the message with a sign of
+an address («слушай, Нестор, а ты как думаешь?»), the name at the start without a comma
+(«нестор вчера тупил»), and «ты», a request or a question from someone the bot has just
+answered («а ты уверен?» a minute later). A candidate, with the few messages before it and
+without names, goes to the profile without tools for a yes or a no; a yes is answered as if the
+bot had been called by name. No profile, past the daily number of checks, or when the day's
+tokens run low: no check, and no answer. The code never guesses yes.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+
+import asyncpg
+
+from . import context, prompts
+from .llm import LLM, Completion, extract_json
+from .reactions import eligible
+from .triggers import BotIdentity, Invocation, keyword_pattern, name_forms, speaks_to
+
+log = logging.getLogger("nestor.addressing")
+
+
+@dataclass(frozen=True)
+class AddressConfig:
+    window_min: float = 5          # ADDRESS_WINDOW_MIN: after an answer, the person's «а ты?» may be to the bot
+    context: int = 4               # ADDRESS_CONTEXT: messages before a candidate shown with it
+    daily_checks: int = 150        # ADDRESS_DAILY_CHECKS: model calls per chat per day
+    timeout_s: float = 20          # a check that takes longer is a no
+
+
+# «а почему?», «и что дальше»: going on with the conversation.
+_GOES_ON = re.compile(r"^\s*(?:а|и)(?!\w)", re.IGNORECASE)
+
+
+def _keywords(me: BotIdentity, generic_keyword_enabled: bool) -> tuple[str, ...]:
+    return me.keywords if generic_keyword_enabled else tuple(k for k in me.keywords if k != "бот")
+
+
+def _set_off(text: str, start: int, end: int) -> bool:
+    """The name at text[start:end] is said to someone: set off by commas («слушай, Нестор, а ...»,
+    «спасибо, нестор»), or at the very end before «?» or «!» («привет нестор!»)."""
+    before, after = text[:start].rstrip(), text[end:].lstrip()
+    if re.fullmatch(r"[?!]+\W*", after):
+        return True
+    return (before.endswith(",") and (not after or after[0] in ",.!?…")) or \
+        (after.startswith(",") and (not before or before[-1] in ".!?…"))
+
+
+def _replies_to_someone(msg: dict) -> bool:
+    """A reply to another person's message: then it is said to them. Replies to the forum topic
+    itself, to one's own message, to a channel post or to a bot are not."""
+    reply = msg.get("reply_to_message")
+    if not reply or (msg.get("is_topic_message") and reply.get("message_id") == msg.get("message_thread_id")):
+        return False
+    author = reply.get("from") or {}
+    human = bool(author) and not author.get("is_bot") and "sender_chat" not in reply
+    return human and author.get("id") != (msg.get("from") or {}).get("id")
+
+
+def candidate(msg: dict, me: BotIdentity, *, generic_keyword_enabled: bool = True,
+              window: bool = False) -> Invocation | None:
+    """Whether a message that detect() did not take may still be addressed to the bot, for the
+    model to decide; None when it is clearly not. window: the bot answered this person here a
+    moment ago. Only a person's own words: no bots, channels, forwards, commands or replies to
+    someone else."""
+    text = msg.get("text") or msg.get("caption") or ""
+    if not eligible(msg) or _replies_to_someone(msg):
+        return None
+    keywords = _keywords(me, generic_keyword_enabled)
+    names = re.compile(rf"(?<!\w)(?:{name_forms(keywords)})(?!\w)", re.IGNORECASE) if keywords else None
+    found = list(names.finditer(text)) if names else []
+    if keywords and keyword_pattern(keywords).match(text):      # «нестор вчера тупил»: maybe about it
+        return Invocation("address", strip_name(text, names))
+    if found and (speaks_to(text) or any(_set_off(text, m.start(), m.end()) for m in found)):
+        return Invocation("address", strip_name(text, names))
+    if window and (speaks_to(text) or _GOES_ON.match(text)):
+        return Invocation("address", strip_name(text, names) if names else text.strip())
+    return None
+
+
+def strip_name(text: str, names: re.Pattern) -> str:
+    """The request without the name at its start or end and the marks around it:
+    «как думаешь, нестор?» -> «как думаешь?»; a name in the middle stays."""
+    text = re.sub(rf"^\s*(?:{names.pattern})[\s,:;!.…—–-]*", "", text, flags=re.IGNORECASE)
+    text = re.sub(rf"[\s,:;—–-]*(?:{names.pattern})(?=[\s?!.…]*$)", "", text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+def render(rows, bot_id: int) -> str:
+    """The messages, numbered, oldest first, a label instead of each author: «Участник 1», ..., and
+    «Нестор» for the bot. A reply to one of them says which."""
+    labels: dict[int | None, str] = {}
+    numbers = {(r["chat_id"], r["message_id"]): i for i, r in enumerate(rows, 1)}
+    lines = []
+    for i, r in enumerate(rows, 1):
+        who = "Нестор" if r["user_id"] == bot_id else labels.setdefault(r["user_id"], f"Участник {len(labels) + 1}")
+        target = numbers.get((r["chat_id"], r["reply_to_id"]))
+        reply = f" (ответ на {target})" if target else ""
+        text = (r["text"] or f"[{r['kind']}]")[:300].replace("\n", " ⏎ ")
+        lines.append(f"{i}. {who}{reply}: {text}")
+    return "\n".join(lines)
+
+
+def parse(answer: str | None) -> bool:
+    """{"to_bot": true} -> True; anything else, a «да» in words included, is a no."""
+    data = extract_json(answer)
+    return isinstance(data, dict) and data.get("to_bot") is True
+
+
+Wanted = Callable[[int], Awaitable[bool]]
+ChecksToday = Callable[[int], Awaitable[int]]
+MaySpend = Callable[[], Awaitable[bool]]
+LogCall = Callable[[int, Completion, float, str], Awaitable[None]]
+Answer = Callable[[dict, Invocation, int], Awaitable[None]]
+Declined = Callable[[dict], None]
+
+
+def _topic(msg: dict) -> int | None:
+    return msg.get("message_thread_id") if msg.get("is_topic_message") else None
+
+
+class Addresser:
+    """Keeps the conversation windows, finds the candidates and checks them with the model.
+    answer(msg, inv, order) gets every yes; declined(msg) every candidate that was not one."""
+
+    def __init__(self, pool: asyncpg.Pool, llm: Callable[[], LLM | None], me: BotIdentity, *, wanted: Wanted,
+                 checks_today: ChecksToday, may_spend: MaySpend, log_call: LogCall, answer: Answer,
+                 declined: Declined, cfg: AddressConfig | None = None):
+        self.pool, self.llm, self.me, self.cfg = pool, llm, me, cfg or AddressConfig()
+        self.wanted, self.checks_today, self.may_spend, self.log_call = wanted, checks_today, may_spend, log_call
+        self.answer, self.declined = answer, declined
+        self._answered: dict[tuple[int, int | None, int], float] = {}   # (chat, topic, person) -> unix time
+        self._checks: dict[tuple[int, int], asyncio.Task] = {}          # (chat, person) -> the check in flight
+        self._waiting: dict[tuple[int, int], tuple[dict, Invocation, int]] = {}
+
+    # ---- the conversation window ----
+
+    def opened(self, chat_id: int, topic: int | None, user_id: int, at: float | None = None) -> None:
+        """The bot answered this person here (a delivered answer to their request): for
+        ADDRESS_WINDOW_MIN minutes their «а ты?» may be to the bot. Kept in memory only."""
+        now = time.time() if at is None else at
+        span = self.cfg.window_min * 60
+        for key in [k for k, t in self._answered.items() if now - t > span]:
+            del self._answered[key]
+        self._answered[(chat_id, topic, user_id)] = now
+
+    def window(self, msg: dict) -> bool:
+        """Whether the message was written within the window after the bot's last answer to its
+        author here (Telegram's dates are whole seconds: a second's slack)."""
+        at = self._answered.get((msg["chat"]["id"], _topic(msg), msg["from"]["id"]))
+        return at is not None and at - 1 <= msg.get("date", 0) <= at + self.cfg.window_min * 60
+
+    # ---- candidates ----
+
+    def consider(self, msg: dict, *, generic_keyword_enabled: bool, order: int) -> bool:
+        """A new stored message detect() did not take, in a group with /address on that is not
+        paused: check it if it is a candidate. order: when it came (answerer.Job.order), so that a
+        /forget_me of its author during the check still drops the answer."""
+        if self.llm() is None:      # no profile without tools: candidates are ignored, never guessed
+            return False
+        inv = candidate(msg, self.me, generic_keyword_enabled=generic_keyword_enabled, window=self.window(msg))
+        if inv is None:
+            return False
+        key = (msg["chat"]["id"], msg["from"]["id"])
+        if key in self._checks and not self._checks[key].done():
+            # One check per person at a time; the newest of theirs waits for it, older ones are dropped.
+            dropped = self._waiting.pop(key, None)
+            if dropped is not None:
+                self.declined(dropped[0])
+            self._waiting[key] = (msg, inv, order)
+        else:
+            self._checks[key] = asyncio.create_task(self._run(key, msg, inv, order))
+        return True
+
+    async def drain(self) -> None:
+        """Wait for the checks in flight and those waiting for them (tests, shutdown)."""
+        while checks := [t for t in self._checks.values() if not t.done()]:
+            await asyncio.gather(*checks, return_exceptions=True)
+
+    async def _run(self, key: tuple[int, int], msg: dict, inv: Invocation, order: int) -> None:
+        try:
+            yes = await self.check(msg)
+            if yes:
+                await self.answer(msg, inv, order)
+            else:
+                self.declined(msg)
+        except Exception:  # a check is never worth a crash
+            log.exception("address check failed", extra={"chat_id": key[0]})
+        finally:
+            waiting = self._waiting.pop(key, None)
+            if waiting is not None:
+                self._checks[key] = asyncio.create_task(self._run(key, *waiting))
+            else:
+                self._checks.pop(key, None)
+
+    async def check(self, msg: dict) -> bool:
+        """The model's yes: the candidate is addressed to the bot. No on any error or timeout."""
+        chat_id = msg["chat"]["id"]
+        llm = self.llm()
+        if llm is None or not await self.wanted(chat_id) or await self.checks_today(chat_id) >= self.cfg.daily_checks \
+                or not await self.may_spend():
+            return False
+        async with self.pool.acquire() as conn:
+            rows = await self._shown(conn, msg)
+        if not rows:
+            return False
+        user = prompts.ADDRESS_USER.format(messages=render(rows, self.me.user_id), n=len(rows))
+        started = time.monotonic()
+        try:
+            completion = await asyncio.wait_for(llm.complete([{"role": "system", "content": prompts.ADDRESS_SYSTEM},
+                                                              {"role": "user", "content": user}]),
+                                                self.cfg.timeout_s)
+        except Exception as e:  # noqa: BLE001 - Hermes down or slow: silence
+            log.warning("address model failed", extra={"chat_id": chat_id, "error": type(e).__name__})
+            # A failed call counts toward the day's checks too: a broken profile is not asked all day.
+            await self.log_call(chat_id, Completion("", None, None, None), started,
+                                "timeout" if isinstance(e, asyncio.TimeoutError) else "error")
+            return False
+        await self.log_call(chat_id, completion, started, "ok")
+        if not parse(completion.text):
+            return False
+        # The model may take a while: a /pause, /address off, a deletion or the author's /forget_me
+        # meanwhile still counts.
+        if not await self.wanted(chat_id):
+            return False
+        async with self.pool.acquire() as conn:
+            return bool(await context.messages_by_id(conn, chat_id, [msg["message_id"]]))
+
+    async def _shown(self, conn, msg: dict) -> list:
+        """The candidate read back from the archive and the ADDRESS_CONTEXT messages before it in
+        its chat and topic, oldest first; nothing when the candidate is gone (deleted, its author's
+        /forget_me). Messages of people who used /forget_me are not among them."""
+        chat_id = msg["chat"]["id"]
+        found = await context.messages_by_id(conn, chat_id, [msg["message_id"]])
+        if not found:
+            return []
+        ids = await context.chat_lineage(conn, chat_id)
+        before = await context.before(conn, ids, _topic(msg), found[0], self.cfg.context) if self.cfg.context else []
+        return [*before, found[0]]

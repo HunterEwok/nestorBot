@@ -51,6 +51,12 @@ class Settings:
     news_telegram_channels: tuple[str, ...] = ("psychedelicsocietyvienna",)
     # Groups where the bot puts reactions on emotional messages; group admins switch it with /reactions on|off.
     reaction_chat_ids: frozenset[int] = frozenset()
+    # Addressing in one's own words (/address on, nestor.bot.addressing): for this many minutes after
+    # the bot answered someone, their «а ты?» may be to the bot; this many messages before a doubtful
+    # one go with it to the model; at most this many such checks per group per day.
+    address_window_min: int = 5
+    address_context: int = 4
+    address_daily_checks: int = 150
     bot_keywords: tuple[str, ...] = ("нестор", "бот")
     rate_limit: int = 5
     rate_window_min: int = 10
@@ -164,13 +170,18 @@ def _channels() -> tuple[str, ...]:
         raise SystemExit(f"NEWS_TELEGRAM_CHANNELS: {e}") from None
 
 
+def _int_in(name: str, default: int, low: int, high: int, what: str) -> int:
+    """A whole number from low to high; what: what it counts, for the error."""
+    value = _int(name, default)
+    if not low <= value <= high:
+        raise SystemExit(f"{name} must be a number of {what} from {low} to {high}, got {value}")
+    return value
+
+
 def _digest_every_days() -> int:
     from .bot.daily import DIGEST_MAX_DAYS
 
-    value = _int("DIGEST_EVERY_DAYS", 30)
-    if not 1 <= value <= DIGEST_MAX_DAYS:
-        raise SystemExit(f"DIGEST_EVERY_DAYS must be a number of days from 1 to {DIGEST_MAX_DAYS}, got {value}")
-    return value
+    return _int_in("DIGEST_EVERY_DAYS", 30, 1, DIGEST_MAX_DAYS, "days")
 
 
 def _player_app() -> str:
@@ -212,6 +223,9 @@ def load_settings() -> Settings:
             news_contact_email=_env("NEWS_CONTACT_EMAIL"),
             news_telegram_channels=_channels(),
             reaction_chat_ids=_parse_ids(_env("REACTION_CHAT_IDS")),
+            address_window_min=_int_in("ADDRESS_WINDOW_MIN", 5, 1, 60, "minutes"),
+            address_context=_int_in("ADDRESS_CONTEXT", 4, 0, 20, "messages"),
+            address_daily_checks=_int_in("ADDRESS_DAILY_CHECKS", 150, 0, 2000, "checks"),
             bot_keywords=tuple(w.strip().lower() for w in _env("BOT_KEYWORDS", "нестор,бот").split(",")
                                if w.strip()),
             rate_limit=_int("RATE_LIMIT_PER_USER", 5),
