@@ -1,7 +1,10 @@
 """Settings from the environment, as systemd's EnvironmentFile hands them over."""
+from dataclasses import fields
 from datetime import time
+from pathlib import Path
 
 import pytest
+from dotenv import dotenv_values
 
 from nestor import config
 from nestor.watchdog import __main__ as watchdog_main
@@ -120,3 +123,16 @@ def test_alert_chat_must_be_allowed(env, tmp_path):
     assert config.check_alert_chat(config.load_settings()) is None          # no alerts: nothing to check
     with pytest.raises(SystemExit, match="ALERT_CHAT_ID is empty"):
         watchdog_main.main(["--test"])
+
+
+def test_env_example_has_the_stage_4_settings_with_their_defaults(env):
+    example = dotenv_values(Path(__file__).parent.parent / ".env.example")
+    assert set(NAMES) <= set(example)
+    for name in NAMES:
+        env.setenv(name, example[name])
+    s = config.load_settings()
+    stage4 = ("retention_time", "alert_chat_id", "alert_daily_at", "alert_quiet", "alert_disk_min_gb",
+              "alert_max_members", "backup_status_file")
+    defaults = {f.name: f.default for f in fields(config.Settings)}
+    assert {name: getattr(s, name) for name in stage4} == {name: defaults[name] for name in stage4}
+    assert config.check_alert_chat(s) is None

@@ -2,7 +2,7 @@
 
 Групповой Telegram-бот: молча архивирует сообщения разрешённых групп в PostgreSQL и (с этапа 3) отвечает по прямому обращению через Hermes Agent.
 
-Состояние: этапы 1 (схема, миграции, роли), 2 (сборщик) и 3 (ответы через Hermes) из ТЗ v0.1, плюс импорт старой истории, интернет, напоминания, песни, дайджест, мудрость дня, вечерняя новостная сводка и выбор модели по задаче.
+Состояние: этапы 1 (схема, миграции, роли), 2 (сборщик) и 3 (ответы через Hermes) из ТЗ v0.1, плюс импорт старой истории, интернет, напоминания, песни, дайджест, мудрость дня, вечерняя новостная сводка и выбор модели по задаче. Этап 4: архив хранит сообщения 12 месяцев, каждую ночь копия базы ложится на карту Pi, сторож пишет о сбоях в Telegram.
 
 ## Устройство
 
@@ -10,6 +10,7 @@
   - `parse.py` — чистое преобразование JSON Bot API в строки базы.
   - `store.py` — идемпотентная запись: ключ `(chat_id, message_id)`, правки в `message_edits`.
   - `app.py` — aiogram-диспетчер, allowlist (FR-7), повтор записи при недоступной базе.
+  - `telemetry.py` — пульс для сторожа: раз в минуту в `ops_state` пишется, когда последний раз удался `getUpdates` и сколько сообщений не ушло (только коды и счётчики). Если сам сторож молчит 20 минут, сборщик один раз говорит об этом в группе оповещений.
 - `nestor/bot` — ответы по обращению (этап 3), работают внутри того же процесса сборщика.
   - `triggers.py` — обращение ли это к боту: @упоминание, реплай на бота, «нестор»/«бот» в начале, команды.
   - `context.py` — контекст для модели: ветка, сообщения упомянутого участника, последние сообщения или период; всегда только текущий чат.
@@ -26,12 +27,16 @@
   - `filters.py` — торговля, дозировки, инструкции, криминал, тема; `store.py` — таблицы `news_*`, склейка одной истории из разных источников.
   - `triage.py` (дешёвая модель: строка по-русски на новость), `rank.py` (отбор по разделам), `digest.py` (сводка умной моделью, ссылки подставляет код).
   - `python -m nestor.news --check` — проверить источники с этой машины без базы и модели; `--check -v <источник>` — каждая запись с причиной отсева, датой и главным из meta.
+- `nestor/retention.py` — ночная чистка архива по сроку хранения; `nestor/forget.py` — `/forget_me`; `nestor/promises.py` — все обещанные сроки в одном месте, из них собирается текст `/privacy`.
+- `nestor/backup.py` — ночная копия базы (`pg_dump`) на карту Pi и восстановление из неё.
+- `nestor/watchdog` — сторож: раз в 5 минут проверяет сборщик, базу, Hermes, копии, чистку и карту Pi и пишет о проблемах в группу оповещений.
+- `nestor/logs.py` — JSON-логи в journald: ошибки только по имени класса, токены, пароли и ключи вымарываются.
 - `nestor/mcp` — MCP-сервер только для чтения (роль `hermes_reader`), его запускает Hermes. Каждый вызов требует ticket из промпта и видит только чат этого запроса.
 - `nestor/importer` — разовый импорт старой истории через аккаунт владельца (Telethon).
 - `deploy/hermes` — профили Hermes: `group` и `deep` (архив, без встроенных инструментов), `web` и `smart` (только интернет, без архива), `news` (без инструментов), SOUL.md, порядок проверки.
 - `migrations/` — SQL-миграции, применяются `python -m nestor.migrate`.
-- `nestor/bootstrap.py` — роли `nestor` (пишет) и `hermes_reader` (только представления `reader.*`) и сама база.
-- `deploy/systemd/nestor-collector.service` — юнит с `Restart=always`.
+- `nestor/bootstrap.py` — роли `nestor` (пишет), `hermes_reader` (только представления `reader.*`), `nestor_backup` (только чтение, для `pg_dump`) и сама база. Пароли уходят на сервер только SCRAM-хешем.
+- `deploy/systemd` — юниты: `nestor-collector` (`Restart=always`), `nestor-backup` (таймер 04:30 и 13:30), `nestor-watchdog` (таймер раз в 5 минут).
 
 ### Гарантия «0 потерь»
 
@@ -52,11 +57,21 @@
 
 ## Установка
 
-Сборщик работает на Raspberry Pi (система на microSD), PostgreSQL на отдельной машине с SSD. Pi ходит к базе через VPN (Tailscale или WireGuard, рекомендуется) или напрямую через интернет по TLS.
+Сборщик работает на Raspberry Pi (система на microSD), PostgreSQL на отдельной машине. Pi ходит к базе по локальной сети, через VPN (Tailscale или WireGuard) или через интернет по TLS.
+
+У нас так:
+
+| Где | Что |
+|---|---|
+| Raspberry Pi 4, Debian 13 (trixie, arm64), Python 3.13, только microSD | `nestor-collector` (архив, ответы, чистка, пульс), Hermes Agent, `nestor-backup` (копии на карту), `nestor-watchdog` |
+| Роутер OpenWrt, PostgreSQL 18 в Docker, `192.168.0.1:5432` | база `nestor` |
+| Ноутбук | `python -m nestor.bootstrap` (пароль суперпользователя базы есть только здесь), импорт истории |
+
+По Москве: 03:30 чистка архива, 04:30 копия базы (13:30 — повтор, если ночью не вышло), 09:30 сводка сторожа за вчера; сторож проверяет всё раз в 5 минут.
 
 ### Сервер базы
 
-1. PostgreSQL 16, данные на SSD. Положить `deploy/postgres/nestor.conf` в `/etc/postgresql/16/main/conf.d/` и поправить адрес в `listen_addresses`.
+1. PostgreSQL 16 или новее (у нас 18). Положить `deploy/postgres/nestor.conf` в `/etc/postgresql/16/main/conf.d/` и поправить адрес в `listen_addresses`.
 2. Добавить строки из `deploy/postgres/pg_hba.example` в `pg_hba.conf` (адрес Pi), перезапустить PostgreSQL.
 3. Создать роли и базу. Запускать можно откуда угодно, где есть этот репозиторий и доступ суперпользователем к серверу:
    ```sh
@@ -70,7 +85,7 @@
 2. ```sh
    sudo useradd --system --home /opt/nestor nestor
    sudo git clone https://github.com/HunterEwok/nestorBot /opt/nestor && sudo chown -R nestor: /opt/nestor
-   sudo -u nestor python3 -m venv /opt/nestor/.venv      # 3.11 из Raspberry Pi OS подходит
+   sudo -u nestor python3 -m venv /opt/nestor/.venv      # Python 3.11 или новее (в Debian 13 — 3.13)
    sudo -u nestor /opt/nestor/.venv/bin/pip install -e /opt/nestor
    sudo cp /opt/nestor/.env.example /opt/nestor/.env && sudo chmod 600 /opt/nestor/.env
    # в .env: BOT_TOKEN, ALLOWED_CHAT_IDS и DATABASE_URL на сервер базы, например
@@ -83,9 +98,76 @@
    ```
    Миграции применяются при каждом старте юнита (`ExecStartPre`). Если база недоступна, юнит перезапускается каждые 10 секунд, пока она не появится.
 
-На microSD сборщик ничего не пишет, кроме журнала (до 100 МБ, 14 дней). Пока база недоступна, сообщения ждут в Telegram (до 24 часов) и дозаписываются после восстановления связи.
+На microSD сборщик ничего не пишет, кроме журнала (до 100 МБ, 14 дней; в нём нет текстов сообщений). Пока база недоступна, сообщения ждут в Telegram (до 24 часов) и дозаписываются после восстановления связи. Копии базы и состояние сторожа тоже на карте, см. ниже.
 
 `chat_id` группы: добавить бота с пустым `ALLOWED_CHAT_IDS`, он сразу выйдет и запишет `chat_id` в журнал (`journalctl -u nestor-collector`).
+
+## Срок хранения
+
+Сообщение хранится 12 месяцев с того дня, как попало в архив (`messages.stored_at`, по часам базы), а не с его даты в Telegram: импортированная история считается со дня импорта. Каждую ночь в `RETENTION_TIME` (03:30 по `TIMEZONE`) сборщик удаляет то, что старше, вместе с правками, цитатами из этих сообщений в чужих ответах и ответами бота, построенными на них; записи о запросах, напоминания и имена уходят по тем же 12 месяцам (подробно — в `/privacy`). Чистка работает и без Hermes. Итог каждой ночи — строка в `maintenance_runs` (только числа и коды), её читает сторож.
+
+Удаление не отменить, поэтому чистка не запускается, если часы Pi и базы расходятся больше чем на 10 минут, в архиве есть сообщения с датой из будущего или срок вышел короче 360 дней. Если за ночь ушло бы больше 5000 сообщений и больше 15 % архива (так будет около 2027-10-03, когда истечёт вся импортированная история), чистка ждёт подтверждения, а сторож об этом пишет:
+
+```sh
+sudo -u nestor /opt/nestor/.venv/bin/python -m nestor.retention                  # что удалилось бы сейчас; ничего не удаляет
+sudo -u nestor /opt/nestor/.venv/bin/python -m nestor.retention --at 2027-10-05  # ... в этот день
+sudo -u nestor /opt/nestor/.venv/bin/python -m nestor.retention --run            # прогнать сейчас (раз в день)
+sudo -u nestor /opt/nestor/.venv/bin/python -m nestor.retention --confirm        # разрешить всё, что уйдёт за 7 дней
+```
+
+`/forget_me` удаляет сразу (`nestor/forget.py`), из копий — в течение 5 недель. Сроки живут в `nestor/promises.py`, текст `/privacy` собирается из них.
+
+## Резервные копии
+
+Юнит `nestor-backup` каждую ночь в 04:30 (после чистки) снимает `pg_dump` базы с роутера на карту Pi; в 13:30 — ещё раз, только если ночью не вышло. Он работает от своего пользователя `nestor-backup` с ролью базы `nestor_backup`, которая умеет только читать; её пароль лежит в `/etc/nestor-backup/pgpass`, не в `.env`. Копия сначала пишется во временный файл, целиком читается обратно `pg_restore` и только потом получает имя `nestor-*.dump`. Хранятся 7 ежедневных и 4 еженедельных копии, не старше 35 дней; две последние удачные не удаляются, даже если новые не получаются.
+
+В `/var/lib/nestor-backup`: `dumps/` (0700, больше никто не читает), `status.json` (его читает сторож), `last-error.txt` (хвост ошибки `pg_dump`; в журнал и в оповещения она не попадает).
+
+Установка на Pi. `pg_dump` нужен 18 из репозитория PGDG: свой клиент Debian 13 (17) сервер 18 не берёт. Роль `nestor_backup` создаёт `python -m nestor.bootstrap backup` с ноутбука (`BACKUP_PASSWORD` в его `.env`).
+
+```sh
+sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh && sudo apt install -y postgresql-client-18
+sudo useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin nestor-backup
+sudo install -d -o root -g nestor-backup -m 0750 /etc/nestor-backup
+sudo install -o root -g nestor-backup -m 0640 /opt/nestor/deploy/systemd/nestor-backup.env.example /etc/nestor-backup/backup.env
+read -rs P    # вставить пароль nestor_backup, Enter; в истории и в аргументах команд его не будет
+printf '192.168.0.1:5432:nestor:nestor_backup:%s\n' "$P" | sudo install -o nestor-backup -g nestor-backup -m 600 /dev/stdin /etc/nestor-backup/pgpass; unset P
+sudo cp /opt/nestor/deploy/systemd/nestor-backup.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now nestor-backup.timer
+sudo systemctl start nestor-backup && cat /var/lib/nestor-backup/status.json     # "ok": true
+```
+
+Восстановление, если база потеряна. Копия возвращает и то, что после неё забыли через `/forget_me`, поэтому `restore` после загрузки применяет миграции, ещё раз забывает всех из `optouts.json` сторожа и удаляет то, что пережило срок хранения. База должна быть пустой: старую переименовать (`ALTER DATABASE nestor RENAME TO nestor_broken`), новую создаст `python -m nestor.bootstrap` с ноутбука.
+
+```sh
+sudo systemctl disable --now nestor-collector nestor-backup.timer nestor-watchdog.timer
+systemctl --user stop hermes-gateway        # его MCP-сервер тоже держит соединение с базой
+F=$(sudo ls -1 /var/lib/nestor-backup/dumps | tail -n 1)
+sudo cat "/var/lib/nestor-backup/dumps/$F" | sudo -u nestor /opt/nestor/.venv/bin/python -m nestor.backup restore \
+    --database nestor --optouts /var/lib/nestor-watchdog/optouts.json                  # restore done
+sudo systemctl enable --now nestor-collector nestor-backup.timer nestor-watchdog.timer
+systemctl --user start hermes-gateway
+```
+
+Потом импорт истории для всех групп с ноутбука: сообщения, пришедшие после копии, Telegram второй раз не пришлёт.
+
+## Оповещения
+
+Сторож (`python -m nestor.watchdog`, таймер `nestor-watchdog` раз в 5 минут, пользователь `nestor`) — единственный, кто пишет о сбоях. Он проверяет базу и часы, миграции, жив ли сборщик и получает ли он сообщения из Telegram (по его пульсу), Hermes, ошибки модели, копии, чистку, место и запись на карте, опоздавшие напоминания и источники новостей. О проблеме пишет один раз, когда она подтвердилась, и ещё раз — тихо, когда прошла; не больше одного сообщения за проверку и шести в час. С 23:00 до 08:00 сообщения приходят без звука (кроме критичного, которое длится больше часа). В 09:30 — тихая сводка за вчера; если в группе оповещений больше `ALERT_MAX_MEMBERS` участников (с ботом), вместо сводки только предупреждение о посторонних. Его состояние — в `/var/lib/nestor-watchdog`, поэтому он помнит, что уже сказал, и когда база недоступна.
+
+В `.env`: `ALERT_CHAT_ID` — группа оповещений (она должна быть в `ALLOWED_CHAT_IDS`, иначе бот из неё выйдет; пусто — оповещений нет), `ALERT_DAILY_AT`, `ALERT_QUIET`, `ALERT_DISK_MIN_GB`, `ALERT_MAX_MEMBERS`, `BACKUP_STATUS_FILE=/var/lib/nestor-backup/status.json`. После правки `.env` перезапустить сборщик.
+
+```sh
+sudo cp /opt/nestor/deploy/systemd/nestor-watchdog.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now nestor-watchdog.timer
+sudo -u nestor /opt/nestor/.venv/bin/python -m nestor.watchdog --test      # пробное сообщение в группу
+sudo -u nestor /opt/nestor/.venv/bin/python -m nestor.watchdog --dry-run   # что он видит; ничего не шлёт
+sudo -u nestor /opt/nestor/.venv/bin/python -m nestor.watchdog --mute 60   # на час работ: новые проблемы ждут, без звука
+```
+
+`/status` в группе оповещений показывает её админам то, что сторож увидел в последний раз; в других группах бот на неё не отвечает, в `/help` её нет. Если сторож сам перестал запускаться, через 20 минут об этом один раз напишет сборщик.
+
+Ни в оповещения, ни в журнал, ни в состояние сторожа не попадают тексты сообщений, токены, ключи и пароли: только коды, числа и имена групп.
 
 ## Импорт старой истории
 

@@ -15,7 +15,7 @@ import re
 import secrets
 import time
 from dataclasses import dataclass, field
-from datetime import date, datetime, time as dtime, timedelta, timezone
+from datetime import UTC, date, datetime, time as dtime, timedelta, timezone
 from typing import Awaitable, Callable, Collection
 from zoneinfo import ZoneInfo
 
@@ -28,6 +28,7 @@ from aiogram.types import (BufferedInputFile, InlineKeyboardMarkup, LinkPreviewO
 
 from .. import forget, promises
 from ..collector.app import dump
+from ..watchdog.alerts import fmt_since, render_status
 from . import context, daily, export, markup, music, prompts, reactions, reminders, routing
 from .llm import LLM, Completion
 from .markup import TELEGRAM_LIMIT, split_text
@@ -36,6 +37,7 @@ from .triggers import BotIdentity, Invocation, detect
 log = logging.getLogger("nestor.answerer")
 
 ANONYMOUS_ADMIN_ID = 1087968824  # GroupAnonymousBot: an admin posting as the group
+STATUS_STALE_AFTER = timedelta(minutes=15)     # the watchdog runs every 5 minutes
 _OFF = ("off", "выкл", "0", "нет", "no")
 
 
@@ -61,6 +63,7 @@ class AnswerConfig:
     news_max_topics: int = 10
     reaction_chat_ids: frozenset[int] = frozenset()  # reactions on by default; /reactions on|off overrides
     reactions: reactions.ReactionConfig = reactions.ReactionConfig()
+    alert_chat_id: int | None = None    # ALERT_CHAT_ID: /status answers there only, to its admins; None: nowhere
 
 
 @dataclass
@@ -135,7 +138,7 @@ class Answerer:
             if not paused and self._reactions_on(msg["chat"]["id"], settings):
                 self.reactor.consider(msg)
             return
-        if paused and inv.command != "resume":
+        if paused and inv.command not in ("resume", "status"):
             return
         if inv.kind == "command":
             await self._command(msg, inv)
@@ -211,6 +214,8 @@ class Answerer:
             await self._list_reminders(msg)
         elif cmd == "unremind":
             await self._unremind(msg, inv.args)
+        elif cmd == "status":
+            await self._status(msg)
         elif cmd in ("pause", "resume", "bot_word", "digest", "wisdom", "news", "reactions"):
             if not await self._is_admin(msg):
                 await self._say(msg, prompts.ADMINS_ONLY)
@@ -231,6 +236,27 @@ class Answerer:
                     return
                 await conn.execute("UPDATE chats SET enabled = $2 WHERE chat_id = $1", chat_id, cmd == "resume")
             await self._say(msg, prompts.RESUMED if cmd == "resume" else prompts.PAUSED)
+
+    async def _status(self, msg: dict) -> None:
+        """/status: what nestor.watchdog found on its last run (its snapshot in ops_state), rendered as the
+        watchdog renders it. Only in the alert group and only for its admins; elsewhere the bot keeps quiet,
+        as if it had no such command. The answer is not archived."""
+        if self.cfg.alert_chat_id is None or msg["chat"]["id"] != self.cfg.alert_chat_id:
+            return
+        if not await self._is_admin(msg):
+            await self._say(msg, prompts.ADMINS_ONLY)
+            return
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT value, updated_at, now() - updated_at > $1 AS stale FROM ops_state "
+                                      "WHERE key = 'watchdog'", STATUS_STALE_AFTER)
+        now = datetime.now(UTC)
+        if row is None:
+            text = prompts.STATUS_NEVER
+        else:
+            text = render_status(row["value"], now, self.cfg.tz)
+            if row["stale"]:
+                text += "\n" + prompts.STATUS_STALE.format(time=fmt_since(row["updated_at"], now, self.cfg.tz))
+        await self._say(msg, text, save=False)
 
     async def _toggle(self, msg: dict, key: str, args: str) -> None:
         """/digest, /wisdom, /news, /reactions on|off; without an argument shows the current state."""

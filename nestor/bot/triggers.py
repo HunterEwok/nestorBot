@@ -4,8 +4,10 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+# /status (the watchdog's view, nestor.bot.answerer._status) is for the admins of the alert group only:
+# it is in neither HELP nor the BotFather list.
 COMMANDS = {"help", "privacy", "forget_me", "summary", "stats", "pause", "resume", "bot_word", "start",
-            "catchup", "export", "reminders", "unremind", "digest", "wisdom", "news", "reactions"}
+            "catchup", "export", "reminders", "unremind", "digest", "wisdom", "news", "reactions", "status"}
 
 
 @dataclass(frozen=True)

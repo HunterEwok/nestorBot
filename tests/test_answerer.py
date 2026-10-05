@@ -1,7 +1,8 @@
 """Stage 3 through the real dispatcher with a fake Telegram and a fake LLM."""
 import asyncio
 import itertools
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 from aiogram import Dispatcher
@@ -17,6 +18,7 @@ from nestor.bot.triggers import BotIdentity
 from nestor.collector.app import Collector
 from nestor.config import Settings
 from nestor.mcp import tools
+from nestor.watchdog import alerts, checks
 
 from .factories import CHAT_ID, message, update
 from .test_collector import FakeBot as BaseFakeBot
@@ -776,3 +778,74 @@ async def test_forget_me_strips_imported_quotes_forwards_and_names(make_env, con
         assert "Петров" not in str(fwd["raw"]) and "секрет" not in str(fwd["raw"])
     names = await conn.fetchrow("SELECT username, first_name, last_name, opted_out FROM users WHERE user_id = 222")
     assert tuple(names) == (None, None, None, True)
+
+
+# ---- /status: what the watchdog saw, for the admins of the alert group ----
+
+async def _watchdog_saw(conn, *, ago: str = "1 minute") -> dict:
+    """A snapshot as nestor.watchdog publishes it: the backups missing, Hermes not looked at."""
+    now = datetime.now(UTC)
+    state = alerts.AlertState()
+    alerts.evaluate(state, [checks.result("backup", [checks.Finding("backup.missing", "crit",
+                                                                    prompts.ALERT_BACKUP_MISSING)]),
+                            checks.unknown("hermes")], now, tz=ZoneInfo("Europe/Moscow"), quiet=None)
+    snap = alerts.snapshot(state, now)
+    await conn.execute("INSERT INTO ops_state (key, value, updated_at) VALUES ('watchdog', $1, now() - $2::text::interval)",
+                       snap, ago)
+    return snap
+
+
+async def test_status_for_admin_in_alert_chat_not_archived(make_env, conn):
+    bot, llm, feed = make_env(admins={111}, alert_chat_id=CHAT_ID)
+    snap = await _watchdog_saw(conn)
+    await feed(update("message", message(1, "/status", uid=111)))
+    (sent,) = bot.sent
+    # As the watchdog renders it (python -m nestor.watchdog --dry-run prints the same).
+    assert sent["text"] == alerts.render_status(snap, datetime.now(UTC), ZoneInfo("Europe/Moscow"))
+    assert "🔴 " + prompts.ALERT_BACKUP_MISSING in sent["text"]
+    assert prompts.STATUS_UNCHECKED.format(names="Hermes") in sent["text"] and "Сторож" not in sent["text"]
+    assert (sent["parse_mode"], sent["reply_to"]) == ("HTML", 1) and llm.calls == []
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE user_id = $1", BOT_ID) == 0
+    assert await conn.fetchval("SELECT count(*) FROM bot_requests") == 0
+
+
+async def test_status_non_admin_gets_admins_only(make_env, conn):
+    bot, _, feed = make_env(admins={111}, alert_chat_id=CHAT_ID)
+    await _watchdog_saw(conn)
+    await feed(update("message", message(1, "/status", uid=222)))
+    assert [s["text"] for s in bot.sent] == [prompts.ADMINS_ONLY]
+
+
+async def test_status_elsewhere_or_unset_is_silent(make_env, conn):
+    await _watchdog_saw(conn)
+    for first, alert_chat in ((1, None), (3, -1009999999999)):
+        bot, llm, feed = make_env(admins={111}, alert_chat_id=alert_chat)
+        await feed(update("message", message(first, "/status", uid=111)))
+        await feed(update("message", message(first + 1, "/status@ewok_nestor_bot", uid=222)))
+        assert bot.sent == [] and llm.calls == []
+    assert await conn.fetchval("SELECT count(*) FROM messages") == 4      # all four were new: each one was asked
+
+
+async def test_status_stale_or_missing_snapshot(make_env, conn):
+    bot, _, feed = make_env(admins={111}, alert_chat_id=CHAT_ID)
+    await feed(update("message", message(1, "/status", uid=111)))
+    assert bot.sent[-1]["text"] == prompts.STATUS_NEVER
+    snap = await _watchdog_saw(conn, ago="20 minutes")
+    updated = await conn.fetchval("SELECT updated_at FROM ops_state WHERE key = 'watchdog'")
+    await feed(update("message", message(2, "/status", uid=111)))
+    now, msk = datetime.now(UTC), ZoneInfo("Europe/Moscow")
+    assert bot.sent[-1]["text"] == (alerts.render_status(snap, now, msk) + "\n"
+                                    + prompts.STATUS_STALE.format(time=alerts.fmt_since(updated, now, msk)))
+
+
+async def test_status_works_while_paused(make_env, conn):
+    bot, _, feed = make_env(admins={111}, alert_chat_id=CHAT_ID)
+    await _watchdog_saw(conn)
+    await feed(update("message", message(1, "/pause", uid=111)))
+    await feed(update("message", message(2, "/help", uid=111)))
+    await feed(update("message", message(3, "/status", uid=111)))
+    paused, status = bot.sent                   # /help waits for /resume, /status does not
+    assert paused["text"] == prompts.PAUSED and prompts.ALERT_BACKUP_MISSING in status["text"]
+    assert status["reply_to"] == 3
+    # Not archived while paused, the question nor the answer.
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE message_id IN (2, 3)") == 0
