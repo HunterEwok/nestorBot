@@ -4,10 +4,12 @@ from datetime import time
 import pytest
 
 from nestor import config
+from nestor.watchdog import __main__ as watchdog_main
 
 NAMES = ("ALLOWED_CHAT_IDS", "MODEL_ROUTES", "MUSIC_DAILY_LIMIT", "MUSIC_PLAYER_APP", "NEWS_CHAT_IDS", "NEWS_TIME",
          "NEWS_MAX_TOPICS", "NEWS_CONTACT_EMAIL", "NEWS_TELEGRAM_CHANNELS", "WISDOM_TIME", "DIGEST_TIME", "TIMEZONE",
-         "RETENTION_TIME")
+         "RETENTION_TIME", "ALERT_CHAT_ID", "ALERT_DAILY_AT", "ALERT_QUIET", "ALERT_DISK_MIN_GB", "ALERT_MAX_MEMBERS",
+         "BACKUP_STATUS_FILE")
 
 
 @pytest.fixture
@@ -63,3 +65,58 @@ def test_retention_time_and_timezone_validation(env):
         env.setenv("TIMEZONE", bad)
         with pytest.raises(SystemExit, match="TIMEZONE must be an IANA name like Europe/Moscow"):
             config.load_settings()
+
+
+def test_alert_settings_parse_off_and_garbage(env):
+    s = config.load_settings()
+    assert (s.alert_chat_id, s.alert_daily_at, s.alert_quiet, s.alert_disk_min_gb, s.alert_max_members,
+            s.backup_status_file) == (None, time(9, 30), (time(23), time(8)), 5, 2, "")
+    env.setenv("ALERT_CHAT_ID", "-1004446259317   # Nestor alerts")
+    env.setenv("ALERT_DAILY_AT", "08:45 # сводка")
+    env.setenv("ALERT_QUIET", "22:30 - 07:15")
+    env.setenv("ALERT_DISK_MIN_GB", "8")
+    env.setenv("ALERT_MAX_MEMBERS", "3")
+    env.setenv("BACKUP_STATUS_FILE", "/var/lib/nestor-backup/status.json   # nestor.backup")
+    s = config.load_settings()
+    assert (s.alert_chat_id, s.alert_daily_at, s.alert_quiet, s.alert_disk_min_gb, s.alert_max_members,
+            s.backup_status_file) == (-1004446259317, time(8, 45), (time(22, 30), time(7, 15)), 8, 3,
+                                      "/var/lib/nestor-backup/status.json")
+    for off in ("off", "OFF", "выкл", "0", "нет"):
+        env.setenv("ALERT_DAILY_AT", off)
+        env.setenv("ALERT_QUIET", off)
+        s = config.load_settings()
+        assert (s.alert_daily_at, s.alert_quiet) == (None, None)
+    env.setenv("ALERT_DAILY_AT", "09:30")
+    env.setenv("ALERT_QUIET", "23:00-08:00")
+    for name, bad, message in (("ALERT_CHAT_ID", "@nestor_alerts", "ALERT_CHAT_ID must be a chat id"),
+                               ("ALERT_DAILY_AT", "утром", "ALERT_DAILY_AT must look like 21:00"),
+                               ("ALERT_QUIET", "23:00", "ALERT_QUIET must look like 23:00-08:00 or off"),
+                               ("ALERT_QUIET", "23:00-08:00-09:00", "ALERT_QUIET must look like"),
+                               ("ALERT_QUIET", "23:00-23:00", "ALERT_QUIET must look like"),
+                               ("ALERT_QUIET", "ночью", "ALERT_QUIET must look like"),
+                               ("ALERT_DISK_MIN_GB", "пять", "ALERT_DISK_MIN_GB must be a whole number"),
+                               ("ALERT_MAX_MEMBERS", "двое", "ALERT_MAX_MEMBERS must be a whole number")):
+        good = config._env(name)
+        env.setenv(name, bad)
+        with pytest.raises(SystemExit, match=message):
+            config.load_settings()
+        env.setenv(name, good)
+    config.load_settings()
+
+
+def test_alert_chat_must_be_allowed(env, tmp_path):
+    env.setenv("ALLOWED_CHAT_IDS", "-1001111111111")
+    env.setenv("ALERT_CHAT_ID", "-1002222222222")
+    s = config.load_settings()
+    assert config.check_alert_chat(s) == "ALERT_CHAT_ID must be one of ALLOWED_CHAT_IDS: the bot leaves every other group"
+    # The watchdog does not start with it: it would send into a group the bot has left.
+    env.setattr(watchdog_main, "setup_logging", lambda level: None)        # keeps pytest's log capture
+    env.setenv("STATE_DIRECTORY", str(tmp_path))
+    with pytest.raises(SystemExit, match="ALERT_CHAT_ID must be one of ALLOWED_CHAT_IDS"):
+        watchdog_main.main([])
+    env.setenv("ALLOWED_CHAT_IDS", "-1001111111111, -1002222222222")
+    assert config.check_alert_chat(config.load_settings()) is None
+    env.delenv("ALERT_CHAT_ID")
+    assert config.check_alert_chat(config.load_settings()) is None          # no alerts: nothing to check
+    with pytest.raises(SystemExit, match="ALERT_CHAT_ID is empty"):
+        watchdog_main.main(["--test"])

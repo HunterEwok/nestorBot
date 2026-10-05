@@ -56,6 +56,13 @@ class Settings:
     timezone: str = "Europe/Moscow"
     # The nightly purge of what entered the archive more than 12 months ago (nestor.retention), local time.
     retention_time: time = time(3, 30)
+    # Alerts of nestor.watchdog go to this group (it must be in ALLOWED_CHAT_IDS); None: no alerts.
+    alert_chat_id: int | None = None
+    alert_daily_at: time | None = time(9, 30)           # the silent daily summary, local time; None: off
+    alert_quiet: tuple[time, time] | None = (time(23), time(8))   # alerts arrive without sound; None: never quiet
+    alert_disk_min_gb: int = 5          # free space on the Pi's card below this is a warning
+    alert_max_members: int = 2          # the alert group with more members (the bot counts) gets no summary
+    backup_status_file: str = ""        # nestor.backup's status.json; empty: backups are not watched
 
 
 _COMMENT = re.compile(r"(?:^|\s)#.*\Z", re.S)
@@ -85,6 +92,47 @@ def _parse_time(name: str, default: str) -> time:
         return time.fromisoformat(value)
     except ValueError:
         raise SystemExit(f"{name} must look like 21:00, got {value!r}") from None
+
+
+_OFF = ("off", "выкл", "0", "нет", "no")      # as the group commands take it
+
+
+def _parse_id(name: str) -> int | None:
+    value = _env(name)
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        raise SystemExit(f"{name} must be a chat id like -1001234567890, got {value!r}") from None
+
+
+def _parse_optional_time(name: str, default: str) -> time | None:
+    """A local time, or None for off (off, выкл, 0, нет, no)."""
+    if _env(name, default).lower() in _OFF:
+        return None
+    return _parse_time(name, default)
+
+
+def _parse_quiet(name: str, default: str) -> tuple[time, time] | None:
+    """HH:MM-HH:MM (it may cross midnight), or None for off."""
+    value = _env(name, default)
+    if value.lower() in _OFF:
+        return None
+    try:
+        start, end = (time.fromisoformat(part.strip()) for part in value.split("-"))
+    except ValueError:
+        raise SystemExit(f"{name} must look like 23:00-08:00 or off, got {value!r}") from None
+    if start == end:
+        raise SystemExit(f"{name} must look like 23:00-08:00 or off, got {value!r}")
+    return start, end
+
+
+def check_alert_chat(settings: Settings) -> str | None:
+    """Why ALERT_CHAT_ID cannot work, or None. The bot leaves every group not in ALLOWED_CHAT_IDS."""
+    if settings.alert_chat_id is not None and settings.alert_chat_id not in settings.allowed_chat_ids:
+        return "ALERT_CHAT_ID must be one of ALLOWED_CHAT_IDS: the bot leaves every other group"
+    return None
 
 
 def _timezone() -> str:
@@ -159,6 +207,12 @@ def load_settings() -> Settings:
             daily_token_limit=_int("DAILY_TOKEN_LIMIT", 250_000),
             timezone=_timezone(),
             retention_time=_parse_time("RETENTION_TIME", "03:30"),
+            alert_chat_id=_parse_id("ALERT_CHAT_ID"),
+            alert_daily_at=_parse_optional_time("ALERT_DAILY_AT", "09:30"),
+            alert_quiet=_parse_quiet("ALERT_QUIET", "23:00-08:00"),
+            alert_disk_min_gb=_int("ALERT_DISK_MIN_GB", 5),
+            alert_max_members=_int("ALERT_MAX_MEMBERS", 2),
+            backup_status_file=_env("BACKUP_STATUS_FILE"),
         )
     except KeyError as e:
         raise SystemExit(f"missing required environment variable {e.args[0]}") from None

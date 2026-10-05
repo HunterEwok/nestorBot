@@ -1,0 +1,23 @@
+[Unit]
+Description=nestor watchdog: checks the collector, database, Hermes, backups, retention and disk; alerts to Telegram
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=nestor
+Group=nestor
+WorkingDirectory=/opt/nestor
+EnvironmentFile=/opt/nestor/.env
+ExecStart=/opt/nestor/.venv/bin/python -m nestor.watchdog
+# /var/lib/nestor-watchdog: state.json (what was announced, the outbox), optouts.json (ids for a restore,
+# nestor.backup restore --optouts), the probe file written on every run.
+StateDirectory=nestor-watchdog
+StateDirectoryMode=0700
+TimeoutStartSec=120
+Nice=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+MemoryMax=200M
