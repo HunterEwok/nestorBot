@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone
 
 import pytest
@@ -30,6 +31,40 @@ def test_the_bot_is_told_by_its_id_and_its_token_is_not_needed():
     for env in ({}, {"BOT_TOKEN": "123456:ABC..."}, {"BOT_ID": "", "BOT_TOKEN": "123456:ABC..."}, {"BOT_ID": "x"}):
         with pytest.raises(SystemExit, match="missing BOT_ID"):         # .env.example's placeholder is no bot
             bot_id_from(env)
+
+
+def test_the_list_of_groups_needs_no_bot_id(monkeypatch):
+    from nestor.importer import __main__ as importer
+    listed = []
+
+    class Client:
+        def __init__(self, *args):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    async def list_groups(client, allowed):
+        listed.append(allowed)
+
+    monkeypatch.setattr(importer, "load_dotenv", lambda: None)
+    monkeypatch.setattr(importer, "setup_logging", lambda level: None)      # would take over the loggers of later tests
+    monkeypatch.setattr(importer, "TelegramClient", Client)
+    monkeypatch.setattr(importer, "list_groups", list_groups)
+    for name in ("BOT_ID", "BOT_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("TG_API_ID", "1")
+    monkeypatch.setenv("TG_API_HASH", "x")
+    monkeypatch.setenv("ALLOWED_CHAT_IDS", "-1001")
+    monkeypatch.setattr("sys.argv", ["nestor.importer", "--list"])
+    asyncio.run(importer.main())
+    assert listed == [{-1001}]
+    monkeypatch.setattr("sys.argv", ["nestor.importer"])
+    with pytest.raises(SystemExit, match="missing BOT_ID"):        # an import still needs it, before connecting
+        asyncio.run(importer.main())
 
 
 def test_chat_dict_uses_bot_api_ids():

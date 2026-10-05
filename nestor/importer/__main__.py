@@ -151,7 +151,7 @@ async def main() -> None:
         api_id, api_hash = int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"]
     except KeyError as e:
         raise SystemExit(f"missing {e.args[0]}: get it at https://my.telegram.org → API development tools") from None
-    bot_id = bot_id_from(os.environ)
+    bot_id = None if args.list else bot_id_from(os.environ)     # --list imports nothing: no bot to tell apart
     allowed = _parse_ids(os.environ.get("ALLOWED_CHAT_IDS", ""))
 
     async with TelegramClient(args.session, api_id, api_hash) as client:
