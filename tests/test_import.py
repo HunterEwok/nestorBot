@@ -5,13 +5,13 @@ import pytest
 
 t = pytest.importorskip("telethon.tl.types")
 
-from nestor import forget, retention
+from nestor import forget, retention  # noqa: E402
 from nestor.collector.parse import parse_message  # noqa: E402
-from nestor.collector.store import Result
-from nestor.importer.__main__ import bot_id_from, import_history, import_ranges
+from nestor.collector.store import Result  # noqa: E402
+from nestor.importer.__main__ import bot_id_from, import_history, import_ranges  # noqa: E402
 from nestor.importer.convert import chat_dict, to_bot_api  # noqa: E402
 
-from .test_answerer import BOT_ID
+from .test_answerer import BOT_ID  # noqa: E402
 from .test_store import save  # noqa: E402
 
 CHANNEL = t.Channel(id=1000000001, title="Друзья", photo=t.ChatPhotoEmpty(), date=None, megagroup=True, forum=True)

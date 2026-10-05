@@ -401,10 +401,15 @@ async def test_what_changes_during_the_model_call_still_counts(make_env, pool, m
 
 
 def test_rules_are_quick():
+    # Every group message goes through the rules. A long ordinary one costs under a millisecond (these 2000 take
+    # about 1.5 s on a laptop), and a text made to make a rule backtrack no more than a few: one that does takes
+    # seconds. The limits leave room for a slower machine, such as CI's.
     started = time.monotonic()
     for _ in range(2000):
         guess("обычное длинное сообщение без эмоций " * 20)
+    assert time.monotonic() - started < 6
     for text in ("х" * 4000 + "ь", "ха" * 2000 + "ль", "ха " * 1300 + "ь"):
+        started = time.monotonic()
         guess(text)
-    assert time.monotonic() - started < 2
+        assert time.monotonic() - started < 0.5, text[:10]
     assert reactions.normalize("❤️") == "❤"
