@@ -212,7 +212,9 @@ def test_without_the_generic_bot_word(text, expected):
 @pytest.mark.parametrize("text", ["а ты уверен?", "а почему", "и что дальше", "можешь подробнее", "а на завтра",
                                   "а подробнее", "и про Цоя тоже", "откуда это известно?", "а, круто", "а вот оно что",
                                   "ахаха", "Маш, ты где?", "вот нарезка https://youtu.be/abc?si=xyz", "вчера нестор тупил",
-                                  "спасибо, а на завтра", "спасибо, но это не так", "спасибо! а ты откуда знаешь"])
+                                  "спасибо, а на завтра", "спасибо, но это не так", "спасибо! а ты откуда знаешь",
+                                  "спасибо, что ещё у них послушать", "спасибо, посоветуй ещё", "спасибо, сделай покороче",
+                                  "спасибо, давай подробнее", "спасибо! теперь про Наутилус"])
 def test_the_next_message_after_an_answer_is_for_the_model_whatever_it_says(text):
     assert verdict(text, window=True) == "candidate" and verdict(text) == "silent"
 
@@ -652,6 +654,23 @@ async def test_thanks_in_own_words_get_a_reaction(make_env, conn, text):
     assert len(checker.checks) == 1 and bot.reactions == [(1, ["❤"])] and llm.calls == [] and bot.sent == []
 
 
+@pytest.mark.parametrize("text", ["нестор посоветуй фильм на вечер, заранее спасибо",
+                                  "нестор спасибо, теперь переведи на английский",
+                                  "Спасибо, Нестор! Теперь переведи на английский",
+                                  "спасибо, нестор, посоветуй ещё что-нибудь похожее",
+                                  "переведи на английский, нестор, спасибо", "спасибо, нестор, давай подробнее",
+                                  "спасибо, нестор, что ещё послушать",
+                                  "спасибо, нестор, только там ошибка: это было в 2019"])
+async def test_a_thanks_with_a_request_in_own_words_is_answered_on_a_yes(make_env, conn, text):
+    """More words than those of a thanks may ask something: a yes is answered, not liked."""
+    checker = Checker(YES)
+    bot, llm, feed = make_env(news_llm=checker)
+    await address_on(conn)
+    await feed(say(222, 1, text))
+    assert len(checker.checks) == 1 and len(llm.calls) == 1 and bot.sent[-1]["reply_to"] == 1
+    assert (1, ["❤"]) not in bot.reactions
+
+
 async def test_the_name_at_the_start_under_a_friends_message_is_answered_on_a_yes(make_env, conn):
     checker = Checker(YES)
     bot, llm, feed = make_env(news_llm=checker)
@@ -742,7 +761,8 @@ async def test_an_answered_call_opens_the_window_again(make_env, conn):
     assert len(checker.checks) == 1 and len(llm.calls) == 3 and bot.sent[-1]["reply_to"] == 3
 
 
-@pytest.mark.parametrize("text", ["а на завтра", "и про Цоя тоже", "а подробнее"])
+@pytest.mark.parametrize("text", ["а на завтра", "и про Цоя тоже", "а подробнее", "спасибо, что ещё у них послушать",
+                                  "спасибо, давай подробнее", "спасибо! теперь про Наутилус"])
 async def test_a_follow_up_without_a_question_is_checked(make_env, conn, text):
     checker = Checker(YES)
     bot, llm, feed = make_env(news_llm=checker)
@@ -968,7 +988,11 @@ async def test_a_forget_me_after_the_check_still_drops_the_answer(make_env, conn
 @pytest.mark.parametrize("text, question", [("нестор вчера тупил", "вчера тупил"),
                                             ("нестор кто сегодня дежурит", "кто сегодня дежурит"),
                                             ("бот переведи это", "переведи это"),
-                                            ("бот опять всё перепутал", "опять всё перепутал")])
+                                            ("бот опять всё перепутал", "опять всё перепутал"),
+                                            ("нестор спасибо, теперь переведи на английский",
+                                             "спасибо, теперь переведи на английский"),
+                                            ("нестор посоветуй фильм на вечер, заранее спасибо",
+                                             "посоветуй фильм на вечер, заранее спасибо")])
 async def test_with_address_off_the_name_at_the_start_is_answered_as_always(make_env, conn, text, question):
     checker = Checker(NO)
     bot, llm, feed = make_env(news_llm=checker)
