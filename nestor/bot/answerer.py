@@ -2,7 +2,7 @@
 time (FR-14), conversation continuation (FR-15), scenarios SC-1..SC-6, audit log.
 
 Besides answers, the bot speaks on its own only when someone asked for it: reminders,
-the morning digest and the wisdom of the day (started by nestor.bot.scheduler), and the
+the group digest and the wisdom of the day (started by nestor.bot.scheduler), and the
 /export file in a private chat.
 """
 from __future__ import annotations
@@ -41,6 +41,18 @@ ANONYMOUS_ADMIN_ID = 1087968824  # GroupAnonymousBot: an admin posting as the gr
 STATUS_STALE_AFTER = timedelta(minutes=15)     # the watchdog runs every 5 minutes
 _OFF = ("off", "выкл", "0", "нет", "no")
 _ORDER = itertools.count()      # orders requests and /forget_me commands (Answerer._overtaken)
+_ON = ("on", "вкл", "да", "yes")
+_DIGEST_DAYS = re.compile(r"(\d+)(?:\s*(?:д|дн|день|дня|дней))?")       # /digest 30, /digest 7 дней
+
+# The group digest reads DIGEST_CHUNK messages per model call at most, what the digest of one day
+# always read. A period with more is cut by time into consecutive parts of at most that many: the
+# archive model writes short notes on each part, keeping the numbers of its key messages, and the
+# digest is written from the notes. Every call is its own row of bot_requests, so the daily token
+# limit counts them all. Beyond DIGEST_MAX_MESSAGES the period is thinned evenly over time
+# (context.period_sample): a digest costs at most 4 calls of notes and the final one, about the
+# tokens of 4 digests of one busy day.
+DIGEST_CHUNK = 500
+DIGEST_MAX_MESSAGES = 2000
 
 
 @dataclass(frozen=True)
@@ -59,6 +71,7 @@ class AnswerConfig:
     allowed_chat_ids: frozenset[int] = frozenset()   # scheduled posts go only to these chats
     wisdom_chat_ids: frozenset[int] = frozenset()    # wisdom of the day on by default; /wisdom on|off overrides
     digest_time: dtime = dtime(9, 0)
+    digest_every_days: int = 30         # DIGEST_EVERY_DAYS; a group's /digest N overrides
     wisdom_time: dtime = dtime(21, 0)
     news_chat_ids: frozenset[int] = frozenset()      # news digest on by default; /news on|off overrides
     news_time: dtime = dtime(20, 0)
@@ -265,18 +278,25 @@ class Answerer:
         await self._say(msg, text, save=False)
 
     async def _toggle(self, msg: dict, key: str, args: str) -> None:
-        """/digest, /wisdom, /news, /reactions on|off; without an argument shows the current state."""
+        """/digest, /wisdom, /news, /reactions on|off; without an argument shows the current state.
+        /digest N also sets the group's digest period, in days, and switches the digest on."""
         chat_id, arg = msg["chat"]["id"], args.strip().lower()
+        change = {key: arg not in _OFF} if arg else {}
+        if key == "digest" and arg:
+            change = _digest_change(arg)
+            if change is None:      # /digest 0, /digest 91, /digest abc: nothing changes
+                await self._say(msg, prompts.DIGEST_USAGE.format(max=daily.DIGEST_MAX_DAYS))
+                return
         async with self.pool.acquire() as conn:
-            if arg:
-                await conn.execute(
-                    "UPDATE chats SET settings = settings || jsonb_build_object($2::text, $3::bool) WHERE chat_id = $1",
-                    chat_id, key, arg not in _OFF)
+            if change:
+                await conn.execute("UPDATE chats SET settings = settings || $2::jsonb WHERE chat_id = $1",
+                                   chat_id, change)
             settings = await conn.fetchval("SELECT settings FROM chats WHERE chat_id = $1", chat_id) or {}
         if key == "digest":
-            on = bool(settings.get("digest", False))
-            text = prompts.DIGEST_STATE.format(state="включён" if on else "выключен",
-                                               time=self.cfg.digest_time.strftime("%H:%M"))
+            on, days = bool(settings.get("digest", False)), self._digest_days(settings)
+            state, when = "включён" if on else "выключен", self.cfg.digest_time.strftime("%H:%M")
+            text = (prompts.DIGEST_STATE.format(state=state, time=when) if days == 1
+                    else prompts.DIGEST_STATE_EVERY.format(state=state, every=daily.days_name(days), time=when))
         elif key == "news":
             on = self._news_on(chat_id, settings)
             text = prompts.NEWS_STATE.format(state="включена" if on else "выключена",
@@ -290,6 +310,11 @@ class Answerer:
             text = prompts.WISDOM_STATE.format(state="включена" if on else "выключена",
                                                time=self.cfg.wisdom_time.strftime("%H:%M"))
         await self._say(msg, text)
+
+    def _digest_days(self, settings: dict) -> int:
+        """The group's digest period (/digest N), else DIGEST_EVERY_DAYS."""
+        value = (settings or {}).get("digest_days")
+        return value if type(value) is int and 1 <= value <= daily.DIGEST_MAX_DAYS else self.cfg.digest_every_days
 
     def _wisdom_on(self, chat_id: int, settings: dict) -> bool:
         value = (settings or {}).get("wisdom")
@@ -1027,7 +1052,7 @@ class Answerer:
         system = prompts.SYSTEM.format(ticket=ticket, web_marker=prompts.WEB_MARKER)
         return [{"role": "system", "content": system}, *history, {"role": "user", "content": user}]
 
-    # ---- scheduled posts: the morning digest, the wisdom of the day, the evening news ----
+    # ---- scheduled posts: the group digest, the wisdom of the day, the evening news ----
 
     async def run_daily_posts(self, now: datetime | None = None) -> None:
         """Called by the scheduler every tick: queue today's posts that are due and not made yet."""
@@ -1039,7 +1064,8 @@ class Answerer:
             for chat in chats:
                 chat_id, settings = chat["chat_id"], chat["settings"] or {}
                 due = []
-                if settings.get("digest") and local.time() >= self.cfg.digest_time:
+                if (settings.get("digest") and local.time() >= self.cfg.digest_time
+                        and await daily.digest_due(conn, chat_id, local.date(), self._digest_days(settings))):
                     due.append("digest")
                 if self._wisdom_on(chat_id, settings) and local.time() >= self.cfg.wisdom_time:
                     due.append("wisdom")
@@ -1069,26 +1095,36 @@ class Answerer:
         return member.status not in ("left", "kicked")
 
     async def _digest(self, chat_id: int, day: date) -> tuple[str, dict]:
-        """Morning summary of the previous local day, by the archive model."""
+        """The group digest posted on `day`: what the chat talked about in the N local days before it
+        (/digest N, else DIGEST_EVERY_DAYS; with 1 the morning digest of yesterday), by the archive
+        model. One call when the messages fit in it, else notes on parts first (DIGEST_CHUNK)."""
         if not await self._bot_is_member(chat_id):
             return "skipped", {}
         tz = self.cfg.tz
-        yesterday = day - timedelta(days=1)
         async with self.pool.acquire() as conn:
             if await self._tokens_today(conn) >= self.cfg.daily_token_limit:
                 return "skipped", {}
+            chat = await conn.fetchrow("SELECT title, settings FROM chats WHERE chat_id = $1", chat_id) or {}
+            days = self._digest_days(chat.get("settings"))
+            since, until = daily.digest_bounds(day, days, tz)
             ids = await context.chat_lineage(conn, chat_id)
-            rows = await context.period_messages(conn, ids, None, datetime.combine(yesterday, dtime(0), tz), limit=500,
-                                                 until=datetime.combine(day, dtime(0), tz), humans_only=True)
-            title = await conn.fetchval("SELECT title FROM chats WHERE chat_id = $1", chat_id) or ""
+            rows = await context.period_sample(conn, ids, since, until, DIGEST_MAX_MESSAGES, humans_only=True)
         if len(rows) < 5:
             return "skipped", {}
+        request = f"Чат «{chat.get('title') or ''}», дайджест за {daily.digest_period(day, days)}."
+        if len(rows) <= DIGEST_CHUNK:
+            data = context.render(rows, tz, title="сообщения за вчера" if days == 1 else "сообщения за эти дни")
+        else:
+            noted = await self._digest_notes(chat_id, request, rows)
+            if noted is None:
+                return "skipped", {}
+            rows, notes = noted         # the messages read now: a /forget_me meanwhile took some out
+            data = prompts.DIGEST_NOTES_INTRO + "\n\n" + notes
         started = time.monotonic()
-        prompt = [{"role": "system", "content": prompts.DIGEST_SYSTEM},
-                  {"role": "user", "content": f"Чат «{title}», дайджест за {daily.day_name(yesterday)}.\n\n"
-                                              + context.render(rows, tz, title="сообщения за вчера")}]
+        prompt = [{"role": "system", "content": prompts.DIGEST_SYSTEM if days == 1 else prompts.DIGEST_PERIOD_SYSTEM},
+                  {"role": "user", "content": f"{request}\n\n{data}"}]
         completion = await asyncio.wait_for(self.router.llm("digest").complete(prompt), self._timeout("digest"))
-        text = prompts.DIGEST_HEADER.format(date=daily.day_name(yesterday)) + "\n\n" + completion.text
+        text = daily.digest_header(day, days) + "\n\n" + completion.text
         # Always one message, cut if the model overran its length limit: a post is then either
         # delivered whole or retried whole, never left half-sent.
         refs, authors, oldest = await self._refs(chat_id, completion.text,
@@ -1107,6 +1143,39 @@ class Answerer:
         if sent is None:
             return "failed", {}
         return "posted", {"message_id": sent.message_id}
+
+    async def _digest_notes(self, chat_id: int, request: str, rows: list) -> tuple[list, str] | None:
+        """Notes by the archive model on consecutive parts of the period, at most DIGEST_CHUNK messages
+        each: the messages they were written from and the notes, a block per part. Each part is read
+        again right before its call, so the words of whoever used /forget_me meanwhile stay out. None
+        when the daily token limit is reached between the calls (the notes made so far stay counted),
+        or when nothing is left to retell."""
+        tz, n = self.cfg.tz, len(rows)
+        count = -(-n // DIGEST_CHUNK)
+        used, blocks = [], []
+        for i in range(count):
+            async with self.pool.acquire() as conn:
+                if await self._tokens_today(conn) >= self.cfg.daily_token_limit:
+                    return None
+                part = await context.reread(conn, rows[i * n // count:(i + 1) * n // count])
+            if not part:
+                continue
+            span = daily.span_name(part[0]["sent_at"].astimezone(tz).date(), part[-1]["sent_at"].astimezone(tz).date())
+            started = time.monotonic()
+            prompt = [{"role": "system", "content": prompts.DIGEST_NOTES_SYSTEM},
+                      {"role": "user", "content": f"{request} Часть {i + 1} из {count}, {span}.\n\n"
+                                                  + context.render(part, tz, title="сообщения")}]
+            notes = await asyncio.wait_for(self.router.llm("digest").complete(prompt), self._timeout("digest"))
+            async with self.pool.acquire() as conn:     # without the text: the digest made of it is what stays
+                await self._log_scheduled(conn, chat_id, "digest_notes", notes, [], started, keep_text=False,
+                                          oldest_source_at=_oldest(r["stored_at"] for r in part))
+            used += part
+            title = f"заметки, часть {i + 1} из {count}, {span}"
+            blocks.append(f"<{title}>\n{notes.text or '(заметок нет)'}\n</{title}>")
+        async with self.pool.acquire() as conn:
+            if not used or await self._tokens_today(conn) >= self.cfg.daily_token_limit:
+                return None
+        return used, "\n\n".join(blocks)
 
     async def _wisdom(self, chat_id: int, day: date) -> tuple[str, dict]:
         """A real quote for today's themes. The archive model picks themes from a fixed list;
@@ -1213,17 +1282,18 @@ class Answerer:
     async def _log_scheduled(self, conn, chat_id: int, scenario: str, completion: Completion,
                              sent: list[Message | None], started: float, status: str = "ok",
                              quoted_user_ids: list[int] | None = None,
-                             oldest_source_at: datetime | None = None) -> int:
-        """Scheduled posts have no asker; their tokens still count toward the daily limit."""
+                             oldest_source_at: datetime | None = None, keep_text: bool = True) -> int:
+        """Scheduled posts have no asker; their tokens still count toward the daily limit.
+        keep_text=False logs a call without its text (the digest's notes)."""
         return await conn.fetchval(
             """INSERT INTO bot_requests (chat_id, scenario, answer, model, input_tokens, output_tokens,
                                          latency_ms, status, answer_msg_ids, profile, quoted_user_ids,
                                          oldest_source_at)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                        least(now(), coalesce($12::timestamptz, now()))) RETURNING id""",
-            chat_id, scenario, completion.text, completion.model, completion.input_tokens, completion.output_tokens,
-            int((time.monotonic() - started) * 1000), status, [m.message_id for m in sent if m is not None],
-            completion.profile, quoted_user_ids, oldest_source_at)
+            chat_id, scenario, completion.text if keep_text else None, completion.model, completion.input_tokens,
+            completion.output_tokens, int((time.monotonic() - started) * 1000), status,
+            [m.message_id for m in sent if m is not None], completion.profile, quoted_user_ids, oldest_source_at)
 
     # ---- Telegram side ----
 
@@ -1322,6 +1392,16 @@ def _quoted(refs: dict[int, markup.Ref] | None, more: Collection[int] = ()) -> l
     users = sorted({r.user_id for r in (refs or {}).values() if r.user_id is not None}
                    | {u for u in more if u is not None})
     return users or None
+
+
+def _digest_change(arg: str) -> dict | None:
+    """What /digest's argument changes in the chat's settings; None if it is not one."""
+    if m := _DIGEST_DAYS.fullmatch(arg):
+        days = int(m.group(1))
+        return {"digest": True, "digest_days": days} if 1 <= days <= daily.DIGEST_MAX_DAYS else None
+    if arg in _OFF or arg in _ON:
+        return {"digest": arg in _ON}
+    return None
 
 
 def _numbered(text: str, n: int) -> list[str | None]:

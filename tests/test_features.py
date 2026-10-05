@@ -464,9 +464,10 @@ async def test_song_without_internet(make_env):
 
 
 # ---- the digest and the wisdom of the day ----
+# These are the digest of one day (DIGEST_EVERY_DAYS=1), as it always was; longer periods: test_digest.py.
 
 async def test_digest_is_switched_on_by_an_admin_and_posted_once(make_env, conn):
-    bot, llm, feed = make_env(FakeLLM("• отпуск: решили ехать в Грецию"), admins={111})
+    bot, llm, feed = make_env(FakeLLM("• отпуск: решили ехать в Грецию"), admins={111}, digest_every_days=1)
     await feed(update("message", message(1, "/digest on", uid=222)))
     assert bot.sent[-1]["text"] == prompts.ADMINS_ONLY
     await feed(update("message", message(2, "/digest on")))
@@ -496,7 +497,7 @@ async def test_digest_is_switched_on_by_an_admin_and_posted_once(make_env, conn)
 
 
 async def test_long_digest_is_one_message_and_a_failed_send_is_retried(make_env, conn):
-    bot, llm, feed = make_env(FakeLLM("• тема: " + "очень длинно " * 600))
+    bot, llm, feed = make_env(FakeLLM("• тема: " + "очень длинно " * 600), digest_every_days=1)
     yesterday = int(local(-1, 12).timestamp())
     for i in range(10, 16):
         await feed(update("message", message(i, f"обсуждаем отпуск {i}", uid=200 + i, date=yesterday + i)))
@@ -639,7 +640,7 @@ async def _aged(conn, message_id: int, days: int):
 
 
 async def test_the_digest_leaves_with_the_oldest_of_yesterdays_messages(make_env, conn):
-    bot, _, feed = make_env(FakeLLM("• отпуск: решили ехать в Грецию"))
+    bot, _, feed = make_env(FakeLLM("• отпуск: решили ехать в Грецию"), digest_every_days=1)
     yesterday = int(local(-1, 12).timestamp())
     for i in range(10, 16):
         await feed(update("message", message(i, f"обсуждаем отпуск {i}", uid=200 + i, date=yesterday + i)))
@@ -666,7 +667,7 @@ async def test_stats_leaves_with_the_oldest_message_of_the_branches_it_showed_th
 
 
 async def test_the_digest_that_may_erase_waits_for_a_purge_batch_in_flight(make_env, pool, conn):
-    bot, _, feed = make_env(FakeLLM("• отпуск: [«обсуждаем отпуск 10»](#10)"))
+    bot, _, feed = make_env(FakeLLM("• отпуск: [«обсуждаем отпуск 10»](#10)"), digest_every_days=1)
     yesterday = int(local(-1, 12).timestamp())
     for i in range(10, 16):
         await feed(update("message", message(i, f"обсуждаем отпуск {i}", uid=200 + i, date=yesterday + i)))

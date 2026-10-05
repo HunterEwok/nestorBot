@@ -41,6 +41,8 @@ class Settings:
     wisdom_chat_ids: frozenset[int] = frozenset()
     wisdom_time: time = time(21, 0)
     digest_time: time = time(9, 0)      # the digest itself is switched on by group admins: /digest on
+    # The digest comes once every this many days and retells them; /digest N sets a group's own period.
+    digest_every_days: int = 30
     # Groups with the evening news digest; group admins can switch it with /news on|off.
     news_chat_ids: frozenset[int] = frozenset()
     news_time: time = time(20, 0)
@@ -162,6 +164,15 @@ def _channels() -> tuple[str, ...]:
         raise SystemExit(f"NEWS_TELEGRAM_CHANNELS: {e}") from None
 
 
+def _digest_every_days() -> int:
+    from .bot.daily import DIGEST_MAX_DAYS
+
+    value = _int("DIGEST_EVERY_DAYS", 30)
+    if not 1 <= value <= DIGEST_MAX_DAYS:
+        raise SystemExit(f"DIGEST_EVERY_DAYS must be a number of days from 1 to {DIGEST_MAX_DAYS}, got {value}")
+    return value
+
+
 def _player_app() -> str:
     value = _env("MUSIC_PLAYER_APP")
     if value and not re.fullmatch(r"[A-Za-z0-9_]{3,30}", value):
@@ -194,6 +205,7 @@ def load_settings() -> Settings:
             wisdom_chat_ids=_parse_ids(_env("WISDOM_CHAT_IDS")),
             wisdom_time=_parse_time("WISDOM_TIME", "21:00"),
             digest_time=_parse_time("DIGEST_TIME", "09:00"),
+            digest_every_days=_digest_every_days(),
             news_chat_ids=_parse_ids(_env("NEWS_CHAT_IDS")),
             news_time=_parse_time("NEWS_TIME", "20:00"),
             news_max_topics=_int("NEWS_MAX_TOPICS", 10),

@@ -20,7 +20,8 @@ from .test_watchdog_checks import AlertBot
 DEAD_DB = "postgresql://nestor:x@127.0.0.1:1/nestor"
 
 NAMES = ("ALLOWED_CHAT_IDS", "MODEL_ROUTES", "MUSIC_DAILY_LIMIT", "MUSIC_PLAYER_APP", "NEWS_CHAT_IDS", "NEWS_TIME",
-         "NEWS_MAX_TOPICS", "NEWS_CONTACT_EMAIL", "NEWS_TELEGRAM_CHANNELS", "WISDOM_TIME", "DIGEST_TIME", "TIMEZONE",
+         "NEWS_MAX_TOPICS", "NEWS_CONTACT_EMAIL", "NEWS_TELEGRAM_CHANNELS", "WISDOM_TIME", "DIGEST_TIME",
+         "DIGEST_EVERY_DAYS", "TIMEZONE",
          "RETENTION_TIME", "ALERT_CHAT_ID", "ALERT_DAILY_AT", "ALERT_QUIET", "ALERT_DISK_MIN_GB", "ALERT_MAX_MEMBERS",
          "BACKUP_STATUS_FILE")
 
@@ -61,6 +62,23 @@ def test_defaults_and_bad_values(env):
     env.setenv("MODEL_ROUTES", "theses:web")
     with pytest.raises(SystemExit, match="MODEL_ROUTES"):
         config.load_settings()
+
+
+def test_digest_every_days(env):
+    # Ewok's choice: once a month. .env.example says the same.
+    assert config.load_settings().digest_every_days == 30
+    assert dotenv_values(Path(__file__).parent.parent / ".env.example")["DIGEST_EVERY_DAYS"] == "30"
+    env.setenv("DIGEST_EVERY_DAYS", "7   # раз в неделю")
+    assert config.load_settings().digest_every_days == 7
+    env.setenv("DIGEST_EVERY_DAYS", "1")
+    assert config.load_settings().digest_every_days == 1
+    for bad, message in (("0", "DIGEST_EVERY_DAYS must be a number of days from 1 to 90, got 0"),
+                         ("91", "from 1 to 90, got 91"), ("-7", "from 1 to 90, got -7"),
+                         ("месяц", "DIGEST_EVERY_DAYS must be a whole number, got 'месяц'"),
+                         ("1.5", "DIGEST_EVERY_DAYS must be a whole number")):
+        env.setenv("DIGEST_EVERY_DAYS", bad)
+        with pytest.raises(SystemExit, match=message):
+            config.load_settings()
 
 
 def test_retention_time_and_timezone_validation(env):

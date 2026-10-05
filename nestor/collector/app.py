@@ -224,6 +224,7 @@ async def make_answerer(settings: Settings, bot: Bot, pool: asyncpg.Pool, collec
                        music_daily_limit=settings.music_daily_limit,
                        music_player_app=settings.music_player_app, allowed_chat_ids=settings.allowed_chat_ids,
                        wisdom_chat_ids=settings.wisdom_chat_ids, digest_time=settings.digest_time,
+                       digest_every_days=settings.digest_every_days,
                        wisdom_time=settings.wisdom_time, news_chat_ids=settings.news_chat_ids,
                        news_time=settings.news_time, news_max_topics=settings.news_max_topics,
                        reaction_chat_ids=settings.reaction_chat_ids, alert_chat_id=alert_chat_id)

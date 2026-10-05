@@ -102,6 +102,40 @@ async def period_messages(conn, chat_ids: list[int], thread_id: int | None, sinc
     return rows[::-1]
 
 
+async def period_sample(conn, chat_ids: list[int], since: datetime, until: datetime, limit: int, *,
+                        humans_only: bool = False) -> list[asyncpg.Record]:
+    """The messages of [since, until), oldest first: all of them, or `limit` of them spread evenly
+    when there are more. Of n messages in time order the i-th is kept when i * limit / n reaches a
+    new whole number, so every stretch of the period keeps the same share of its messages: a busy
+    week keeps more than a quiet one, as it was. humans_only: without bots."""
+    return list(await conn.fetch(
+        f"""WITH period AS (
+                SELECT m.chat_id, m.message_id, (row_number() OVER (ORDER BY m.sent_at, m.message_id)) - 1 AS i,
+                       count(*) OVER () AS n
+                {_FROM}
+                WHERE m.chat_id = ANY($1::bigint[]) AND {_VISIBLE} AND m.sent_at >= $2 AND m.sent_at < $3
+                  AND (NOT $5::bool OR u.user_id IS NULL OR NOT u.is_bot)),
+            kept AS (
+                SELECT chat_id, message_id, i FROM period
+                WHERE n <= $4 OR i = 0 OR i * $4 / n > (i - 1) * $4 / n)
+            SELECT {_COLUMNS} {_FROM} JOIN kept k ON m.chat_id = k.chat_id AND m.message_id = k.message_id
+            ORDER BY k.i""",
+        chat_ids, since, until, limit, humans_only,
+    ))
+
+
+async def reread(conn, rows) -> list[asyncpg.Record]:
+    """The same messages read again, oldest first: those deleted since, or whose author used
+    /forget_me since, are gone, and forwards of their words come back blank."""
+    return list(await conn.fetch(
+        f"""SELECT {_COLUMNS} {_FROM}
+            JOIN unnest($1::bigint[], $2::bigint[]) AS k(chat_id, message_id)
+              ON m.chat_id = k.chat_id AND m.message_id = k.message_id
+            WHERE {_VISIBLE} ORDER BY m.sent_at, m.message_id""",
+        [r["chat_id"] for r in rows], [r["message_id"] for r in rows],
+    ))
+
+
 async def last_message_at(conn, chat_ids: list[int], thread_id: int | None, user_id: int, *,
                           before: datetime, exclude_id: int) -> datetime | None:
     """When the user last wrote here before the current message (for «что я пропустил»)."""
