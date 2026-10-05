@@ -255,6 +255,18 @@ async def test_old_deleted_and_forgotten_messages_get_nothing(make_env, conn):
     assert model.calls == [] and bot.reactions == []
 
 
+async def test_without_the_model_the_sure_guess_is_on_the_words_as_they_are_now(make_env, conn):
+    bot, llm, feed = make_env(reaction_chat_ids=frozenset({CHAT_ID}), reactions=FAST)
+    reactor = feed.answerer.reactor
+    for mid, edited in ((1, "жаль, конечно"), (2, "С днём рождения, Вася!")):
+        msg = message(mid, "ахахах", uid=222, date=NOW())
+        await feed.answerer.save_outgoing(msg)
+        await conn.execute("UPDATE messages SET text = $1, edited_at = now() WHERE message_id = $2", edited, mid)
+        assert reactor.consider(msg)                  # queued by the words that came
+        await reactor.drain()
+    assert bot.reactions == [(2, ["🎉"])] and llm.calls == []
+
+
 async def test_reactions_are_off_by_default_and_switched_by_admins(make_env):
     bot, llm, feed = make_env(admins={111}, reactions=FAST)
     await feed(update("message", message(1, "ахахах", uid=222, date=NOW())))
@@ -362,6 +374,7 @@ async def test_failed_model_calls_count_toward_the_day(make_env, conn):
     "UPDATE chats SET enabled = FALSE",                                      # /pause
     "UPDATE chats SET settings = settings || '{\"reactions\": false}'",       # /reactions off
     "UPDATE users SET opted_out = TRUE WHERE user_id = 222",                 # the author's /forget_me
+    "UPDATE messages SET text = 'жаль, конечно', edited_at = now() WHERE message_id = 1",   # edited
 ])
 async def test_what_changes_during_the_model_call_still_counts(make_env, pool, meanwhile):
     class Slow(FakeLLM):

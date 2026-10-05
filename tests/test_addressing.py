@@ -979,6 +979,23 @@ async def test_a_candidate_edited_before_its_check_is_not_asked(make_env, conn):
     assert [s["reply_to"] for s in bot.sent] == [1]
 
 
+async def test_a_candidate_edited_during_its_check_gets_no_reaction_on_its_old_words(make_env, pool, conn):
+    class Editing(Checker):
+        async def complete(self, messages):
+            if messages[0]["content"] == prompts.ADDRESS_SYSTEM:
+                async with pool.acquire() as c:
+                    await c.execute("UPDATE messages SET text = 'ой, это я не тебе', edited_at = now() "
+                                    "WHERE message_id = 1")
+            return await super().complete(messages)
+
+    # The reactions' model fails: only the code's sure guesses («ахахах» is one) are put.
+    bot, _, feed = make_env(FakeLLM(fail=True), news_llm=Editing(YES), routes={"react": "group"},
+                            reaction_chat_ids=frozenset({CHAT_ID}), reactions=ReactionConfig(delay_s=0))
+    await address_on(conn)
+    await feed(say(222, 1, "ахахах, Нестор, ты видел?"))
+    assert bot.sent == [] and bot.reactions == []
+
+
 async def test_the_authors_forget_me_during_the_check_drops_the_answer(make_env, conn):
     class Forgetting(Checker):
         async def complete(self, messages):
