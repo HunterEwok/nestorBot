@@ -1,5 +1,6 @@
 """Stage 4 watchdog, the alert engine: when a problem is said, said again, resolved; events; one message
 per run, the hourly cap, the outbox; quiet hours and the mute; the state on the card."""
+import copy
 import json
 import logging
 from datetime import date, datetime, time, timedelta
@@ -7,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 from nestor.bot import prompts
 from nestor.watchdog import alerts
+from nestor.watchdog import run as run_mod
 from nestor.watchdog.checks import Event, Finding, result, unknown
 
 MSK = ZoneInfo("Europe/Moscow")
@@ -189,6 +191,44 @@ def test_quiet_hours_silent_except_old_crit():
     assert alerts.in_quiet(time(13), (time(12), time(14))) and not alerts.in_quiet(time(23), (time(12), time(14)))
 
 
+def test_a_warning_that_turns_critical_at_night_rings_an_hour_later():
+    evening = datetime(2026, 10, 5, 22, 0, tzinfo=MSK)
+    state = alerts.AlertState()
+
+    def disk(level):
+        return result("disk", [Finding("disk.low:/", level, f"Мало места ({level})")])
+
+    assert not run(state, disk("warn"), when=evening).silent           # rang as a warning before the quiet hours
+    out = run(state, disk("crit"), when=at(120, evening))               # midnight: worse, said without sound
+    assert out.silent and out.text.endswith("🔴 Мало места (crit)")
+    minutes = range(125, 600, 5)
+    outs = [run(state, disk("crit"), when=at(m, evening)) for m in minutes]
+    assert [(m, o.silent) for m, o in zip(minutes, outs, strict=True) if o is not None] == [(180, False)]
+    # An adopted crit that rang as a crit stays quiet.
+    snap = alerts.snapshot(state, at(600, evening))
+    adopted = alerts.adopt(alerts.AlertState(), snap)
+    assert adopted.problems["disk.low:/"].rung and adopted.problems["disk.low:/"].crit_since == at(120, evening)
+    assert run(adopted, disk("crit"), when=at(605, evening)) is None
+
+
+def test_muted_events_and_old_crits_make_no_sound(tmp_path):
+    night = datetime(2026, 10, 5, 23, 30, tzinfo=MSK)
+    state = alerts.AlertState()
+    crit = result("collector", [Finding("collector.down", "crit", "Сборщик не работает")])
+    assert run(state, crit, when=night).silent
+    state.mute_until = at(240, night)                                   # works on the router tonight
+    assert run(state, crit, when=at(65, night)) is None and not state.problems["collector.down"].rung
+    restarted = Event("collector.restarts", "Сборщик сам перезапускался {count} раз")
+    noon = datetime(2026, 10, 6, 12, 0, tzinfo=MSK)
+    state = alerts.AlertState(mute_until=at(60, noon))
+    out = run(state, result("collector", events=[restarted]), when=noon)
+    assert "перезапускался 1 раз" in out.text and out.silent           # by day, but muted
+    # --mute 60 from the command line: kept in the state, 0 ends it.
+    assert run_mod.mute(tmp_path, 60, noon) == at(60, noon)
+    assert alerts.load_state(tmp_path / run_mod.STATE_FILE).mute_until == at(60, noon)
+    assert run_mod.mute(tmp_path, 0, noon) is None and alerts.load_state(tmp_path / run_mod.STATE_FILE).mute_until is None
+
+
 def test_mute_holds_then_sends_open_problems():
     state = alerts.AlertState()
     old = Finding("disk.low:/", "warn", "Мало места")
@@ -225,19 +265,28 @@ def test_corrupt_state_starts_fresh(tmp_path, caplog):
     assert alerts.load_state(tmp_path / "missing.json") == alerts.AlertState()
 
 
-def test_a_lost_state_takes_what_the_snapshot_says_was_announced():
-    # The card went read-only: the state of the last runs is not on it, the snapshot in the database is.
-    state = alerts.AlertState()
-    run(state, result("sd", [Finding("sd.write", "crit", "Не могу записать на карту Pi")]), when=at(0))
-    snap = alerts.snapshot(state, at(0))
-    lost = alerts.AlertState()
-    alerts.adopt(lost, snap)
-    assert run(lost, result("sd", [Finding("sd.write", "crit", "Не могу записать на карту Pi")]), when=at(5)) is None
+def test_a_lost_state_takes_the_one_published_with_the_snapshot():
+    # The card went read-only: it keeps the state of an hour ago, the snapshot in the database is newer.
+    stale = alerts.AlertState()
+    run(stale, result("disk", [Finding("disk.low:/", "warn", "Мало места")]), when=at(-60))
+    stale.saved_at = at(-60)
+    state = copy.deepcopy(stale)                                        # the runs since, which could not save
+    sd = Finding("sd.write", "crit", "Не могу записать на карту Pi")
+    restarted = Event("collector.restarts", "Сборщик сам перезапускался {count} раз")
+    run(state, result("sd", [sd]), result("disk"), result("collector", events=[restarted]), when=at(0))
+    state.last_daily, state.baselines = date(2026, 10, 5), {"collector_restarts": 3}
+    snap = json.loads(json.dumps(alerts.snapshot(state, at(0))))        # as the database gives it back
+    lost = alerts.adopt(stale, snap)
+    assert lost.saved_at == at(0) and lost.last_daily == date(2026, 10, 5) and lost.sent_times == [at(0)]
+    assert lost.baselines == {"collector_restarts": 3} and set(lost.events) == {"collector.restarts"}
+    # Nothing is said again: not the problem, not that the disk is fine, not the event.
+    assert run(lost, result("sd", [sd]), result("disk"), result("collector"), when=at(5)) is None
     assert "Запись на карту Pi: снова в порядке" in run(lost, result("sd"), when=at(10)).text
-    # A state saved after that snapshot knows better.
+    # A state saved after that snapshot knows better; a snapshot without a readable one changes nothing.
     newer = alerts.AlertState(saved_at=at(1))
-    alerts.adopt(newer, snap)
-    assert newer.problems == {}
+    assert alerts.adopt(newer, snap) is newer and newer.problems == {}
+    for unusable in ({**snap, "state": {"version": 99}}, {k: v for k, v in snap.items() if k != "state"}, None):
+        assert alerts.adopt(stale, unusable) is stale
 
 
 def test_daily_summary_once_per_local_day_silent():

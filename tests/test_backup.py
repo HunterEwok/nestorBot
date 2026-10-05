@@ -43,6 +43,12 @@ NIGHT = datetime(2026, 10, 5, 4, 30, 5, tzinfo=MSK)        # a Monday: the 04:30
 CANARY = "CANARY-7f3a секретный текст"
 
 
+@pytest.fixture(autouse=True)
+def no_timesync_flag(monkeypatch):
+    """Tools(synced=...) alone says whether the clock is synced, whatever this machine's timesyncd says."""
+    monkeypatch.setattr(bk, "TIMESYNC_FLAG", Path("/nonexistent/timesync/synchronized"))
+
+
 def utc(day: int, hour: int = 1, minute: int = 30, month: int = 10) -> datetime:
     return datetime(2026, month, day, hour, minute, tzinfo=UTC)
 
@@ -96,9 +102,8 @@ def test_a_year_of_nights_keeps_at_most_11_and_forgets_within_29_days(outages):
     first = utc(1, month=1)
     for n in range(400):
         now = first + timedelta(days=n)
-        if n in down:
-            continue                                  # no new dump, no rotation: nothing is deleted
-        taken = sorted(bk.plan_rotation([*taken, now], now))
+        # A night without a new dump still rotates: what expired goes, the newest two stay.
+        taken = sorted(bk.plan_rotation(taken if n in down else [*taken, now], now))
         assert len(taken) <= 11
         assert now - taken[0] <= timedelta(days=BACKUP_MAX_AGE_DAYS)
         if not outages and n >= 40:
@@ -488,6 +493,13 @@ def test_running_status_carries_the_last_verdict_so_a_retry_does_not_flap(tmp_pa
     assert (during["last_ok_at"], during["last_ok_file"], during["last_ok_size"]) == (
         first["last_ok_at"], first["last_ok_file"], first["last_ok_size"])
     assert status_of(cfg)["running"] is False and status_of(cfg)["ok"] is True
+    # The warnings of the last run stay while the next one runs, and go with its verdict.
+    shrank = bk.backup(cfg, NIGHT + timedelta(days=2), run=Tools(size=100))
+    seen = Tools(size=100)
+    done = bk.backup(cfg, NIGHT + timedelta(days=3), run=seen)
+    during = seen.statuses[0]
+    assert (during["running"], during["warnings"], during["shrank_pct"]) == (True, shrank["warnings"], 90)
+    assert shrank["warnings"] == ["shrank"] and done["warnings"] == [] and "shrank_pct" not in done
 
 
 def test_a_failed_night_keeps_the_old_dumps_and_counts_distinct_days(tmp_path):
@@ -558,6 +570,79 @@ def test_low_space_skips_the_dump(tmp_path):
     failed = bk.backup(cfg, NIGHT, run=tools)
     assert (failed["error"], failed["ok"], tools.dumps, failed["attempts"]) == ("low_space", False, 0, 0)
     assert list(cfg.dumps_dir.iterdir()) == [] and not cfg.error_file.exists()
+
+
+def _free(monkeypatch, free) -> None:
+    """The card's free bytes as `free(dumps_dir)` says."""
+    monkeypatch.setattr(bk.shutil, "disk_usage", lambda path: SimpleNamespace(total=64 << 30, used=0, free=free(path)))
+
+
+def _last_dump(cfg: bk.BackupConfig, size: int) -> None:
+    cfg.state_dir.mkdir(parents=True, exist_ok=True)
+    bk.write_status(cfg.status_file, {"version": 1, "ok": True, "last_ok_size": size})
+
+
+def test_the_space_needed_is_twice_the_last_dump_on_top(tmp_path, monkeypatch):
+    cfg, tools = cfg_in(tmp_path), Tools()
+    _last_dump(cfg, 900 * bk.MIB)
+    _free(monkeypatch, lambda path: 1200 * bk.MIB)                    # a 900 MB dump, 1.2 GB free
+    failed = bk.backup(cfg, NIGHT, run=tools, force=True)
+    assert (failed["error"], failed["ok"], tools.dumps, failed["attempts"]) == ("low_space", False, 0, 0)
+    _free(monkeypatch, lambda path: (2 * 900 + 1) * bk.MIB)           # min_free_mb=1 on top of twice that
+    assert bk.backup(cfg, NIGHT, run=tools, force=True)["ok"] and tools.dumps == 1
+
+
+def test_a_full_card_lets_the_expired_copies_go_before_it_checks_the_space(tmp_path, monkeypatch):
+    cfg = cfg_in(tmp_path)
+    old_dumps(cfg, nights(11, utc(20, month=8)))                       # all far older than 35 days
+    _last_dump(cfg, 10 * bk.MIB)
+    _free(monkeypatch, lambda path: (120 - 10 * len(bk.list_dumps(path))) * bk.MIB)
+    # 11 copies leave 10 MB, 21 are needed: without the old copies gone the card stays full every night.
+    tools = Tools()
+    done = bk.backup(cfg, NIGHT, run=tools)
+    assert (done["ok"], tools.dumps, done["deleted"], done["kept"], done["rotated"]) == (True, 1, 10, 2, True)
+    # Still short of space: the run fails, and what expired goes all the same.
+    old_dumps(cfg, nights(9, utc(11, month=8)))
+    _free(monkeypatch, lambda path: 0)
+    tools = Tools()
+    failed = bk.backup(cfg, NIGHT + timedelta(days=1), run=tools)
+    assert (failed["error"], tools.dumps, failed["deleted"], failed["kept"], failed["rotated"]) == (
+        "low_space", 0, 9, 2, True)
+
+
+def test_failed_nights_let_expired_copies_go_and_keep_the_last_two_good_ones(tmp_path):
+    cfg = cfg_in(tmp_path, attempts=1)
+    first = NIGHT - timedelta(days=70)
+    for n in range(30):
+        assert bk.backup(cfg, first + timedelta(days=n), run=Tools())["ok"]
+    good = [at for at, _ in bk.list_dumps(cfg.dumps_dir)]
+    assert len(good) == 11
+    down = "pg_dump: error: connection to server at \"192.168.0.1\", port 5432 failed: Connection refused"
+    deleted = 0
+    for n in range(30, 70):                                            # 40 nights, the 04:30 run and the 13:30 one
+        for hours in (0, 9):
+            now = first + timedelta(days=n, hours=hours)
+            status = bk.backup(cfg, now, run=Tools(down))
+            assert (status["ok"], status["error"], status["rotated"]) == (False, "unreachable", True)
+            deleted += status["deleted"]
+            kept = [at for at, _ in bk.list_dumps(cfg.dumps_dir)]
+            expired = [at for at in kept if now - at > timedelta(days=BACKUP_MAX_AGE_DAYS)]
+            assert set(expired) <= set(good[-2:]) and kept[-2:] == good[-2:], n
+    assert [at for at, _ in bk.list_dumps(cfg.dumps_dir)] == good[-2:] and deleted == 9
+    assert (status["kept"], status["failed_nights"], status["last_ok_file"]) == (2, 40, bk.dump_name(good[-1]))
+
+
+def test_a_failed_run_deletes_nothing_by_a_clock_it_cannot_trust(tmp_path):
+    cfg = cfg_in(tmp_path)
+    old_dumps(cfg, nights(30, utc(20, month=8)))
+    auth = "FATAL:  password authentication failed for user \"nestor_backup\""
+    unsynced = bk.backup(cfg, NIGHT, run=Tools(auth, synced=False))
+    assert (unsynced["error"], unsynced["warnings"], unsynced["rotated"], unsynced["deleted"], unsynced["kept"]) == (
+        "auth_failed", ["clock_unsynced"], False, 0, 30)
+    old_dumps(cfg, [NIGHT.astimezone(UTC) + timedelta(days=2)])          # a dump from the future
+    backward = bk.backup(cfg, NIGHT + timedelta(days=1), run=Tools(auth))
+    assert (backward["warnings"], backward["rotated"], backward["deleted"], backward["kept"]) == (
+        ["clock_backwards"], False, 0, 31)
 
 
 def test_a_dying_card_is_named_without_its_path(tmp_path):
@@ -654,13 +739,16 @@ def test_a_second_run_while_the_first_holds_the_lock_exits_75(tmp_path, monkeypa
 
 # --- what a failed tool printed goes to one file --------------------------------------------------------------
 
-def _script_bin(tmp_path: Path, stderr: str) -> Path:
-    """pg_dump and pg_restore that fail the way a real one does, with `stderr` on the way."""
+def _script_bin(tmp_path: Path, stderr: str, record: Path | None = None) -> Path:
+    """pg_dump and pg_restore that fail the way a real one does, with `stderr` on the way; with `record`, they
+    first write their arguments and whether PGPASSWORD was set into that file."""
     bindir = tmp_path / "script-bin"
-    bindir.mkdir()
+    bindir.mkdir(parents=True)
+    spy = f'printf "%s\\n" "$@" "PGPASSWORD=${{PGPASSWORD-unset}}" > "{record}"' if record else ""
     for tool in ("pg_dump", "pg_restore"):
         (bindir / tool).write_text(f"""#!/bin/sh
 if [ "$1" = "--version" ]; then echo "pg_dump (PostgreSQL) 18.6 (Debian 18.6-1.pgdg130+1)"; exit 0; fi
+{spy}
 cat >&2 <<'END_OF_STDERR'
 {stderr}
 END_OF_STDERR
@@ -1130,6 +1218,26 @@ async def test_pg_restore_stderr_canary_not_printed(conn, cfg, fresh, restore_en
     out, err = capfd.readouterr()
     assert code == 1 and out == "restore failed permission_denied (3 lines of stderr)\n"
     assert "CANARY" not in out + err + caplog.text + repr([r.__dict__ for r in caplog.records])
+
+
+async def test_restore_gives_pg_restore_the_password_in_its_environment_only(fresh, restore_env, database, tmp_path,
+                                                                             monkeypatch):
+    # Arguments are in /proc/<pid>/cmdline and in ps for every user of the Pi; the environment is not.
+    url = urlsplit(database["collector"])
+    password = url.password
+    empty = tmp_path / "empty.dump"
+    empty.write_bytes(b"")
+    for n, dsn in enumerate((database["collector"],
+                             url._replace(netloc=f"nestor@{url.hostname}:{url.port}", query=f"password={password}")
+                             .geturl())):
+        record = tmp_path / f"argv-{n}.txt"
+        monkeypatch.setenv("BACKUP_PG_BINDIR", str(_script_bin(tmp_path / str(n), "pg_restore: error: stop", record)))
+        monkeypatch.setenv("DATABASE_URL", dsn)
+        with empty.open("rb") as source, pytest.raises(bk.BackupError):
+            await bk.restore(source, fresh, optouts=None)
+        lines = record.read_text().splitlines()
+        assert f"--dbname=postgresql://nestor@{url.hostname}:{url.port}/{fresh}" in lines, lines
+        assert lines[-1] == f"PGPASSWORD={password}" and not any(password in line for line in lines[:-1])
 
 
 def test_restore_does_not_wait_for_a_dump_typed_at_the_terminal(monkeypatch, capfd):

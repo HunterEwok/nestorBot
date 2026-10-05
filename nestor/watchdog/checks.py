@@ -299,7 +299,8 @@ async def check_hermes(ctx: Ctx) -> CheckResult:
         if not memo.get("no_models"):
             log.warning("hermes answers 404 to /models on every profile: profiles are not checked")
         memo["no_models"] = True
-        return unknown("hermes")
+        # It answers, so the gateway is up; whether a profile works cannot be told from it.
+        return result("hermes", unknown=("hermes.profile:",))
     memo.pop("no_models", None)
     findings = []
     for name, outcome in sorted(outcomes.items()):

@@ -307,6 +307,34 @@ async def test_collector_reports_missing_watchdog_once_and_recovery_silently(poo
     assert await conn.fetchval("SELECT value FROM ops_state WHERE key = 'collector_watch'") == {"down": False}
 
 
+async def test_a_database_outage_is_not_the_watchdog_stopping(pool, conn):
+    # Neither can write while the database is down, and once it is back the collector usually looks first.
+    clock = Clock(datetime(2026, 10, 5, 12, 0, tzinfo=MSK))
+    watch = Telemetry(clock=clock)
+    clock.at += timedelta(hours=2)                      # it has run for two hours
+    bot = AlertBot()
+
+    async def tick(target=pool):
+        await watch.tick(target, bot=bot, alert_chat_id=ALERT_CHAT, tz=MSK)
+
+    await _watchdog_ran(conn)
+    await tick()
+    down = FlakyPool(pool, *[ConnectionRefusedError() for _ in range(30)])
+    for _ in range(30):                                 # the router reboots for half an hour
+        clock.at += timedelta(minutes=1)
+        await tick(down)
+    await _watchdog_ran(conn, "31 minutes")             # its last snapshot is from before
+    for minutes in (1, 19):                             # back: the watchdog gets 20 minutes of it to write
+        clock.at += timedelta(minutes=minutes)
+        await tick()
+    assert bot.sent == []
+    clock.at += timedelta(minutes=1)                    # it did not: now it is news
+    await tick()
+    last = await conn.fetchval("SELECT updated_at FROM ops_state WHERE key = 'watchdog'")
+    assert [(m["text"], m["disable_notification"]) for m in bot.sent] == [
+        (prompts.WATCHDOG_DOWN.format(since=alerts.fmt_since(last, clock.at, MSK)), False)]
+
+
 # ---- the collector -------------------------------------------------------------------------------------------
 
 async def test_collector_starts_the_heartbeat_with_its_probe_and_the_alert_group(monkeypatch, caplog):

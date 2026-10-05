@@ -5,6 +5,10 @@ import asyncio
 import io
 import json
 import logging
+import os
+import subprocess
+import sys
+import threading
 
 import asyncpg
 import pytest
@@ -23,8 +27,9 @@ def journal():
     """The root handler of setup_logging, writing into a buffer: what journald would get. Returns the
     lines parsed, so a line that is not JSON fails the test."""
     root = logging.getLogger()
-    before, level = root.handlers[:], root.level
+    before, level, hooks = root.handlers[:], root.level, (sys.excepthook, threading.excepthook)
     setup_logging("INFO")
+    sys.excepthook, threading.excepthook = hooks          # tested in a process of their own
     (handler,) = root.handlers
     root.handlers[:] = before                   # pytest's own capture stays as it was
     root.setLevel(level)
@@ -90,3 +95,32 @@ async def test_aiogram_args_become_class_names_and_tokens_are_redacted(journal):
                                'password=<redacted> \\" end" PASSWORD=<redacted>')
     for canary in ("canary", "КАНАРЕЙКА", "AAH"):
         assert canary.lower() not in raw.lower(), canary
+
+
+def test_an_exception_nobody_caught_reaches_the_journal_by_its_class():
+    """As `python -m nestor.migrate` (the collector's ExecStartPre) ends when a backfill fails on a row, and a
+    thread that dies: Python would print the exception's text, DETAIL and all, on stderr."""
+    code = """
+import asyncio, logging, os, threading
+import asyncpg
+from nestor.logs import setup_logging
+setup_logging("INFO")
+canary = os.environ["CANARY"]
+logging.getLogger("nestor").info("%d messages", canary)            # cannot be formatted
+def dies():
+    raise ValueError(canary)
+thread = threading.Thread(target=dies)
+thread.start()
+thread.join()
+async def main():
+    raise asyncpg.NotNullViolationError("null value in column \\"id\\" DETAIL:  Failing row contains (null, " + canary + ")")
+asyncio.run(main())
+"""
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60, check=False,
+                          env={**os.environ, "CANARY": CANARY})
+    assert done.returncode == 1 and CANARY not in done.stdout + done.stderr
+    thread, main = (json.loads(line) for line in done.stdout.splitlines())
+    assert (thread["msg"], thread["level"]) == ("uncaught exception", "CRITICAL") and thread["exc"].endswith("ValueError")
+    assert main["msg"] == "uncaught exception"
+    assert main["exc"].endswith("asyncpg.exceptions.NotNullViolationError (sqlstate=23502)")
+    assert done.stderr == "logging error in nestor: TypeError\n"

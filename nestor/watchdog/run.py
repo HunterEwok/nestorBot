@@ -6,7 +6,8 @@
 4. evaluate them against the state of the earlier runs (nestor.watchdog.alerts);
 5. the daily summary, if it is due;
 6. send;
-7. the snapshot for /status into ops_state('watchdog'), in its own short transaction;
+7. the snapshot for /status into ops_state('watchdog'), in its own short transaction, with the state:
+   the next run takes it from there if this one cannot save it (alerts.adopt);
 8. the opted-out user ids into optouts.json (0600): a restore from a backup forgets them again;
 9. save the state.
 """
@@ -191,12 +192,13 @@ async def _run(settings: Settings, now: datetime, bot: Bot | None, http: aiohttp
     conn, db_now, error = await connect(settings.database_url)
     ctx = Ctx(settings, now, tz, state, conn, db_now, http, systemctl, host)
     try:
-        results.append(db_result(ctx, error))
         if conn is not None:
             try:
-                alerts.adopt(state, await conn.fetchval("SELECT value FROM ops_state WHERE key = 'watchdog'"))
+                published = await conn.fetchval("SELECT value FROM ops_state WHERE key = 'watchdog'")
+                ctx.state = state = alerts.adopt(state, published)
             except Exception as e:  # noqa: BLE001
                 log.warning("watchdog snapshot unreadable", extra={"error": type(e).__name__})
+        results.append(db_result(ctx, error))
         for check in checks:
             if due(check, state, now):
                 results.append(await run_check(ctx, check))

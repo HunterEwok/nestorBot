@@ -126,7 +126,8 @@ sudo -u nestor /opt/nestor/.venv/bin/python -m nestor.retention --confirm       
 Установка на Pi. `pg_dump` нужен 18 из репозитория PGDG: свой клиент Debian 13 (17) сервер 18 не берёт. Роль `nestor_backup` создаёт `python -m nestor.bootstrap backup` с ноутбука (`BACKUP_PASSWORD` в его `.env`).
 
 ```sh
-sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh && sudo apt install -y postgresql-client-18
+sudo apt install -y postgresql-common      # только скрипт подключения репозитория PGDG, сервер не ставится
+sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y && sudo apt install -y postgresql-client-18
 sudo useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin nestor-backup
 sudo install -d -o root -g nestor-backup -m 0750 /etc/nestor-backup
 sudo install -o root -g nestor-backup -m 0640 /opt/nestor/deploy/systemd/nestor-backup.env.example /etc/nestor-backup/backup.env
@@ -137,19 +138,29 @@ sudo systemctl daemon-reload && sudo systemctl enable --now nestor-backup.timer
 sudo systemctl start nestor-backup && cat /var/lib/nestor-backup/status.json     # "ok": true
 ```
 
-Восстановление, если база потеряна. Копия возвращает и то, что после неё забыли через `/forget_me`, поэтому `restore` после загрузки применяет миграции, ещё раз забывает всех из `optouts.json` сторожа и удаляет то, что пережило срок хранения. База должна быть пустой: старую переименовать (`ALTER DATABASE nestor RENAME TO nestor_broken`), новую создаст `python -m nestor.bootstrap` с ноутбука.
+Восстановление, если база потеряна. Копия возвращает и то, что после неё забыли через `/forget_me`, поэтому `restore` после загрузки применяет миграции, ещё раз забывает всех из `optouts.json` сторожа и удаляет то, что пережило срок хранения. База должна быть пустой. Порядок важен: пока кто-то держит соединение, базу не переименовать, а сборщик успел бы создать таблицы в новой.
 
-```sh
-sudo systemctl disable --now nestor-collector nestor-backup.timer nestor-watchdog.timer
-systemctl --user stop hermes-gateway        # его MCP-сервер тоже держит соединение с базой
-F=$(sudo ls -1 /var/lib/nestor-backup/dumps | tail -n 1)
-sudo cat "/var/lib/nestor-backup/dumps/$F" | sudo -u nestor /opt/nestor/.venv/bin/python -m nestor.backup restore \
-    --database nestor --optouts /var/lib/nestor-watchdog/optouts.json                  # restore done
-sudo systemctl enable --now nestor-collector nestor-backup.timer nestor-watchdog.timer
-systemctl --user start hermes-gateway
-```
-
-Потом импорт истории для всех групп с ноутбука: сообщения, пришедшие после копии, Telegram второй раз не пришлёт.
+1. На Pi остановить всё, что ходит в базу:
+   ```sh
+   sudo systemctl disable --now nestor-collector nestor-backup.timer nestor-watchdog.timer
+   systemctl --user stop hermes-gateway        # его MCP-сервер тоже держит соединение с базой
+   ```
+2. На сервере базы, суперпользователем, если старая база ещё есть: `ALTER DATABASE nestor RENAME TO nestor_broken`.
+3. С ноутбука `python -m nestor.bootstrap`: создаст новую пустую `nestor`.
+4. На Pi:
+   ```sh
+   F=$(sudo ls -1 /var/lib/nestor-backup/dumps | tail -n 1)
+   sudo cat "/var/lib/nestor-backup/dumps/$F" | sudo -u nestor /opt/nestor/.venv/bin/python -m nestor.backup restore \
+       --database nestor --optouts /var/lib/nestor-watchdog/optouts.json                  # restore done
+   ```
+   `restore failed not_empty`: в новую базу уже что-то записали (обычно сборщик, если его не остановили). Тогда на сервере `DROP DATABASE nestor WITH (FORCE)`, и снова шаги 3 и 4.
+5. Запустить всё обратно:
+   ```sh
+   sudo systemctl enable --now nestor-collector nestor-backup.timer nestor-watchdog.timer
+   systemctl --user start hermes-gateway
+   ```
+6. Импорт истории для всех групп с ноутбука: сообщения, пришедшие после копии, Telegram второй раз не пришлёт.
+7. Через неделю нормальной работы удалить старую базу: `DROP DATABASE nestor_broken WITH (FORCE)`. Пока она есть, в ней лежит весь архив без срока хранения и без `/forget_me`: обещания `/privacy` до этого не выполнены.
 
 ## Оповещения
 

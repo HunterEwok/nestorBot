@@ -11,11 +11,11 @@ from zoneinfo import ZoneInfo
 import asyncpg
 import pytest
 from aiogram import Bot
-from aiogram.exceptions import TelegramNetworkError
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 
 from nestor import backup as bk
 from nestor import retention
-from nestor.bot import prompts
+from nestor.bot import markup, prompts
 from nestor.bot.daily import day_name
 from nestor.config import Settings
 from nestor.watchdog import alerts, checks, run, summary
@@ -187,7 +187,7 @@ async def test_collector_down_and_restarts(conn):
     assert "<code>failed/failed, exit-code</code>" in res.findings[0].line
 
 
-async def test_db_down_makes_db_checks_unknown_and_suppresses_collector(database, tmp_path):
+async def test_db_down_makes_db_checks_unknown_and_suppresses_collector(database, pool, tmp_path):
     bot = AlertBot()
     dead = "postgresql://nestor:wrong@127.0.0.1:1/nestor_test"
     crashing = Systemd(nestor_collector={"ActiveState": "activating", "SubState": "auto-restart", "Result": "exit-code",
@@ -285,7 +285,8 @@ async def test_retention_overdue_every_kind(pool, conn):
 
 # ---- backups: the status nestor.backup writes ---------------------------------------------------------------
 
-async def test_backup_contract_from_backup_write_status(conn, tmp_path):
+async def test_backup_contract_from_backup_write_status(conn, tmp_path, monkeypatch):
+    monkeypatch.setattr(bk, "TIMESYNC_FLAG", tmp_path / "no-timesync-flag")     # Tools(synced=...) decides
     cfg = cfg_in(tmp_path)
     after = NIGHT + timedelta(minutes=30)
 
@@ -569,6 +570,111 @@ async def test_a_run_sends_publishes_the_snapshot_and_the_daily_summary(database
                        state_dir=tmp_path, checks=no_clock)
     assert bot.sent[-1]["text"] == prompts.ALERT_NEW + "\n🟠 " + prompts.ALERT_DISK.format(free="3,0 ГБ", total="58,0 ГБ")
     assert alerts.load_state(tmp_path / run.STATE_FILE).outbox == []
+
+
+async def test_daily_summary_reads_backup_news_memory_and_restarts(conn, tmp_path):
+    await conn.execute("INSERT INTO chats (chat_id, type, title) VALUES ($1, 'supergroup', 'Nestor')", CHAT_ID)
+    await conn.execute("INSERT INTO users (user_id, first_name) VALUES (111, 'U')")
+    await conn.execute("""INSERT INTO messages (chat_id, message_id, user_id, sent_at, text, raw, stored_at)
+                          VALUES ($1, 1, 111, now(), 'вчера', '{}', date_trunc('day', now() AT TIME ZONE 'Europe/Moscow')
+                                                                   AT TIME ZONE 'Europe/Moscow' - interval '12 hours'),
+                                 ($1, 2, 111, now(), 'сегодня', '{}', now())""", CHAT_ID)
+    await conn.execute("""INSERT INTO news_sources (key, last_run_at, last_ok_at, status, failures)
+                          VALUES ('pubmed', now(), now() - interval '1 hour', 'ok', 0),
+                                 ('reggaeville', now(), now() - interval '3 days', 'http_403', 5)""")
+    cfg = cfg_in(tmp_path)
+    bk.backup(cfg, NIGHT - timedelta(days=1), run=Tools())
+    good = bk.backup(cfg, NIGHT, run=Tools(size=5 * 1024 ** 2))
+    db_now = await conn.fetchval("SELECT clock_timestamp()")
+    collector = {**ACTIVE, "MemoryPeak": str(300 * 1024 ** 2), "NRestarts": "5"}
+    ctx = await make_ctx(conn, now=db_now.astimezone(MSK).replace(hour=9, minute=30), systemd=Systemd(
+        nestor_collector=collector), backup_status_file=str(cfg.status_file))
+    ctx.state.baselines["summary_restarts"] = 3                         # what yesterday's summary saw
+    lines = (await summary.daily_summary(conn, ctx, AlertBot())).split("\n")
+    assert lines[1].startswith(prompts.DAILY_ARCHIVE.format(chats="«Nestor» 1", size=""))  # not today's
+    oldest = datetime.fromisoformat(good["oldest_dump_at"]).astimezone(MSK).date()
+    assert prompts.DAILY_BACKUP.format(time=ctx.fmt(datetime.fromisoformat(good["last_ok_at"])), size="5 МБ", kept=2,
+                                       oldest=day_name(oldest)) in lines and oldest == date(2026, 10, 4)
+    assert prompts.DAILY_COLLECTOR.format(memory="300 МБ" + prompts.DAILY_MEMORY_HIGH, restarts=2) in lines
+    assert prompts.DAILY_NEWS.format(names="reggaeville (http_403)") in lines and ctx.summary_restarts == 5
+    # Started by hand since: NRestarts counts from 0 again.
+    collector.update(NRestarts="1", MemoryPeak=str(200 * 1024 ** 2))
+    ctx = await make_ctx(conn, now=ctx.now, systemd=Systemd(nestor_collector=collector), state=ctx.state)
+    assert prompts.DAILY_COLLECTOR.format(memory="200 МБ", restarts=1) in (
+        await summary.daily_summary(conn, ctx, AlertBot())).split("\n")
+
+
+async def test_daily_summary_waits_while_the_hours_messages_are_used(database, conn, tmp_path):
+    morning = (await conn.fetchval("SELECT clock_timestamp()")).astimezone(MSK).replace(hour=9, minute=31)
+    used = AlertState(sent_times=[morning - timedelta(minutes=50 - i) for i in range(alerts.MAX_PER_HOUR)])
+    alerts.save_state(tmp_path / run.STATE_FILE, used, morning - timedelta(minutes=5))
+    bot, cfg = AlertBot(), settings(database["collector"], alert_quiet=None)
+    no_clock = tuple(c for c in CHECKS if c.name != "clock")
+    report = await run.run_once(cfg, now=morning, bot=bot, systemctl=Systemd(), host=host(), state_dir=tmp_path,
+                                checks=no_clock)
+    assert report.summary is not None and bot.sent == []
+    assert alerts.load_state(tmp_path / run.STATE_FILE).last_daily is None
+    # The first of those six is an hour old: the summary goes, once.
+    for minutes in (11, 16):
+        await run.run_once(cfg, now=morning + timedelta(minutes=minutes), bot=bot, systemctl=Systemd(), host=host(),
+                           state_dir=tmp_path, checks=no_clock)
+    assert [(m["text"].split("\n")[0], m["disable_notification"]) for m in bot.sent] == [
+        (prompts.DAILY_HEADER.format(date=day_name(morning.date() - timedelta(days=1))), True)]
+    assert alerts.load_state(tmp_path / run.STATE_FILE).last_daily == morning.date()
+
+
+async def test_a_message_telegram_refuses_as_html_goes_as_plain_text(tmp_path):
+    bot = AlertBot()
+    refused = TelegramBadRequest(method=None, message="Bad Request: can't parse entities")
+    bot.errors = [refused]
+    cfg = settings("postgresql://nestor:wrong@127.0.0.1:1/nestor_test", alert_daily_at=None, alert_quiet=None)
+    now = datetime(2026, 10, 5, 14, 0, tzinfo=MSK)
+    report = await run.run_once(cfg, now=now, bot=bot, systemctl=Systemd(), host=host(free_gb=3), state_dir=tmp_path)
+    assert report.sent and [(m["text"], m["parse_mode"], m["disable_notification"]) for m in bot.sent] == [
+        (markup.to_plain(report.message.text), None, False)]
+    assert "<b>" in report.message.text and "<b>" not in bot.sent[0]["text"]
+    assert alerts.load_state(tmp_path / run.STATE_FILE).outbox == []
+    # Refused as plain text too: nothing is lost, the lines wait for the next run.
+    bot.errors = [refused, refused]
+    report = await run.run_once(cfg, now=now + timedelta(minutes=15), bot=bot, systemctl=Systemd(),
+                                host=host(free_gb=0.5), state_dir=tmp_path)
+    assert not report.sent and len(bot.sent) == 1
+    assert {i["key"] for i in alerts.load_state(tmp_path / run.STATE_FILE).outbox} == {"db.unreachable", "disk.low:/"}
+
+
+async def test_a_card_that_cannot_keep_the_state_does_not_repeat_itself(database, conn, tmp_path):
+    cfg = cfg_in(tmp_path / "backup")
+    down = "pg_dump: error: connection to server at \"192.168.0.1\", port 5432 failed: Connection refused"
+    bk.backup(replace(cfg, attempts=1), NIGHT, run=Tools(down))
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    nine = (await conn.fetchval("SELECT clock_timestamp()")).astimezone(MSK).replace(hour=9, minute=0)
+    bot, systemd = AlertBot(), Systemd()
+    s = settings(database["collector"], alert_quiet=None, backup_status_file=str(cfg.status_file))
+    no_clock = tuple(c for c in CHECKS if c.name != "clock")
+
+    async def once(minutes, free_gb):
+        await run.run_once(s, now=nine + timedelta(minutes=minutes), bot=bot, systemctl=systemd,
+                           host=host(free_gb=free_gb), state_dir=state_dir, checks=no_clock)
+
+    await once(0, 3)                                    # the backup and the disk, said; the state saved
+    assert len(bot.sent) == 1
+    # The card can be read but not written: the probe and the state's temporary file cannot be created.
+    for name in ("probe", run.STATE_FILE + ".tmp"):
+        (state_dir / name).unlink(missing_ok=True)
+        (state_dir / name).mkdir()
+    systemd.units["nestor-collector"]["NRestarts"] = "3"
+    for minutes in range(35, 80, 5):                    # the summary is due from 09:30; the disk is fine again
+        await once(minutes, 40)
+    assert (state_dir / run.STATE_FILE).exists() and alerts.load_state(state_dir / run.STATE_FILE).saved_at == nine
+    header = prompts.DAILY_HEADER.format(date=day_name(nine.date() - timedelta(days=1)))
+    summaries = [m["text"] for m in bot.sent if m["text"].startswith(header)]
+    alerts_sent = [m["text"] for m in bot.sent if not m["text"].startswith(header)]
+    assert len(summaries) == 1 and len(alerts_sent) == 2
+    said = "\n".join(alerts_sent)
+    for line in ("Резервная копия не сделана", prompts.ALERT_SD_WRITE.format(error="<code>EISDIR</code>"),
+                 "перезапускался 3 раз", "Место на карте Pi: снова в порядке"):
+        assert said.count(line) == 1, line
 
 
 async def test_daily_summary_without_the_database_stays_within_a_message():

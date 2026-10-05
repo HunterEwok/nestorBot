@@ -8,7 +8,9 @@ What the code does not control is sanitized here, in one place, for every logger
   extra field becomes its class name; asyncio's report of a failed task keeps only its first line,
   the rest is reprs of the task and of its exception;
 - in the final line, bot tokens, the passwords of database URLs, bearer keys and key=/password=
-  values are blanked out, whoever wrote them.
+  values are blanked out, whoever wrote them;
+- an exception nobody caught (one that ends `python -m nestor.migrate`, or a thread) goes the same way
+  instead of Python's own report on stderr, which has its text; so does a record that cannot be formatted.
 """
 from __future__ import annotations
 
@@ -16,6 +18,7 @@ import json
 import logging
 import re
 import sys
+import threading
 import traceback
 from datetime import datetime, timezone
 
@@ -103,10 +106,31 @@ class JsonFormatter(logging.Formatter):
         return safe_exc(ei)
 
 
+class JsonHandler(logging.StreamHandler):
+    def handleError(self, record: logging.LogRecord) -> None:
+        """A record that could not be written: its logger and the error's class, never its message or
+        arguments, which the standard handler would print as they are."""
+        if logging.raiseExceptions and sys.stderr:
+            sys.stderr.write(f"logging error in {record.name}: {_name(sys.exc_info()[1])}\n")
+
+
+def _uncaught(exc_type, exc, tb) -> None:
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc, tb)
+        return
+    logging.getLogger("nestor").critical("uncaught exception", exc_info=(exc_type, exc, tb))
+
+
+def _uncaught_in_thread(args: threading.ExceptHookArgs) -> None:
+    if not issubclass(args.exc_type, SystemExit):
+        _uncaught(args.exc_type, args.exc_value, args.exc_traceback)
+
+
 def setup_logging(level: str = "INFO") -> None:
-    handler = logging.StreamHandler(sys.stdout)
+    handler = JsonHandler(sys.stdout)
     handler.setFormatter(JsonFormatter())
     handler.addFilter(ArgsFilter())
     root = logging.getLogger()
     root.handlers[:] = [handler]
     root.setLevel(level)
+    sys.excepthook, threading.excepthook = _uncaught, _uncaught_in_thread

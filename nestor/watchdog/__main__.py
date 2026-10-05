@@ -68,10 +68,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     settings = load_settings()
     setup_logging(settings.log_level)
+    state_dir = Path(os.environ.get("STATE_DIRECTORY") or STATE_DIR)    # set by systemd for StateDirectory=
     problem = check_alert_chat(settings)
     if problem:
+        if not (args.test or args.dry_run) and args.mute is None:
+            asyncio.run(_optouts_only(settings, state_dir))     # nobody can be told; a restore still needs them
         raise SystemExit(problem)
-    state_dir = Path(os.environ.get("STATE_DIRECTORY") or STATE_DIR)    # set by systemd for StateDirectory=
     if args.mute is not None:
         try:
             until = mute(state_dir, args.mute)

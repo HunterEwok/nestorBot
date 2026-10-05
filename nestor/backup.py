@@ -8,8 +8,10 @@ The unit (deploy/systemd/nestor-backup.service) runs as its own Linux user with 
 nestor_backup, which can only read. It dumps at BACKUP_AT (04:30, after the 03:30 purge) and once more
 at 13:30, which does something only if the night failed. Every dump is written to a partial file, read
 back completely by pg_restore, and only then renamed, so a file named nestor-*.dump is a good copy.
-Rotation keeps 7 daily and 4 weekly copies, none older than 35 days (nestor.promises), runs only after
-a new verified dump, and never leaves fewer than 2 verified copies: 40 failed nights keep the last two.
+Rotation keeps 7 daily and 4 weekly copies, none older than 35 days (nestor.promises), but always the
+newest 2: 40 failed nights keep the last two good ones. It runs on every run, before the dump (so a night
+that fails lets what expired go too, and a full card frees it before the space is checked) and after it,
+and only while the clock can be trusted to say what is old.
 
 The unit's state is in /var/lib/nestor-backup: dumps/ (0700, nobody else reads the archive),
 status.json (0644: the watchdog reads it), last-error.txt (0600: the tail of pg_dump's stderr; the
@@ -390,6 +392,24 @@ def backup(cfg: BackupConfig, now: datetime | None = None, *, force: bool = Fals
         os.close(lock)
 
 
+def _rotate(directory: Path, now: datetime, warnings: list[str]) -> int:
+    """Deletes the dumps plan_rotation does not keep; how many. A card that refuses leaves them, which is
+    a warning ("rotation_failed"), not a failed backup: the dumps that are there are good."""
+    deleted = 0
+    try:
+        dumps = list_dumps(directory)
+        keep = plan_rotation([t for t, _ in dumps], now)
+        for at, path in dumps:
+            if at not in keep:
+                path.unlink()
+                deleted += 1
+                log.info("dump deleted", extra={"file": path.name})
+    except OSError:
+        if "rotation_failed" not in warnings:
+            warnings.append("rotation_failed")
+    return deleted
+
+
 def _backup(cfg: BackupConfig, now: datetime, previous: dict, run, sleep) -> dict:
     began = time.monotonic()
     status = {"version": 1, "running": False, "ok": None, "error": None, "attempts": 0, "started_at": None,
@@ -397,20 +417,32 @@ def _backup(cfg: BackupConfig, now: datetime, previous: dict, run, sleep) -> dic
               "client_version": None, "free_mb": None, "kept": None, "deleted": None, "oldest_dump_at": None,
               "rotated": False, "warnings": [], "failed_nights": 0, "last_ok_at": None, "last_ok_file": None,
               "last_ok_size": None}
-    status.update({k: previous[k] for k in STATUS_KEYS if k in previous and k != "warnings"})
-    # While it runs, the watchdog sees the last verdict, so a retry of a failed night does not flap; only
-    # `running` and `started_at` are new. A run that dies leaves `running` set, which is how it is found.
+    status.update({k: previous[k] for k in (*STATUS_KEYS, "shrank_pct") if k in previous})
+    # While it runs, the watchdog sees the last verdict and its warnings, so a retry of a failed night does
+    # not flap; only `running` and `started_at` are new. A run that dies leaves `running` set, which is how
+    # it is found.
     status.update(running=True, started_at=_iso(now))
     write_status(cfg.status_file, status)
     # What the finished status says about this run only: a run that fails early leaves them empty.
     status.update(file=None, size=None, server_version=None, client_version=None, free_mb=None)
+    status.pop("shrank_pct", None)
     last_size = previous["last_ok_size"] if isinstance(previous.get("last_ok_size"), int) else 0
-    attempts, failure, warnings, deleted, rotated = 0, None, [], 0, False
+    attempts, failure, warnings, deleted, trusted = 0, None, [], 0, False
     try:
         cfg.dumps_dir.mkdir(mode=0o700, exist_ok=True)
         os.chmod(cfg.dumps_dir, 0o700)
         for stale in cfg.dumps_dir.glob(".*.partial"):
             stale.unlink()
+        # Only a trustworthy clock may decide what is old. Before the dump, so a night that fails still
+        # lets the expired copies go (the newest two stay) and a full card frees them before the check.
+        newest = list_dumps(cfg.dumps_dir)[-1:]
+        if not clock_synced(run):
+            warnings.append("clock_unsynced")
+        elif newest and newest[0][0] > now + CLOCK_SLACK:
+            warnings.append("clock_backwards")
+        else:
+            trusted = True
+            deleted += _rotate(cfg.dumps_dir, now, warnings)
         bindir = find_bindir(cfg.pg_bindir)
         status["client_version"] = client_version(bindir, run)
         status["free_mb"] = check_space(cfg.dumps_dir, cfg.min_free_mb * MIB + 2 * last_size) // MIB
@@ -436,23 +468,8 @@ def _backup(cfg: BackupConfig, now: datetime, previous: dict, run, sleep) -> dic
         if last_size and status["size"] < last_size / 2:
             warnings.append("shrank")
             status["shrank_pct"] = round(100 * (1 - status["size"] / last_size))
-        others = [t for t, path in list_dumps(cfg.dumps_dir) if path != target]
-        if not clock_synced(run):
-            warnings.append("clock_unsynced")
-        elif others and max(others) > now + CLOCK_SLACK:
-            warnings.append("clock_backwards")
-        else:      # only a trustworthy clock may decide what is old
-            try:
-                dumps = list_dumps(cfg.dumps_dir)
-                keep = plan_rotation([t for t, _ in dumps], now)
-                for at, path in dumps:
-                    if at not in keep:
-                        path.unlink()
-                        deleted += 1
-                        log.info("dump deleted", extra={"file": path.name})
-                rotated = True
-            except OSError:    # the new dump is good, the old ones stay: not a failed backup
-                warnings.append("rotation_failed")
+        if trusted:     # the new one is the newest of the two that always stay
+            deleted += _rotate(cfg.dumps_dir, now, warnings)
     except BackupError as e:
         failure = e
     except OSError as e:     # the card: read-only, full, dying; the class and the errno, never the path
@@ -465,7 +482,7 @@ def _backup(cfg: BackupConfig, now: datetime, previous: dict, run, sleep) -> dic
         dumps = []
     status.update(running=False, attempts=attempts, finished_at=_iso(finished), duration_s=round(elapsed, 1),
                   kept=len(dumps), deleted=deleted, oldest_dump_at=_iso(dumps[0][0]) if dumps else None,
-                  rotated=rotated, warnings=warnings)
+                  rotated=trusted and "rotation_failed" not in warnings, warnings=warnings)
     if failure is None:
         name = target.name
         status.update(ok=True, error=None, file=name, failed_nights=0, last_ok_at=_iso(finished),

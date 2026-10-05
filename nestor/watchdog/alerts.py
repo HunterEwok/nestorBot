@@ -12,7 +12,9 @@ waited becomes one line «Было: …». In quiet hours (ALERT_QUIET) and whil
 without sound; muted, new problems are held until it ends. A crit open for over an hour rings once
 even in quiet hours.
 
-The state lives in the watchdog's StateDirectory, so it survives database outages and reboots.
+The state lives in the watchdog's StateDirectory, so it survives database outages and reboots. Each
+run also publishes it with its snapshot in ops_state('watchdog'): a card that cannot be written does
+not make every run repeat what the runs before it said.
 """
 from __future__ import annotations
 
@@ -59,7 +61,8 @@ class Problem:
     announced: str | None = None    # the level it was announced at; None: not (yet)
     announced_token: str | None = None
     delivered: bool = False         # an announcement of it reached the chat
-    rung: bool = False              # one reached it with sound (or the quiet-hours ring is queued)
+    rung: bool = False              # one at its level reached it with sound (or the quiet-hours ring is queued)
+    crit_since: datetime | None = None    # when it first was crit
 
 
 @dataclass
@@ -136,7 +139,9 @@ def _when(value: str | None) -> datetime | None:
 
 def _encode(state: AlertState) -> dict:
     data = asdict(state)
-    data["problems"] = {k: {**v, "since": _iso(state.problems[k].since)} for k, v in data["problems"].items()}
+    for key, p in data["problems"].items():
+        since, crit_since = state.problems[key].since, state.problems[key].crit_since
+        p.update(since=_iso(since), crit_since=_iso(crit_since) if crit_since else None)
     data["sent_times"] = [_iso(t) for t in state.sent_times]
     data["last_daily"] = state.last_daily.isoformat() if state.last_daily else None
     data["mute_until"] = _iso(state.mute_until) if state.mute_until else None
@@ -150,7 +155,8 @@ def _decode(data: dict) -> AlertState:
         raise ValueError("state version")
     known = {f.name for f in fields(Problem)}
     return AlertState(
-        problems={k: Problem(**{**{n: v for n, v in p.items() if n in known}, "since": _when(p["since"])})
+        problems={k: Problem(**{**{n: v for n, v in p.items() if n in known}, "since": _when(p["since"]),
+                                "crit_since": _when(p.get("crit_since"))})
                   for k, p in data["problems"].items()},
         events=dict(data["events"]), outbox=list(data["outbox"]),
         sent_times=[_when(t) for t in data["sent_times"]],
@@ -193,19 +199,23 @@ def save_state(path: Path, state: AlertState, now: datetime) -> None:
     write_private(path, json.dumps(_encode(state), ensure_ascii=False, indent=1) + "\n")
 
 
-def adopt(state: AlertState, snapshot: dict | None) -> None:
-    """After a run that could not save its state (a read-only card) or lost it, take the problems the
-    last snapshot in the database says were announced, so they are not announced again every run."""
+def adopt(state: AlertState, snapshot: dict | None) -> AlertState:
+    """The state the last run published with its snapshot, when that run is newer than the state on the
+    card: it could not save it (a read-only or full card), or the file was lost. Otherwise every run would
+    say again what the runs since then said (the summary, the events, «снова в порядке») and count the
+    hour's messages from a stale list."""
     if not snapshot:
-        return
+        return state
     checked = _when(snapshot.get("checked_at"))
     if checked is None or (state.saved_at is not None and state.saved_at >= checked):
-        return
-    for p in snapshot.get("problems") or ():
-        if p.get("announced") and p.get("key") not in state.problems and p.get("level") in LEVELS:
-            state.problems[p["key"]] = Problem(
-                key=p["key"], check=p["check"], level=p["level"], line=p["line"], label=label_for(p["key"]),
-                since=_when(p["since"]), fails=1, announced=p["level"], delivered=True, rung=True)
+        return state
+    try:
+        newer = _decode(snapshot["state"])
+    except (KeyError, ValueError, TypeError, AttributeError) as e:
+        log.warning("watchdog snapshot state unreadable", extra={"error": type(e).__name__})
+        return state
+    newer.saved_at = checked
+    return newer
 
 
 # ---- evaluation ----
@@ -219,6 +229,8 @@ def _announce(state: AlertState, p: Problem, now: datetime) -> None:
     # A line about this problem that has not gone out yet says something older: this one replaces it.
     state.outbox = [i for i in state.outbox if not (i["kind"] == "problem" and i["key"] == p.key)]
     _push(state, {"kind": "problem", "key": p.key, "level": p.level, "line": p.line, "at": _iso(now)})
+    if p.announced is not None and LEVELS[p.level] > LEVELS[p.announced]:
+        p.rung = False              # it rang as a warning: as a crit it has not
     p.announced, p.announced_token = p.level, p.token
 
 
@@ -254,6 +266,8 @@ def evaluate(state: AlertState, results: list[CheckResult], now: datetime, *, tz
                                                     label=f.label or label_for(f.key), since=now)
             p.level, p.line, p.confirm, p.clear, p.token = f.level, f.line, f.confirm, f.clear, f.repeat_token
             p.check = r.name
+            if f.level == "crit" and p.crit_since is None:
+                p.crit_since = now
             p.fails, p.oks = p.fails + 1, 0
         if r.status == "error":
             continue                # the check's own problems: as unknown
@@ -284,7 +298,8 @@ def evaluate(state: AlertState, results: list[CheckResult], now: datetime, *, tz
             del state.events[key]
     if not muted and in_quiet(now.astimezone(tz).time(), quiet):
         for p in state.problems.values():
-            if p.announced == "crit" and p.level == "crit" and not p.rung and now - p.since >= QUIET_RING_AFTER:
+            if p.announced == "crit" and p.level == "crit" and not p.rung \
+                    and now - (p.crit_since or p.since) >= QUIET_RING_AFTER:
                 waiting = [i for i in state.outbox if i["kind"] == "problem" and i["key"] == p.key]
                 if waiting:
                     waiting[-1]["force"] = True
@@ -353,11 +368,13 @@ def confirmed(state: AlertState) -> list[Problem]:
 
 
 def snapshot(state: AlertState, now: datetime) -> dict:
+    """What /status shows, and the whole state for the next run if this one cannot save it (adopt)."""
     return {"checked_at": _iso(now),
             "problems": [{"key": p.key, "level": p.level, "line": p.line, "since": _iso(p.since), "check": p.check,
                           "announced": p.announced is not None} for p in confirmed(state)],
             "checks": dict(sorted(state.statuses.items())),
-            "muted_until": _iso(state.mute_until) if state.mute_until and state.mute_until > now else None}
+            "muted_until": _iso(state.mute_until) if state.mute_until and state.mute_until > now else None,
+            "state": _encode(state)}
 
 
 def render_status(snap: dict, now: datetime, tz: ZoneInfo) -> str:

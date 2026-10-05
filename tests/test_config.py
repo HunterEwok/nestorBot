@@ -1,13 +1,23 @@
 """Settings from the environment, as systemd's EnvironmentFile hands them over."""
+import asyncio
+import json
+import logging
 from dataclasses import fields
 from datetime import time
 from pathlib import Path
 
 import pytest
+from aiogram.exceptions import TelegramNetworkError
 from dotenv import dotenv_values
 
 from nestor import config
+from nestor.bot import prompts
 from nestor.watchdog import __main__ as watchdog_main
+from nestor.watchdog import alerts, run
+
+from .test_watchdog_checks import AlertBot
+
+DEAD_DB = "postgresql://nestor:x@127.0.0.1:1/nestor"
 
 NAMES = ("ALLOWED_CHAT_IDS", "MODEL_ROUTES", "MUSIC_DAILY_LIMIT", "MUSIC_PLAYER_APP", "NEWS_CHAT_IDS", "NEWS_TIME",
          "NEWS_MAX_TOPICS", "NEWS_CONTACT_EMAIL", "NEWS_TELEGRAM_CHANNELS", "WISDOM_TIME", "DIGEST_TIME", "TIMEZONE",
@@ -115,6 +125,7 @@ def test_alert_chat_must_be_allowed(env, tmp_path):
     # The watchdog does not start with it: it would send into a group the bot has left.
     env.setattr(watchdog_main, "setup_logging", lambda level: None)        # keeps pytest's log capture
     env.setenv("STATE_DIRECTORY", str(tmp_path))
+    env.setenv("DATABASE_URL", DEAD_DB)
     with pytest.raises(SystemExit, match="ALERT_CHAT_ID must be one of ALLOWED_CHAT_IDS"):
         watchdog_main.main([])
     env.setenv("ALLOWED_CHAT_IDS", "-1001111111111, -1002222222222")
@@ -132,7 +143,71 @@ def test_env_example_has_the_stage_4_settings_with_their_defaults(env):
         env.setenv(name, example[name])
     s = config.load_settings()
     stage4 = ("retention_time", "alert_chat_id", "alert_daily_at", "alert_quiet", "alert_disk_min_gb",
-              "alert_max_members", "backup_status_file")
+              "alert_max_members")
     defaults = {f.name: f.default for f in fields(config.Settings)}
     assert {name: getattr(s, name) for name in stage4} == {name: defaults[name] for name in stage4}
     assert config.check_alert_chat(s) is None
+    # The backups are watched unless the line is emptied: the unit fixes where their status is on the Pi.
+    assert s.backup_status_file == "/var/lib/nestor-backup/status.json"
+
+
+def _main(argv: list[str]):
+    """watchdog_main.main in a thread (it runs its own event loop); a SystemExit is returned, not raised."""
+    try:
+        return watchdog_main.main(argv)
+    except SystemExit as e:
+        return e
+
+
+async def test_the_watchdog_keeps_the_optouts_with_alerts_off_or_refused(env, database, conn, tmp_path, caplog):
+    env.setattr(watchdog_main, "setup_logging", lambda level: None)
+    env.setenv("DATABASE_URL", database["collector"])
+    env.setenv("STATE_DIRECTORY", str(tmp_path))
+    for uid, out in ((111, True), (222, False)):
+        await conn.execute("INSERT INTO users (user_id, opted_out) VALUES ($1, $2)", uid, out)
+    path = tmp_path / run.OPTOUTS_FILE
+    path.write_text("[555]\n")
+    # ALERT_CHAT_ID empty, as .env.example has it: nobody to tell, the opt-outs a restore needs are kept.
+    with caplog.at_level(logging.WARNING, logger="nestor.watchdog"):
+        assert await asyncio.to_thread(_main, []) == 0
+    assert "alerts are off: ALERT_CHAT_ID is empty" in caplog.text
+    assert json.loads(path.read_text()) == [111, 555] and path.stat().st_mode & 0o777 == 0o600
+    # An alert group the bot would leave: the unit fails, but the opt-outs are kept first.
+    await conn.execute("UPDATE users SET opted_out = TRUE WHERE user_id = 222")
+    env.setenv("ALLOWED_CHAT_IDS", "-1001111111111")
+    env.setenv("ALERT_CHAT_ID", "-1002222222222")
+    refused = await asyncio.to_thread(_main, [])
+    assert isinstance(refused, SystemExit) and "ALERT_CHAT_ID must be one of ALLOWED_CHAT_IDS" in str(refused)
+    assert json.loads(path.read_text()) == [111, 222, 555]
+    # --dry-run refuses the same, and saves nothing.
+    await conn.execute("INSERT INTO users (user_id, opted_out) VALUES (333, TRUE)")
+    assert isinstance(await asyncio.to_thread(_main, ["--dry-run"]), SystemExit)
+    assert json.loads(path.read_text()) == [111, 222, 555]
+
+
+def test_the_watchdog_test_and_dry_run_say_what_they_did(env, tmp_path, capsys):
+    env.setattr(watchdog_main, "setup_logging", lambda level: None)
+    env.setenv("STATE_DIRECTORY", str(tmp_path))
+    env.setenv("ALLOWED_CHAT_IDS", "-1001111111111")
+    env.setenv("ALERT_CHAT_ID", "-1001111111111")
+    bot = AlertBot()
+    env.setattr(watchdog_main, "Bot", lambda token: bot)
+    assert watchdog_main.main(["--test"]) == 0 and capsys.readouterr().out == "test sent\n"
+    assert [(m["chat_id"], m["text"], m["disable_notification"]) for m in bot.sent] == [
+        (-1001111111111, prompts.ALERT_TEST, False)]
+    bot.errors = [TelegramNetworkError(method=None, message="down")]
+    assert watchdog_main.main(["--test"]) == 1 and capsys.readouterr().out == "test failed: see the journal\n"
+    # --dry-run: what the last look found and the message a run would send, as plain text; nothing is sent.
+    snap = {"checked_at": "2026-10-05T11:00:00+00:00", "checks": {},
+            "problems": [{"key": "disk.low:/", "level": "warn", "line": "Мало <b>места</b>"}]}
+    message = alerts.Outgoing(f"{prompts.ALERT_NEW}\n🟠 Мало <b>места</b>", silent=False, items=[])
+
+    async def dry(settings, **kw):
+        assert kw["dry_run"] is True and kw["bot"] is bot
+        return run.Report([], snap, message)
+
+    env.setattr(watchdog_main, "run_once", dry)
+    assert watchdog_main.main(["--dry-run"]) == 0
+    status, sent = capsys.readouterr().out.split("\n---\n")
+    assert status.startswith("🩺 Состояние Нестора") and "🟠 Мало места" in status and "<b>" not in status
+    assert sent == "🚨 Нестор: проблема\n🟠 Мало места\n" and len(bot.sent) == 1

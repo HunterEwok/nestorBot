@@ -81,11 +81,13 @@ async def test_hermes_probe(hermes, caplog):
              2, 2),
             ("hermes.profile:smart", prompts.ALERT_HERMES_PROFILE.format(profile="smart", problem="отвечает HTTP 500"), 2, 2),
             ("hermes.profile:web", prompts.ALERT_HERMES_PROFILE.format(profile="web", problem=prompts.HERMES_MISSING), 2, 2)]
-        # 404 everywhere: this Hermes has no /models; nothing can be told from it, said once in the log.
+        # 404 everywhere: this Hermes has no /models. It answers, so the gateway is up; of the profiles nothing
+        # can be told, said once in the log.
         state = AlertState()
         for _ in range(2):
             ctx = ctx_without_db(http=http, state=state, hermes_url=url("gone"), hermes_web_url=url("web"))
-            assert (await run.run_check(ctx, BY_NAME["hermes"])).status == "unknown"
+            res = await run.run_check(ctx, BY_NAME["hermes"])
+            assert (res.status, res.findings, res.unknown) == ("ok", [], ("hermes.profile:",))
         assert caplog.text.count("404 to /models") == 1
         # The gateway is down: one line for it, the profiles neither raised nor cleared.
         down = f"http://127.0.0.1:{closed_port()}/p/{{}}/v1".format
@@ -94,6 +96,19 @@ async def test_hermes_probe(hermes, caplog):
         assert [(f.key, f.line, f.confirm) for f in res.findings] == [
             ("hermes.gateway", prompts.ALERT_HERMES_DOWN.format(error="в соединении отказано"), 2)]
         assert res.unknown == ("hermes.profile:",)
+        # Down, then back answering 404 everywhere: that it is back is said; a profile it knew of stays.
+        state = AlertState(problems={"hermes.profile:web": alerts.Problem(
+            "hermes.profile:web", "hermes", "crit", "Профиль web", "Hermes", NOW, fails=2, announced="crit")})
+        texts = []
+        for minutes, urls in ((0, down), (5, down), (10, url), (15, url)):
+            ctx = ctx_without_db(http=http, state=state, hermes_url=urls("gone"), hermes_web_url=urls("web"))
+            res = await run.run_check(ctx, BY_NAME["hermes"])
+            state, out = alerts.evaluate(state, [res], NOW + timedelta(minutes=minutes), tz=MSK, quiet=None)
+            if out is not None:
+                alerts.delivered(state, out, NOW + timedelta(minutes=minutes))
+                texts.append(out.text)
+        assert len(texts) == 2 and "Hermes не отвечает" in texts[0] and "снова в порядке" in texts[1]
+        assert set(state.problems) == {"hermes.profile:web"}
         # No answer within the time: a timeout, the same gateway line.
         assert await probes.probe_hermes(http, [("smart", url("slow"), "good-key")], timeout_s=0.2) == {"smart": "timeout"}
     # Archiving only: nothing to probe.
