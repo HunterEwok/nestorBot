@@ -945,6 +945,7 @@ async def test_a_check_does_not_hold_up_the_chats_answers(make_env, conn):
     "UPDATE chats SET enabled = FALSE",                                     # /pause
     "UPDATE chats SET settings = settings || '{\"address\": false}'",        # /address off
     "DELETE FROM messages WHERE message_id = 1",                            # deleted
+    "UPDATE messages SET text = 'ой, это я не тебе', edited_at = now() WHERE message_id = 1",   # edited
 ])
 async def test_what_changes_during_the_check_still_counts(make_env, pool, conn, meanwhile):
     class Slow(Checker):
@@ -957,6 +958,21 @@ async def test_what_changes_during_the_check_still_counts(make_env, pool, conn, 
     await address_on(conn)
     await feed(say(222, 1, "слушай, Нестор, а ты как думаешь?"))
     assert llm.calls == [] and bot.sent == []
+
+
+async def test_a_candidate_edited_before_its_check_is_not_asked(make_env, conn):
+    checker = Checker(YES, delay=0.2)
+    bot, _, feed = make_env(news_llm=checker)
+    await address_on(conn)
+    answerer = feed.answerer
+    first, second = message(1, "слушай, Нестор, раз?", uid=222, date=now()), \
+        message(2, "слушай, Нестор, два?", uid=222, date=now())
+    for msg in (first, second):
+        await answerer.save_outgoing(msg)
+        await answerer.on_message(msg, paused=False)      # the second waits for the check of the first
+    await feed(update("edited_message", second | {"text": "ой, это я не тебе", "edit_date": now() + 1}))
+    assert len(checker.checks) == 1                      # the edited one is not asked about, nor answered
+    assert [s["reply_to"] for s in bot.sent] == [1]
 
 
 async def test_the_authors_forget_me_during_the_check_drops_the_answer(make_env, conn):
