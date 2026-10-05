@@ -93,12 +93,16 @@ def guess(text: str | None) -> Guess | None:
     return None
 
 
+def _words(text: str) -> bool:
+    """Some words, and not a command."""
+    return bool(text.strip()) and not text.lstrip().startswith("/")
+
+
 def eligible(msg: dict) -> bool:
     """A person's own words: no bots, channels, anonymous admins, forwards or commands."""
     sender = msg.get("from") or {}
-    text = msg.get("text") or msg.get("caption") or ""
-    return bool(text.strip()) and not sender.get("is_bot") and "sender_chat" not in msg \
-        and "forward_origin" not in msg and "via_bot" not in msg and not text.lstrip().startswith("/")
+    return _words(msg.get("text") or msg.get("caption") or "") and not sender.get("is_bot") \
+        and "sender_chat" not in msg and "forward_origin" not in msg and "via_bot" not in msg
 
 
 # ---- «спасибо» to the bot: a reaction instead of an answer ----
@@ -248,9 +252,10 @@ class Reactor:
         if not queue or room <= 0 or not await self.wanted(chat_id):
             return 0
         texts = await self._texts(chat_id, [c.message_id for c in queue])
-        # On the words as they are now: an edit since it came may have made a message plain («ахахах» -> «жаль»).
+        # On the words as they are now: an edit since it came may have made a message plain («ахахах» -> «жаль»)
+        # or a command («ахахах» -> «/stats ахахах»).
         guesses = {c.message_id: g for c in queue
-                   if c.message_id in texts and (g := guess(texts[c.message_id])) is not None}
+                   if _words(texts.get(c.message_id, "")) and (g := guess(texts[c.message_id])) is not None}
         queue = [c for c in queue if c.message_id in guesses]
         allowed = await self.allowed(chat_id)
         if not queue or not allowed:
