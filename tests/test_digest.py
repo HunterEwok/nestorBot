@@ -1,11 +1,14 @@
 """The group digest once every N days (DIGEST_EVERY_DAYS, /digest N): when it is due, what period
 it retells, notes on parts of a long period, the cap on what it reads, the daily token limit,
-retention and /forget_me. The digest of one day as it always was: test_features.py."""
+retries, its own queue, retention and /forget_me. The digest of one day as it always was:
+test_features.py."""
+import asyncio
 import re
 from datetime import date, datetime, timedelta
 from datetime import time as dtime
 from zoneinfo import ZoneInfo
 
+import pytest
 from aiogram.enums import ChatMemberStatus
 from aiogram.exceptions import TelegramNetworkError
 from aiogram.methods import SendMessage
@@ -14,7 +17,7 @@ from nestor.bot import answerer, context, daily, markup, prompts
 from nestor.bot.llm import Completion
 
 from .factories import CHAT_ID, message, update
-from .test_answerer import FakeLLM, make_env_fixture  # noqa: F401 - make_env
+from .test_answerer import BOT_ID, FakeLLM, make_env_fixture  # noqa: F401 - make_env
 
 TZ = ZoneInfo("Europe/Moscow")     # the answerer's default zone
 DAY = date(2026, 10, 5)            # the morning the digest comes; it retells the days before it
@@ -31,21 +34,27 @@ def spread(first: datetime, until: datetime, n: int) -> list[datetime]:
     return [first + i * step for i in range(n)]
 
 
-async def write(conn, times: list[datetime], first: int = 1000) -> list[int]:
+async def write(conn, times: list[datetime], first: int = 1000, chat_id: int = CHAT_ID) -> list[int]:
     """Messages of the test group at these times, by users 200..209 in turn; their ids."""
     await conn.execute("INSERT INTO chats (chat_id, type, title) VALUES ($1, 'supergroup', 'Test group') "
-                       "ON CONFLICT DO NOTHING", CHAT_ID)
+                       "ON CONFLICT DO NOTHING", chat_id)
     await conn.execute("INSERT INTO users (user_id, first_name) SELECT g, 'User' || g FROM generate_series(200, 209) g "
                        "ON CONFLICT DO NOTHING")
-    rows = [(CHAT_ID, first + i, 200 + i % 10, t, f"обсуждаем тему {first + i}") for i, t in enumerate(times)]
+    rows = [(chat_id, first + i, 200 + i % 10, t, f"обсуждаем тему {first + i}") for i, t in enumerate(times)]
     await conn.executemany("INSERT INTO messages (chat_id, message_id, user_id, sent_at, text, raw) "
                            "VALUES ($1, $2, $3, $4, $5, '{}')", rows)
     return [r[1] for r in rows]
 
 
-async def digest_on(conn, **settings) -> None:
+async def spend(conn, tokens: int) -> None:
+    """Tokens spent today on something else."""
+    await conn.execute("INSERT INTO bot_requests (chat_id, scenario, input_tokens, output_tokens, status) "
+                       "VALUES ($1, 'other', $2, 0, 'ok')", CHAT_ID, tokens)
+
+
+async def digest_on(conn, chat_id: int = CHAT_ID, **settings) -> None:
     await conn.execute("UPDATE chats SET settings = settings || $2::jsonb WHERE chat_id = $1",
-                       CHAT_ID, {"digest": True, **settings})
+                       chat_id, {"digest": True, **settings})
 
 
 async def run(feed, now: datetime) -> None:
@@ -59,25 +68,30 @@ def shown(call: list[dict]) -> list[int]:
 
 
 class PartsLLM(FakeLLM):
-    """Notes name the first message of their part; the digest quotes the first note's message, one
-    from the beginning of the period. hook(call number) runs while a call is in flight."""
+    """Notes quote one message of their part: the first one by User20<quote> if it has one, else its
+    first; the digest quotes the first note's message (or the first message it was shown). Other
+    prompts get FakeLLM's answer. hook(call number) runs while a call is in flight; every call
+    reports `tokens`, input and output."""
 
-    def __init__(self, final: str | None = None, hook=None):
+    def __init__(self, final: str | None = None, hook=None, quote: int = 0, tokens: tuple[int, int] = (1000, 200)):
         super().__init__()
-        self.final, self.hook = final, hook
+        self.final, self.hook, self.quote, self.tokens = final, hook, quote, tokens
 
     async def complete(self, messages):
         done = await super().complete(messages)
         if self.hook is not None:
             await self.hook(len(self.calls))
-        user = messages[-1]["content"]
-        if messages[0]["content"] == prompts.DIGEST_NOTES_SYSTEM:
-            first = re.search(r"^#(\d+) ", user, re.MULTILINE).group(1)
-            text = f"- тема части: #{first} «обсуждаем тему {first}» (User)"
-        else:
-            first = re.search(r"#(\d+) «", user).group(1)
+        system, user = messages[0]["content"], messages[-1]["content"]
+        if system == prompts.DIGEST_NOTES_SYSTEM:
+            ids = re.findall(r"^#(\d+) ", user, re.MULTILINE)
+            first = next((i for i in ids if int(i) % 10 == self.quote), ids[0])
+            text = f"- тема части: #{first} «обсуждаем тему {first}» (User20{int(first) % 10})"
+        elif system in (prompts.DIGEST_SYSTEM, prompts.DIGEST_PERIOD_SYSTEM):
+            first = (re.search(r"#(\d+) «", user) or re.search(r"^#(\d+) ", user, re.MULTILINE)).group(1)
             text = self.final or f"- 📌 **начало**: [«обсуждаем тему {first}»](#{first})"
-        return Completion(text, done.model, done.input_tokens, done.output_tokens)
+        else:
+            return done
+        return Completion(text, done.model, *self.tokens)
 
 
 # ---- when it comes ----
@@ -185,14 +199,46 @@ async def test_a_long_period_is_read_in_parts_and_the_digest_quotes_any_of_them(
     assert await conn.fetchval("SELECT status FROM daily_posts") == "posted"
 
 
-async def test_a_busy_day_is_read_in_parts_too(make_env, conn):
-    bot, llm, feed = make_env(PartsLLM(), digest_every_days=1)
-    await write(conn, spread(at(DAY - timedelta(days=1), 0), at(DAY, 0), 600))
+async def test_the_digest_links_and_names_messages_of_every_part(make_env, conn):
+    async def forget_201(call: int) -> None:
+        if call == 4:       # while the digest itself is written
+            await feed.answerer.forget_user(201)
+
+    final = "- 📌 **начало**: см. #1000\n- 💬 **потом**: [«обсуждаем тему 1401»](#1401)"
+    bot, llm, feed = make_env(PartsLLM(final=final, hook=forget_201))
+    since, until = daily.digest_bounds(DAY, 30, TZ)
+    await write(conn, spread(since, until, 1200))
     await digest_on(conn)
     await run(feed, at(DAY, 9, 30))
-    assert [len(shown(c)) for c in llm.calls] == [300, 300, 0]
-    assert llm.calls[-1][0]["content"] == prompts.DIGEST_SYSTEM
+    assert len(llm.calls) == 4
+    # A bare number of a message from the first part is linked, as the model was shown it in the notes ...
+    assert f'см. <a href="{LINK}1000">«обсуждаем тему 1000»</a>' in bot.sent[-1]["text"]
+    # ... and a quote from the second part whose author used /forget_me meanwhile still names them: the
+    # digest leaves the log as any answer that carries their words.
+    row = await conn.fetchrow("SELECT answer, quoted_user_ids FROM bot_requests WHERE scenario = 'digest'")
+    assert (row["answer"], row["quoted_user_ids"]) == (None, [200, 201])
+
+
+async def test_a_busy_day_is_its_latest_messages_in_one_call(make_env, conn):
+    bot, llm, feed = make_env(PartsLLM(), digest_every_days=1)
+    ids = await write(conn, spread(at(DAY - timedelta(days=1), 0), at(DAY, 0), 600))
+    await digest_on(conn)
+    await run(feed, at(DAY, 9, 30))
+    # What the morning digest always read: the latest 500 of yesterday, in one call.
+    assert [shown(c) for c in llm.calls] == [ids[100:]] and llm.calls[0][0]["content"] == prompts.DIGEST_SYSTEM
     assert bot.sent[-1]["text"].startswith("☀️ <b>Дайджест за вчера, 4 октября</b>")
+    assert await conn.fetchval("SELECT array_agg(scenario) FROM bot_requests") == ["digest"]
+
+
+@pytest.mark.parametrize("n, read", [(500, [500]), (501, [250, 251, 0])])
+async def test_one_call_reads_500_messages_at_most(make_env, conn, n, read):
+    _, llm, feed = make_env(PartsLLM())
+    since, until = daily.digest_bounds(DAY, 30, TZ)
+    await write(conn, spread(since, until, n))
+    await digest_on(conn)
+    await run(feed, at(DAY, 9, 30))
+    assert [len(shown(c)) for c in llm.calls] == read
+    assert llm.calls[-1][0]["content"] == prompts.DIGEST_PERIOD_SYSTEM
 
 
 async def test_beyond_the_cap_the_period_is_thinned_evenly(make_env, conn):
@@ -216,6 +262,23 @@ async def test_beyond_the_cap_the_period_is_thinned_evenly(make_env, conn):
     assert await conn.fetchval("SELECT count(*) FROM bot_requests WHERE scenario = 'digest_notes'") == 4
 
 
+async def test_bots_are_not_retold_and_take_no_share_of_the_cap(make_env, conn):
+    _, llm, feed = make_env(PartsLLM())
+    since, until = daily.digest_bounds(DAY, 30, TZ)
+    humans = await write(conn, spread(since, until, answerer.DIGEST_MAX_MESSAGES))
+    # The bot's own posts, from the last digest on the first morning of the period on, and another bot's.
+    await conn.execute("INSERT INTO users (user_id, first_name, is_bot) VALUES ($1, 'Нестор', TRUE), "
+                       "(299, 'Spam', TRUE)", BOT_ID)
+    await conn.executemany("INSERT INTO messages (chat_id, message_id, user_id, sent_at, text, raw) "
+                           "VALUES ($1, $2, $3, $4, 'пост бота', '{}')",
+                           [(CHAT_ID, 5000 + i, (BOT_ID, 299)[i % 2], t)
+                            for i, t in enumerate(spread(since + timedelta(hours=9, minutes=30), until, 600))])
+    await digest_on(conn)
+    await run(feed, at(DAY, 9, 30))
+    assert [i for c in llm.calls[:-1] for i in shown(c)] == humans
+    assert "пост бота" not in "".join(c[1]["content"] for c in llm.calls)
+
+
 async def test_period_sample(conn):
     since = at(DAY, 0)
     ids = await write(conn, [since + timedelta(minutes=i) for i in range(10)])
@@ -234,30 +297,176 @@ async def test_period_sample(conn):
 
 # ---- the daily token limit ----
 
-async def test_the_token_limit_stops_a_long_digest_between_calls(make_env, conn):
-    bot, llm, feed = make_env(PartsLLM(), daily_token_limit=6000)       # each call: 1200
+async def test_a_digest_does_not_start_at_the_token_limit(make_env, conn):
+    _, llm, feed = make_env(PartsLLM(), daily_token_limit=6000)
+    since, until = daily.digest_bounds(DAY, 30, TZ)
+    await write(conn, spread(since, until, 1200))
+    await spend(conn, 6000)
+    await digest_on(conn, digest_days=7)        # 280 messages: one call
+    await run(feed, at(DAY, 9, 30))
+    await digest_on(conn, digest_days=30)       # about 1200: in parts
+    await run(feed, at(DAY + timedelta(days=1), 9, 30))
+    assert llm.calls == []
+    assert await conn.fetchval("SELECT array_agg(status ORDER BY day) FROM daily_posts") == ["skipped"] * 2
+
+
+async def test_a_digest_that_would_not_fit_reads_fewer_messages(make_env, conn):
+    _, llm, feed = make_env(PartsLLM(), daily_token_limit=100_000)
+    since, until = daily.digest_bounds(DAY, 30, TZ)
+    ids = await write(conn, spread(since, until, 1200))
+    await digest_on(conn)
+    await run(feed, at(DAY, 9, 30))
+    # All 1200 would take more than half the day's tokens by the rough measure: fewer are read, evenly over
+    # the whole period, in two parts instead of three, and the digest comes the same morning.
+    parts = [shown(c) for c in llm.calls[:-1]]
+    read = [i for p in parts for i in p]
+    assert len(parts) == 2 and 500 < len(read) < 1200
+    assert read == sorted(read) and read[0] == ids[0] and read[-1] >= ids[-3]
+    thirds = [sum(1 for i in read if (i - 1000) // 400 == k) for k in range(3)]
+    assert max(thirds) - min(thirds) <= 1
+    assert await conn.fetchval("SELECT status FROM daily_posts") == "posted"
+
+    # Thirty days later most of the day's tokens are spent already: it reads what one call reads.
+    later = await write(conn, spread(until, until + timedelta(days=30), 1200), first=3000)
+    await spend(conn, 85_000)
+    await run(feed, at(DAY + timedelta(days=30), 9, 30))
+    last = shown(llm.calls[-1])
+    assert llm.calls[-1][0]["content"] == prompts.DIGEST_PERIOD_SYSTEM and len(last) == 500
+    assert last[0] == later[0] and last[-1] >= later[-3]
+    assert await conn.fetchval("SELECT array_agg(status ORDER BY day) FROM daily_posts") == ["posted"] * 2
+
+
+async def test_a_started_digest_finishes_past_the_limit(make_env, conn):
+    bot, llm, feed = make_env(PartsLLM(tokens=(99_800, 200)))       # the limit: 250 000
+    since, until = daily.digest_bounds(DAY, 30, TZ)
+    await write(conn, spread(since, until, 1200))
+    await spend(conn, 60_000)
+    await digest_on(conn)
+    await run(feed, at(DAY, 9, 30))
+    # The second call of notes reached the limit: the notes left and the digest still come, as an answer
+    # once started does. Notes already paid for are not thrown away.
+    assert [c[0]["content"] for c in llm.calls] == [prompts.DIGEST_NOTES_SYSTEM] * 3 + [prompts.DIGEST_PERIOD_SYSTEM]
+    assert bot.sent[-1]["text"].startswith("☀️ <b>Дайджест за 30 дней, 5 сентября — 4 октября</b>")
+    assert await conn.fetchval("SELECT status FROM daily_posts") == "posted"
+    async with feed.answerer.pool.acquire() as c:
+        assert await feed.answerer._tokens_today(c) == 60_000 + 4 * 100_000
+
+
+# ---- retries and the queue ----
+
+async def test_a_retry_pays_only_for_notes_on_parts_that_changed(make_env, conn):
+    bot, llm, feed = make_env(PartsLLM(quote=5))       # notes quote User205 where they can
+    since, until = daily.digest_bounds(DAY, 30, TZ)
+    ids = await write(conn, spread(since, until, 1200))
+    await digest_on(conn)
+
+    async def attempt(hour: int, minute: int, *, delivered: bool) -> list:
+        bot.send_errors = [] if delivered else [TelegramNetworkError(SendMessage(chat_id=CHAT_ID, text="x"), "timeout")]
+        await conn.execute("UPDATE daily_posts SET updated_at = now() - interval '11 minutes'")
+        before = len(llm.calls)
+        await run(feed, at(DAY, hour, minute))
+        return llm.calls[before:]
+
+    first = await attempt(9, 30, delivered=False)
+    assert [shown(c) for c in first] == [ids[:400], ids[400:800], ids[800:], []]
+    # A message of the second part is edited before Telegram is tried again: only that part gets new notes.
+    await conn.execute("UPDATE messages SET text = 'обсуждаем тему 1500, исправлено', edited_at = now() "
+                       "WHERE message_id = 1500")
+    second = await attempt(9, 45, delivered=False)
+    assert [shown(c) for c in second] == [ids[400:800], []] and "исправлено" in second[0][1]["content"]
+    assert second[1] == first[3]        # the digest is written from the same notes
+    # A /forget_me drops the notes kept for a retry: they quote the one who used it.
+    assert "(User205)" in second[1][1]["content"]
+    await feed.answerer.forget_user(205)
+    assert feed.answerer._digest_parts == {}
+    third = await attempt(10, 0, delivered=True)
+    assert [len(shown(c)) for c in third] == [360, 360, 360, 0] and "User205" not in third[-1][1]["content"]
+    assert bot.sent[-1]["text"].startswith("☀️ <b>Дайджест за 30 дней")
+    assert await conn.fetchrow("SELECT status, attempts FROM daily_posts") == ("posted", 3)
+    assert await conn.fetchval("SELECT count(*) FROM bot_requests WHERE scenario = 'digest_notes'") == 7
+
+
+async def test_parts_that_keep_changing_are_read_again_later(make_env, conn):
+    editing = True
+
+    async def edit(call: int) -> None:
+        if editing:         # a message of the first part changes during every call
+            await conn.execute("UPDATE messages SET text = text || '!', edited_at = now() WHERE message_id = 1000")
+
+    _, llm, feed = make_env(PartsLLM(hook=edit))
     since, until = daily.digest_bounds(DAY, 30, TZ)
     await write(conn, spread(since, until, 1200))
     await digest_on(conn)
-    # Today's tokens already at the limit: it does not start.
-    await conn.execute("INSERT INTO bot_requests (chat_id, scenario, input_tokens, output_tokens, status) "
-                       "VALUES ($1, 'other', 5000, 1000, 'ok')", CHAT_ID)
     await run(feed, at(DAY, 9, 30))
-    assert llm.calls == [] and await conn.fetchval("SELECT status FROM daily_posts") == "skipped"
+    # The notes, then twice new notes on the first part: it still changed, so no digest is written from them.
+    assert [c[0]["content"] for c in llm.calls] == [prompts.DIGEST_NOTES_SYSTEM] * 5
+    assert await conn.fetchval("SELECT status FROM daily_posts") == "failed"
+    # Ten minutes later, with no more edits: new notes on the first part only, it changed during the last call.
+    editing = False
+    await conn.execute("UPDATE daily_posts SET updated_at = now() - interval '11 minutes'")
+    await run(feed, at(DAY, 9, 45))
+    assert [c[0]["content"] for c in llm.calls[5:]] == [prompts.DIGEST_NOTES_SYSTEM, prompts.DIGEST_PERIOD_SYSTEM]
+    assert "обсуждаем тему 1000!!!!!\n" in llm.calls[5][1]["content"]        # as edited during the 5 calls
+    assert await conn.fetchval("SELECT status FROM daily_posts") == "posted"
 
-    # Below it, it starts; two calls of notes reach it, and the rest waits for another day.
-    await conn.execute("UPDATE bot_requests SET input_tokens = 2700")       # 3700 spent today
-    await run(feed, at(DAY + timedelta(days=1), 9, 30))
-    assert len(llm.calls) == 2 and not any(s["text"].startswith("☀️") for s in bot.sent)
-    assert await conn.fetchval("SELECT status FROM daily_posts WHERE day = $1", DAY + timedelta(days=1)) == "skipped"
-    assert await conn.fetchval("SELECT array_agg(scenario ORDER BY id) FROM bot_requests") == \
-        ["other", "digest_notes", "digest_notes"]
 
-    # The next day (yesterday's tokens no longer count) it is still due, and comes.
-    await conn.execute("UPDATE bot_requests SET created_at = created_at - interval '1 day'")
-    await run(feed, at(DAY + timedelta(days=2), 9, 30))
-    assert bot.sent[-1]["text"].startswith("☀️ <b>Дайджест за 30 дней, 7 сентября — 6 октября</b>")
-    assert await conn.fetchval("SELECT status FROM daily_posts WHERE day = $1", DAY + timedelta(days=2)) == "posted"
+async def test_questions_do_not_wait_for_a_digest(make_env, conn):
+    asking: list[asyncio.Task] = []
+    answered_at: list[int] = []
+
+    async def replied() -> None:
+        while not any(s["reply_to"] == 1 for s in bot.sent):
+            await asyncio.sleep(0.01)
+
+    async def ask(call: int) -> None:
+        if call == 1:       # while the first part of the digest is read, someone asks the bot
+            asking.append(asyncio.create_task(feed(update("message", message(1, "нестор, как дела?", uid=300)))))
+            await asyncio.wait_for(replied(), 5)
+            answered_at.append(len(llm.calls))
+
+    bot, llm, feed = make_env(PartsLLM(hook=ask))
+    since, until = daily.digest_bounds(DAY, 30, TZ)
+    await write(conn, spread(since, until, 1200))
+    await digest_on(conn)
+    await run(feed, at(DAY, 9, 30))
+    await asking[0]
+    # Answered, 👀 first, with only the first call of notes made: scheduled posts have a queue of their own.
+    assert answered_at == [2] and bot.reactions == [(1, ["👀"]), (1, [])]
+    assert [c[0]["content"] == prompts.DIGEST_NOTES_SYSTEM for c in llm.calls] == [True, False, True, True, False]
+    assert await conn.fetchval("SELECT status FROM daily_posts") == "posted"
+
+
+async def test_digests_of_two_groups_come_one_after_the_other(make_env, conn):
+    other = CHAT_ID - 1
+    llm = PartsLLM(tokens=(30_000, 0))
+    llm.delay = 0.01
+    _, llm, feed = make_env(llm, daily_token_limit=100_000, allowed_chat_ids=frozenset({CHAT_ID, other}))
+    since, until = daily.digest_bounds(DAY, 30, TZ)
+    for chat_id, first in ((CHAT_ID, 1000), (other, 3000)):
+        await write(conn, spread(since, until, 1200), first=first, chat_id=chat_id)
+        await digest_on(conn, chat_id)
+    await run(feed, at(DAY, 9, 30))
+    # The first measures the day's tokens and reads in two parts; the second, after it, sees what it spent
+    # and reads one call's worth.
+    group = ["other" if re.search(r"#3\d{3}\b", c[1]["content"]) else "test" for c in llm.calls]
+    assert group in (["test"] * 3 + ["other"], ["other"] * 3 + ["test"]) and llm.max_active == 1
+    assert len(shown(llm.calls[-1])) == 500
+    assert await conn.fetchval("SELECT array_agg(status) FROM daily_posts") == ["posted"] * 2
+
+
+async def test_a_post_still_running_is_not_claimed_again(make_env, conn):
+    async def tick(call: int) -> None:
+        if call == 1:       # a tick half an hour into the digest: it is not taken for one that died mid-way
+            await conn.execute("UPDATE daily_posts SET updated_at = now() - interval '31 minutes'")
+            await feed.answerer.run_daily_posts(at(DAY, 10, 0))
+
+    bot, llm, feed = make_env(PartsLLM(hook=tick))
+    since, until = daily.digest_bounds(DAY, 30, TZ)
+    await write(conn, spread(since, until, 1200))
+    await digest_on(conn)
+    await run(feed, at(DAY, 9, 30))
+    assert await conn.fetchrow("SELECT status, attempts FROM daily_posts") == ("posted", 1)
+    assert len(llm.calls) == 4 and sum(s["text"].startswith("☀️") for s in bot.sent) == 1
 
 
 # ---- /forget_me ----
@@ -269,7 +478,7 @@ async def test_forgotten_authors_never_reach_the_model(make_env, conn):
         if call == 1:       # while the first part is being read
             await feed.answerer.forget_user(207)
 
-    bot, llm, feed = make_env(PartsLLM(hook=forget_207))
+    bot, llm, feed = make_env(PartsLLM(hook=forget_207, quote=7))     # notes quote User207 where they can
     ids = await write(conn, spread(since, until, 1200))
     # User 201 forwarded a message of 207's in the last part.
     await conn.execute("""UPDATE messages SET text = 'секрет от 207', forward_origin = '{"type": "user",
@@ -278,12 +487,18 @@ async def test_forgotten_authors_never_reach_the_model(make_env, conn):
     await digest_on(conn)
     await run(feed, at(DAY, 9, 30))
 
-    seen = [shown(c) for c in llm.calls[:3]]
+    seen = [shown(c) for c in llm.calls[:-1]]
     assert not any(i % 10 == 5 for part in seen for i in part)
     assert any(i % 10 == 7 for i in seen[0])                    # read before the /forget_me ...
     assert not any(i % 10 == 7 for part in seen[1:] for i in part)          # ... and not after it
     assert "секрет" not in llm.calls[2][1]["content"] and ids[1000] in seen[2]
-    assert "обсуждаем тему" in bot.sent[-1]["text"]
+    # The notes on the first part quote 207 by name: the part is read again before the digest is written
+    # from them, and gets new notes. Neither 207's words nor name reach the model again, nor the group.
+    assert len(seen) == 4 and seen[3] == [i for i in seen[0] if i % 10 != 7]
+    final = llm.calls[-1][1]["content"]
+    assert "User207" not in final and not re.search(r"#\d+7\b", final)
+    post = bot.sent[-1]["text"]
+    assert "обсуждаем тему 1000" in post and "User207" not in post and not re.search(r"тему \d+7\b", post)
 
 
 # ---- /digest N ----
