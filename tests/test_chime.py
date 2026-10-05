@@ -7,6 +7,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from aiogram.enums import ChatMemberStatus
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.methods import SendMessage
 from aiogram.types import ReactionTypeEmoji
 
 from nestor import retention
@@ -289,7 +291,7 @@ async def test_it_needs_people_talking_in_the_last_hour(make_env, conn, people, 
     assert len(model.looks) == looks
 
 
-async def test_once_an_hour_and_never_right_after_a_remark(make_env, conn):
+async def test_once_an_hour_from_the_start_of_the_last_look(make_env, conn):
     model = Profile(SILENCE)
     _, _, feed = make_env(news_llm=model)
     await chime_on(conn)
@@ -319,11 +321,28 @@ async def test_once_an_hour_and_never_right_after_a_remark(make_env, conn):
     await logged(conn, at + 2 * hour + timedelta(seconds=40))      # the remark went out at 14:00:40
     model.chime = SILENCE
     await talk(at + 3 * hour, 5000)
-    await look(feed, at + 3 * hour + timedelta(seconds=10))         # 15:00:10: it is less than an hour old
+    await look(feed, at + 3 * hour)                                 # 15:00:00: not an hour since the last look
     assert len(model.looks) == 3
-    await talk(at + 4 * hour, 6000)
-    await look(feed, at + 4 * hour + timedelta(seconds=10))
+    await look(feed, at + 3 * hour + timedelta(seconds=10))         # 15:00:10: an hour since the look that made it
     assert len(model.looks) == 4
+
+
+async def test_a_remark_may_come_on_the_next_look(make_env, conn):
+    """«No remark in the last hour» counts from the start of the look that made it, not from when the remark
+    went out: the next hourly look may speak again."""
+    model = Profile(remark(1))                  # message 1 is Петя's
+    bot, _, feed = make_env(news_llm=model)
+    await chime_on(conn)
+    at, hour, took = noon(), timedelta(hours=1), timedelta(seconds=40)
+    await chat(feed, at)
+    await look(feed, at)
+    await logged(conn, at + took)               # the model took a while: the remark went out at 12:00:40
+    await conn.execute("UPDATE messages SET sent_at = $1 WHERE user_id = $2", at + took, BOT_ID)
+    await chat(feed, at + hour, first=100)
+    model.chime = remark(3)                     # 1 is the remark itself, 2 Петя's message 100, 3 someone else's 101
+    await look(feed, at + hour)
+    assert [s["reply_to"] for s in bot.sent] == [1, 101] and len(model.looks) == 2
+    assert await conn.fetchval("SELECT count(*) FROM bot_requests WHERE scenario = 'chime' AND status = 'ok'") == 2
 
 
 @pytest.mark.parametrize("earlier, looks", [
@@ -457,6 +476,29 @@ async def test_what_changes_during_the_look_still_counts(make_env, pool, conn, m
     assert await conn.fetchval("SELECT scenario FROM bot_requests") == "chime_check"
 
 
+async def test_a_remark_is_said_to_its_target_or_not_at_all(make_env, conn):
+    """Deleted in Telegram before the archive heard of it: Telegram refuses the reply, and the remark
+    is not sent without it."""
+    bot, _, feed = make_env(news_llm=Profile(remark(2)))
+    send, asked = bot.send_message, []
+
+    async def deleted(chat_id, text, reply_parameters=None, **kw):     # what Telegram does then
+        asked.append(reply_parameters)
+        if not reply_parameters.allow_sending_without_reply:
+            raise TelegramBadRequest(SendMessage(chat_id=chat_id, text=text),
+                                     "Bad Request: message to be replied not found")
+        return await send(chat_id, text, reply_parameters=None, **kw)
+    bot.send_message = deleted
+    await chime_on(conn)
+    await chat(feed, noon())
+    await look(feed, noon())
+    assert bot.sent == [] and [r.message_id for r in asked] == [2]
+    row = await conn.fetchrow("SELECT scenario, status, answer, answer_msg_ids, quoted_user_ids FROM bot_requests")
+    assert dict(row) == {"scenario": "chime_check", "status": "error", "answer": None, "answer_msg_ids": [],
+                         "quoted_user_ids": None}
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE user_id = $1", BOT_ID) == 0
+
+
 async def test_one_look_per_chat_at_a_time(make_env, conn):
     model = Profile(SILENCE, delay=0.3)
     _, _, feed = make_env(news_llm=model)
@@ -520,6 +562,20 @@ async def test_quiet_until_the_end_of_the_day(make_env, conn, text, replied):
     await chime_on(conn, chime_quiet=(datetime.now(MSK).date() - timedelta(days=1)).isoformat())
     await look(feed, noon() + timedelta(hours=3))
     assert len(model.looks) == 2
+
+
+async def test_chime_on_ends_the_quiet(make_env, conn):
+    model = Profile(SILENCE)
+    _, _, feed = make_env(admins={111}, news_llm=model)
+    await chime_on(conn, chime_quiet=datetime.now(MSK).date().isoformat(), address=True)
+    await chat(feed, noon())
+    await feed(say(111, 50, "/chime off", noon()))
+    assert await conn.fetchval("SELECT settings->>'chime_quiet' FROM chats") is not None     # off keeps it
+    await feed(say(111, 51, "/chime on", noon()))
+    settings = await conn.fetchval("SELECT settings FROM chats")
+    assert settings["chime"] is True and settings["address"] is True and "chime_quiet" not in settings
+    await look(feed, noon())
+    assert len(model.looks) == 1
 
 
 async def test_quiet_says_it_in_words_where_the_chat_takes_no_such_reaction(make_env, conn):

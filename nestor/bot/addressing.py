@@ -1,7 +1,7 @@
 """Addressing in the person's own words, the owner's «гибрид В» of 2026-10-05.
 
 The clear cases are decided by code for free (nestor.bot.triggers.detect): a command, an @mention,
-a reply to the bot, the name at the start with a comma. In a group where an admin turned on
+a reply to the bot, the name at the start with a comma, or alone. In a group where an admin turned on
 /address, the doubtful ones are candidates: the name elsewhere in the message with a sign of
 an address («слушай, Нестор, а ты как думаешь?»), the name at the start without a comma
 («нестор вчера тупил»), and «ты», a request or a question from someone the bot has just

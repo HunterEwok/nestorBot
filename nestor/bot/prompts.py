@@ -73,6 +73,7 @@ HELP = """👋 <b>Я Нестор</b>: молча веду архив этой �
 /pause, /resume — остановить и продолжить запись
 /bot_word on|off — обращение «бот»
 /digest on|off, /wisdom on|off, /news on|off, /reactions on|off — дайджест, мудрость дня, новости, реакции
+/address on|off, /chime on|off — обращения своими словами, мои реплики
 /digest N — дайджест раз в N дней, от 1 до 90
 /news status — состояние источников новостей"""
 

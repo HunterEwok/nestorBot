@@ -51,11 +51,17 @@ def verdict(text: str | None, *, on: bool = True, bot_word: bool = True, window:
     ("нестор напомни завтра в 10 про встречу", "explicit"),
     ("нестор вчера тупил?", "explicit"),
     ("бот, привет", "explicit"),
+    # Only the name, maybe with a mark or an emoji: a call, as today.
+    ("нестор", "explicit"),
+    ("Нестор ", "explicit"),
+    ("нестор 👋", "explicit"),
+    ("Нестор)", "explicit"),
+    ("нестор...", "explicit"),
+    ("бот", "explicit"),
     # The name at the start and nothing that speaks to it: maybe it is talk about the bot.
     ("нестор вчера тупил", "candidate"),
     ("бот опять всё перепутал", "candidate"),
     ("Нестор молодец", "candidate"),
-    ("нестор", "candidate"),
     # The name elsewhere with a sign of an address.
     ("слушай, Нестор, а ты как думаешь?", "candidate"),
     ("Ну что, Нестор, пойдём", "candidate"),
@@ -103,6 +109,7 @@ def test_with_address_off_nothing_changes(text, expected):
 
 @pytest.mark.parametrize("text, expected", [
     ("бот, привет", "silent"),
+    ("бот", "silent"),
     ("бот опять всё перепутал", "silent"),
     ("эй бот, ты тут?", "silent"),
     ("кто знает, бот это сможет?", "silent"),
@@ -189,6 +196,8 @@ def test_rendered_without_names():
 def test_texts():
     help_text = prompts.HELP.format(username="ewok_nestor_bot")
     assert "• своими словами («а ты как думаешь, нестор?»), если админ включил /address on" in help_text
+    for_admins = help_text.split("<b>Для админов</b>")[1].splitlines()
+    assert "/address on|off, /chime on|off — обращения своими словами, мои реплики" in for_admins
     lines = markup.to_plain(prompts.ADDRESS_ON).splitlines()
     assert 2 <= len(lines) <= 4 and "/privacy" in lines[-1] and "без имён" in prompts.ADDRESS_ON
     assert "по имени" in prompts.ADDRESS_OFF and "через @" in prompts.ADDRESS_OFF

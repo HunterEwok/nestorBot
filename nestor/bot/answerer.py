@@ -364,10 +364,13 @@ class Answerer:
             if change is None:      # /digest 0, /digest 91, /digest abc: nothing changes
                 await self._say(msg, prompts.DIGEST_USAGE.format(max=daily.DIGEST_MAX_DAYS))
                 return
+        # /chime on starts afresh: a «нестор, помолчи» from earlier today no longer holds.
+        dropped = ["chime_quiet"] if key == "chime" and change.get("chime") else []
         async with self.pool.acquire() as conn:
             if change:
-                await conn.execute("UPDATE chats SET settings = settings || $2::jsonb WHERE chat_id = $1",
-                                   chat_id, change)
+                await conn.execute(
+                    "UPDATE chats SET settings = (settings - $3::text[]) || $2::jsonb WHERE chat_id = $1",
+                    chat_id, change, dropped)
             settings = await conn.fetchval("SELECT settings FROM chats WHERE chat_id = $1", chat_id) or {}
         if key == "digest":
             on, days = bool(settings.get("digest", False)), self._digest_days(settings)
@@ -1551,11 +1554,13 @@ class Answerer:
                 return "off"
             if await self._tokens_today(conn) >= self.cfg.daily_token_limit // 2:     # answers come first
                 return "no_tokens"
-            made = await conn.fetchrow(
-                "SELECT count(*) FILTER (WHERE created_at >= $2) AS today, max(created_at) AS last "
-                "FROM bot_requests WHERE chat_id = $1 AND scenario = 'chime' AND status = 'ok'",
-                chat_id, local.replace(hour=0, minute=0, second=0, microsecond=0))
-            if made["today"] >= cfg.daily or (made["last"] is not None and made["last"] > hour):
+            # No remark in the last hour either: only a look makes one, and looks are an hour apart from
+            # start to start (run_chimes). A remark written down a minute into its look does not hold up
+            # the next look, so remarks may come on consecutive looks, one an hour.
+            made = await conn.fetchval(
+                "SELECT count(*) FROM bot_requests WHERE chat_id = $1 AND scenario = 'chime' AND status = 'ok' "
+                "AND created_at >= $2", chat_id, local.replace(hour=0, minute=0, second=0, microsecond=0))
+            if made >= cfg.daily:
                 return "enough"
             # This chat only: a message of the basic group it moved from cannot be answered here.
             if await context.count_since(conn, [chat_id], None, hour, except_user=self.me.user_id) < cfg.min_messages:
@@ -1595,16 +1600,22 @@ class Answerer:
             async with self.pool.acquire() as conn:
                 await self._log_scheduled(conn, chat_id, "chime_check", completion, [], started, keep_text=False)
             return "silent"
-        sent = await self._send(chat_id, pick.text, reply_to=target["message_id"])
+        # A remark is said to its target or not at all: when Telegram refuses the reply (the message was
+        # deleted and the archive has not heard yet) or the send fails, it is dropped, and no text is kept.
+        sent = await self._send(chat_id, pick.text, reply_to=target["message_id"], without_reply=False)
+        if sent is None:
+            async with self.pool.acquire() as conn:
+                await self._log_scheduled(conn, chat_id, "chime_check", completion, [], started, status="error",
+                                          keep_text=False)
+            return "failed"
         # Logged as an answer to the target's author: /forget_me and the purge take it with their message.
         quoted = sorted({target["user_id"], target["forwarded_from"]} - {None})
         async with self.pool.acquire() as conn, conn.transaction():
             await forget.erase_lock(conn)       # it may erase: the lock comes before the insert's row locks
             rid = await self._log_scheduled(conn, chat_id, "chime", replace(completion, text=pick.text), [sent],
-                                            started, status="ok" if sent else "error", quoted_user_ids=quoted,
-                                            oldest_source_at=target["stored_at"])
+                                            started, quoted_user_ids=quoted, oldest_source_at=target["stored_at"])
             await self._scrub_if_opted_out(conn, rid, quoted)
-        return "posted" if sent else "failed"
+        return "posted"
 
     async def _chime_wanted(self, conn, chat_id: int, day: date) -> bool:
         """/chime on, not paused, not moved to a supergroup, and nobody said «нестор, помолчи» on this day."""
@@ -1659,15 +1670,17 @@ class Answerer:
 
     async def _send(self, chat_id: int, text: str, *, reply_to: int | None = None, save: bool = True,
                     html: bool = False, preview_url: str | None = None,
-                    keyboard: InlineKeyboardMarkup | None = None, plain: str | None = None) -> Message | None:
-        """plain: the same text without formatting, sent if Telegram refuses the HTML."""
+                    keyboard: InlineKeyboardMarkup | None = None, plain: str | None = None,
+                    without_reply: bool = True) -> Message | None:
+        """plain: the same text without formatting, sent if Telegram refuses the HTML. without_reply=False:
+        when the message replied to is gone, Telegram refuses, and nothing is sent."""
         preview = (LinkPreviewOptions(url=preview_url, prefer_large_media=True, show_above_text=True) if preview_url
                    else LinkPreviewOptions(is_disabled=True))
 
         async def send(body: str, formatted: bool) -> Message:
             return await self.bot.send_message(
                 chat_id, body,
-                reply_parameters=(ReplyParameters(message_id=reply_to, allow_sending_without_reply=True)
+                reply_parameters=(ReplyParameters(message_id=reply_to, allow_sending_without_reply=without_reply)
                                   if reply_to is not None else None),
                 link_preview_options=preview, parse_mode="HTML" if formatted else None, reply_markup=keyboard,
             )

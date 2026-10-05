@@ -75,7 +75,8 @@ def detect(msg: dict, me: BotIdentity, *, generic_keyword_enabled: bool = True,
            addressing: bool = False) -> Invocation | None:
     """An explicit call: a command, an @mention, a reply to the bot, or the name at the start.
     addressing (/address on): the name at the start counts only when a comma or another mark comes
-    after it, or the rest speaks to someone; «нестор вчера тупил» is left to nestor.bot.addressing."""
+    after it, the rest speaks to someone, or there is no rest («нестор», «нестор 👋»); «нестор вчера
+    тупил» is left to nestor.bot.addressing."""
     text = msg.get("text") or msg.get("caption") or ""
     entities = msg.get("entities") or msg.get("caption_entities") or []
 
@@ -105,6 +106,8 @@ def detect(msg: dict, me: BotIdentity, *, generic_keyword_enabled: bool = True,
         if km:
             rest = text[km.end():]
             # keyword_pattern takes «,:;!.—-» after the name with it; «?», «…» and «–» stay in the rest.
-            if not addressing or _MARK.search(km.group()) or _MARK.match(rest) or speaks_to(rest):
+            # The bare name, maybe with an emoji or a bracket after it, calls the bot as it always did.
+            if not addressing or _MARK.search(km.group()) or _MARK.match(rest) or speaks_to(rest) \
+                    or not re.search(r"\w", rest):
                 return Invocation("keyword", rest.strip())
     return None
