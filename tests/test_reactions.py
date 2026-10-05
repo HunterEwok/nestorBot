@@ -278,6 +278,19 @@ async def test_a_message_edited_into_plain_words_is_not_shown_to_the_model(make_
     assert model.calls == [] and bot.reactions == []
 
 
+@pytest.mark.parametrize("asked", [False, True])
+async def test_a_message_edited_into_a_command_gets_no_reaction(make_env, conn, asked):
+    model = picks((1, "😁"))
+    bot, llm, feed = make_env(news_llm=model if asked else None, reaction_chat_ids=frozenset({CHAT_ID}),
+                              reactions=FAST)
+    msg = message(1, "ахахах", uid=222, date=NOW())
+    await feed.answerer.save_outgoing(msg)
+    await conn.execute("UPDATE messages SET text = '/stats ахахах', edited_at = now() WHERE message_id = 1")
+    assert feed.answerer.reactor.consider(msg)
+    await feed.answerer.reactor.drain()
+    assert model.calls == [] and llm.calls == [] and bot.reactions == []
+
+
 async def test_reactions_are_off_by_default_and_switched_by_admins(make_env):
     bot, llm, feed = make_env(admins={111}, reactions=FAST)
     await feed(update("message", message(1, "ахахах", uid=222, date=NOW())))
