@@ -63,6 +63,13 @@ def verdict(text: str | None, *, on: bool = True, bot_word: bool = True, window:
     ("нестор оцени тезисы", "explicit"),
     ("нестор напомни завтра в 10 про встречу", "explicit"),
     ("нестор вчера тупил?", "explicit"),
+    ("нестор что я пропустил", "explicit"),         # a question by its first word, without its «?»
+    ("нестор кто прав", "explicit"),
+    ("нестор как дела", "explicit"),
+    ("нестор что нового", "explicit"),
+    ("нестор кто говорил про отпуск", "explicit"),
+    ("нестор какая погода в Москве", "explicit"),
+    ("бот сколько времени", "explicit"),
     ("бот, привет", "explicit"),
     ("нестор, глянь https://youtu.be/abc?si=xyz", "explicit"),
     # «помолчи» needs no check: it asks nothing of the model (nestor.bot.chime).
@@ -85,10 +92,9 @@ def verdict(text: str | None, *, on: bool = True, bot_word: bool = True, window:
     ("бот-то опять всё перепутал", "candidate"),
     ("Нестор-то молодец", "candidate"),
     ("бот-помощник опять всё перепутал", "candidate"),
-    ("нестор что я пропустил", "candidate"),         # a question without its «?», or talk: the model decides
-    ("нестор кто прав", "candidate"),
-    ("бот сколько времени", "candidate"),
-    ("нестор что-то тупит", "candidate"),
+    ("нестор что-то тупит", "candidate"),            # not a question: «что-то», «как всегда», «когда-то»
+    ("нестор как всегда всё перепутал", "candidate"),
+    ("бот когда-то работал", "candidate"),
     ("нестор вчера скинул ролик https://youtu.be/abc?si=xyz", "candidate"),    # a «?» in a link is no question
     # The name elsewhere with a sign of an address.
     ("слушай, Нестор, а ты как думаешь?", "candidate"),
@@ -241,13 +247,15 @@ def test_not_a_candidate_whatever_the_words(kw):
     assert verdict("а ты уверен?", window=True, **kw) == "silent"
 
 
-@pytest.mark.parametrize("text", ["нестор переведи", "нестор вчера тоже тупил", "нестор кто прав", "бот кто прав",
-                                  "Нестор\nкто тут прав"])
-def test_the_name_at_the_start_of_a_reply_to_someone_is_for_the_model(text):
-    """As a call by name it was answered with /address off: under a friend's message it is checked, not dropped."""
+@pytest.mark.parametrize("text, expected", [("нестор переведи", "candidate"), ("нестор вчера тоже тупил", "candidate"),
+                                            ("нестор кто прав", "explicit"), ("бот кто прав", "explicit"),
+                                            ("Нестор\nкто тут прав", "explicit")])
+def test_the_name_at_the_start_of_a_reply_to_someone_is_for_the_model(text, expected):
+    """As a call by name it was answered with /address off: under a friend's message it is checked, not dropped,
+    and a question after the name is answered as it always was."""
     friend = message(7, "налоги надо снизить вдвое", uid=222)
     assert verdict(text, on=False, reply_to_message=friend) == "explicit"
-    assert verdict(text, reply_to_message=friend) == "candidate"
+    assert verdict(text, reply_to_message=friend) == expected
 
 
 def test_replies_that_still_may_be_to_the_bot():
@@ -634,6 +642,19 @@ async def test_no_checks_past_half_the_days_tokens(make_env, conn):
     assert len(llm.calls) == 1
 
 
+@pytest.mark.parametrize("on", [True, False])
+async def test_a_question_after_the_name_is_answered_past_half_the_days_tokens(make_env, conn, on):
+    """No check to skip: with /address on as with it off."""
+    checker = Checker(YES)
+    bot, llm, feed = make_env(news_llm=checker, daily_token_limit=10_000)
+    await address_on(conn)
+    await conn.execute("UPDATE chats SET settings = settings || jsonb_build_object('address', $1::boolean)", on)
+    await conn.execute("INSERT INTO bot_requests (chat_id, scenario, input_tokens, status) "
+                       "VALUES ($1, 'x', 5000, 'ok')", CHAT_ID)
+    await feed(say(222, 1, "нестор кто говорил про отпуск"))
+    assert checker.calls == [] and len(llm.calls) == 1 and bot.sent[-1]["reply_to"] == 1
+
+
 async def test_a_yes_keeps_the_limits_of_a_request(make_env, conn):
     checker = Checker(YES)
     bot, llm, feed = make_env(news_llm=checker, rate_limit=1)
@@ -681,6 +702,17 @@ async def test_the_name_at_the_start_under_a_friends_message_is_answered_on_a_ye
         "1. Аноним 1: налоги надо снизить вдвое\n2. Аноним 2 (ответ на 1): нестор переведи")
     assert len(llm.calls) == 1 and bot.sent[-1]["reply_to"] == 2
     assert await conn.fetchval("SELECT question FROM bot_requests WHERE trigger_msg_id = 2") == "переведи"
+
+
+@pytest.mark.parametrize("text, scenario", [("нестор кто прав", "who_is_right"), ("нестор что я пропустил", "catchup")])
+async def test_a_question_after_the_name_needs_no_check(make_env, conn, text, scenario):
+    """Without its «?» too: answered as with /address off, also with no profile to check it with."""
+    bot, llm, feed = make_env()
+    await address_on(conn)
+    await feed(say(333, 1, "налоги надо снизить вдвое"))
+    await feed(say(222, 2, text, reply_to_message=message(1, "налоги надо снизить вдвое", uid=333)))
+    assert len(llm.calls) == 1 and bot.sent[-1]["reply_to"] == 2
+    assert await conn.fetchval("SELECT scenario FROM bot_requests WHERE trigger_msg_id = 2") == scenario
 
 
 async def test_a_no_still_may_get_a_reaction(make_env, conn):
