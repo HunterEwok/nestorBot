@@ -125,6 +125,9 @@ def test_chime_settings(env):
                                ("CHIME_HOURS", "23:00-10:00", "the start before the end, got '23:00-10:00'"),
                                ("CHIME_HOURS", "10:00-10:00", "the start before the end"),
                                ("CHIME_HOURS", "днём", "CHIME_HOURS must look like 10:00-23:00"),
+                               # an offset: the scheduler compares the hours with the local clock
+                               ("CHIME_HOURS", "10:00+03:00-23:00+03:00", "CHIME_HOURS must look like 10:00-23:00"),
+                               ("CHIME_HOURS", "10:00Z-23:00Z", "CHIME_HOURS must look like 10:00-23:00"),
                                ("CHIME_MIN_MESSAGES", "0", "CHIME_MIN_MESSAGES must be a number of messages from 1 to 500"),
                                ("CHIME_WINDOW", "101", "CHIME_WINDOW must be a number of messages from 1 to 100"),
                                ("CHIME_DAILY", "25", "CHIME_DAILY must be a number of remarks from 0 to 24, got 25"),
@@ -181,6 +184,8 @@ def test_alert_settings_parse_off_and_garbage(env):
                                ("ALERT_QUIET", "23:00-08:00-09:00", "ALERT_QUIET must look like"),
                                ("ALERT_QUIET", "23:00-23:00", "ALERT_QUIET must look like"),
                                ("ALERT_QUIET", "ночью", "ALERT_QUIET must look like"),
+                               ("ALERT_QUIET", "23:00Z-08:00Z", "ALERT_QUIET must look like"),
+                               ("ALERT_DAILY_AT", "09:30+03:00", "ALERT_DAILY_AT must look like 21:00"),
                                ("ALERT_DISK_MIN_GB", "пять", "ALERT_DISK_MIN_GB must be a whole number"),
                                ("ALERT_MAX_MEMBERS", "двое", "ALERT_MAX_MEMBERS must be a whole number")):
         good = config._env(name)
