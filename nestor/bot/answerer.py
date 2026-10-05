@@ -2,9 +2,12 @@
 time (FR-14), conversation continuation (FR-15), scenarios SC-1..SC-6, audit log.
 
 Besides answers, the bot speaks on its own only when someone asked for it: reminders,
-the group digest and the wisdom of the day (started by nestor.bot.scheduler), and the
-/export file in a private chat. Scheduled posts wait in a queue of their own, so they never
-hold up a group's answers.
+the group digest and the wisdom of the day (started by nestor.bot.scheduler), the /export
+file in a private chat, and where an admin turned on /chime, a rare remark of its own
+(nestor.bot.chime). Scheduled posts wait in a queue of their own, so they never hold up a
+group's answers. Where an admin turned on /address, a message that may be addressed to the
+bot without its name is checked first (nestor.bot.addressing) and, on a yes, answered like
+any other request.
 """
 from __future__ import annotations
 
@@ -17,7 +20,7 @@ import logging
 import re
 import secrets
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time as dtime, timedelta, timezone
 from typing import Awaitable, Callable, Collection
 from zoneinfo import ZoneInfo
@@ -32,10 +35,10 @@ from aiogram.types import (BufferedInputFile, InlineKeyboardMarkup, LinkPreviewO
 from .. import forget, promises
 from ..collector.app import dump
 from ..watchdog.alerts import fmt_since, render_status
-from . import context, daily, export, markup, music, prompts, reactions, reminders, routing
+from . import addressing, chime, context, daily, export, markup, music, prompts, reactions, reminders, routing
 from .llm import LLM, Completion
 from .markup import TELEGRAM_LIMIT, split_text
-from .triggers import BotIdentity, Invocation, detect
+from .triggers import URL, BotIdentity, Invocation, detect
 
 log = logging.getLogger("nestor.answerer")
 
@@ -52,16 +55,16 @@ _DIGEST_DAYS = re.compile(r"(\d+)(?:\s*(?:д|дн|день|дня|дней))?") 
 # each part, keeping the numbers of its key messages, and the digest is written from the notes.
 # Every call is its own row of bot_requests, so the daily token limit counts them all. Beyond
 # DIGEST_MAX_MESSAGES the period is thinned evenly over time (context.period_sample): 4 calls of
-# notes and the final one. The digests of all groups together take half of the day's tokens at most
-# (answers keep the rest), every call of notes included (_digest_room). Before its first call a
-# digest is measured roughly, DIGEST_CHARS_PER_TOKEN characters of the rendered messages per token
-# and DIGEST_CALL_TOKENS for each call's own prompt, answer and the agent's overhead, and thinned
-# further to fit in what is left of that half and of the day. When not even one call's worth fits
-# (DIGEST_CHUNK messages, or all when fewer), it is skipped and comes the next morning. A digest once
-# started finishes, as an answer does (the limit is soft): the tokens never stop its measured notes
-# or its final call (only /pause or /digest off do). New notes on parts that changed meanwhile were
-# not measured, so each is made only while it fits in what is left; else the attempt fails and keeps
-# its notes for a retry.
+# notes and the final one. The digests of all groups together take half of the day's tokens at most,
+# shared with the reactions, address checks and remarks (answers keep the rest), every call of notes
+# included (_digest_room). Before its first call a digest is measured roughly, DIGEST_CHARS_PER_TOKEN
+# characters of the rendered messages per token and DIGEST_CALL_TOKENS for each call's own prompt,
+# answer and the agent's overhead, and thinned further to fit in what is left of that half and of
+# the day. When not even one call's worth fits (DIGEST_CHUNK messages, or all when fewer), it is
+# skipped and comes the next morning. A digest once started finishes, as an answer does (the limit
+# is soft): the tokens never stop its measured notes or its final call (only /pause or /digest off
+# do). New notes on parts that changed meanwhile were not measured, so each is made only while it
+# fits in what is left; else the attempt fails and keeps its notes for a retry.
 DIGEST_CHUNK = 500
 DIGEST_MAX_MESSAGES = 2000
 DIGEST_CHARS_PER_TOKEN = 2.5
@@ -102,6 +105,8 @@ class AnswerConfig:
     news_max_topics: int = 10
     reaction_chat_ids: frozenset[int] = frozenset()  # reactions on by default; /reactions on|off overrides
     reactions: reactions.ReactionConfig = reactions.ReactionConfig()
+    address: addressing.AddressConfig = field(default_factory=addressing.AddressConfig)   # /address, off by default
+    chime: chime.ChimeConfig = field(default_factory=chime.ChimeConfig)     # /chime, off by default
     alert_chat_id: int | None = None    # ALERT_CHAT_ID: /status answers there only, to its admins; None: nowhere
 
 
@@ -170,8 +175,12 @@ class Answerer:
         self.checker = checker or music.HttpChecker()
         self.save_outgoing = save_outgoing
         self.reactor = reactions.Reactor(bot, pool, lambda: self.router.llm("react"), wanted=self._reactions_wanted,
-                                         calls_today=self._reaction_calls_today, may_spend=self._may_spend_on_reactions,
+                                         calls_today=self._reaction_calls_today, may_spend=self._may_spend_on_extras,
                                          log_call=self._log_reaction, cfg=cfg.reactions)
+        self.addresser = addressing.Addresser(pool, lambda: self.router.llm("address"), me,
+                                              wanted=self._address_wanted, checks_today=self._address_checks_today,
+                                              may_spend=self._may_spend_on_extras, log_call=self._log_address,
+                                              answer=self._invoke, declined=self._not_addressed, cfg=cfg.address)
         # A queue per group for its answers and one for its other scheduled posts, and _DIGESTS for the
         # digests of all groups.
         self._queues: dict[_QueueKey, asyncio.Queue[Callable[[], Awaitable[None]]]] = {}
@@ -179,30 +188,54 @@ class Answerer:
         self._posting: set[tuple[int, str]] = set()     # (chat_id, kind) of the posts queued or running
         self._digest_parts: dict[int, _DigestParts] = {}    # by chat_id: a digest not posted yet
         self._forgotten: dict[int, int] = {}   # user_id -> when their last /forget_me came, as Job.order
+        self._looked: dict[int, datetime | None] = {}   # chat_id -> its last look for a remark (_chime)
+        self._asked: set[tuple[int, int]] = set()       # (chat_id, message_id) of the requests queued or being answered
 
     # ---- entry points, called by the collector ----
 
     async def on_message(self, msg: dict, *, paused: bool) -> None:
         """A new group message that was just stored."""
+        order = next(_ORDER)    # a candidate's answer comes after its check: a /forget_me meanwhile still counts
         async with self.pool.acquire() as conn:
             settings = await conn.fetchval("SELECT settings FROM chats WHERE chat_id = $1", msg["chat"]["id"]) or {}
-        inv = detect(msg, self.me, generic_keyword_enabled=settings.get("keyword_bot", True))
+        generic, address = settings.get("keyword_bot", True), self._address_on(settings)
+        inv = detect(msg, self.me, generic_keyword_enabled=generic, addressing=address)
         if "from" not in msg:
             return
+        # The person's next message after the bot's answer, whatever it is, closes their conversation window
+        # (nestor.bot.addressing); a delivered answer to it opens a new one.
+        window = self.addresser.next_message(msg)
         if inv is None:
-            if not paused and self._reactions_on(msg["chat"]["id"], settings):
-                self.reactor.consider(msg)
+            # A message that may be addressed to the bot without its name is checked first; one that
+            # is not goes on to the reactions (_not_addressed).
+            if not paused and not (address and self.addresser.consider(msg, generic_keyword_enabled=generic,
+                                                                        window=window, order=order)):
+                self._not_addressed(msg, settings)
             return
         if paused and inv.command not in ("resume", "status", "forget_me", "privacy"):   # /forget_me never waits
             return
         if inv.kind == "command":
             await self._command(msg, inv)
             return
+        await self._invoke(msg, inv, order)
+
+    async def _invoke(self, msg: dict, inv: Invocation, order: int) -> None:
+        """A request to the bot: queued as a Job, or a reaction for a bare «спасибо». order: when the
+        message came (Job.order)."""
+        if chime.asks_quiet(inv.text, self.me):    # «нестор, помолчи»: no remarks today, no model needed
+            await self._quiet(msg)
+            return
         if await self._acknowledged(msg, inv):    # «спасибо», «ок»: a reaction says it, no model needed
             return
         think, question = routing.split_think(inv.text)
         scenario = context.classify(question, reply_target=_reply_target(msg, inv) is not None)
-        self.submit(Job(msg, inv, scenario, question, think=think))
+        self.submit(Job(msg, inv, scenario, question, think=think, order=order))
+
+    def _not_addressed(self, msg: dict, settings: dict | None = None) -> None:
+        """A group message that is not to the bot, or that its check found not to be: maybe a reaction.
+        settings: the chat's, as just read; without them the reactor checks the chat when its batch is due."""
+        if settings is None or self._reactions_on(msg["chat"]["id"], settings):
+            self.reactor.consider(msg)
 
     async def on_private(self, msg: dict) -> None:
         """Private chats are never archived. Only /export works there (also through the
@@ -217,7 +250,15 @@ class Answerer:
             await self._say(msg, prompts.PRIVATE_HELP, save=False)
 
     def submit(self, job: Job) -> None:
-        self._enqueue(job.msg["chat"]["id"], functools.partial(self._answer, job))
+        self._asked.add((job.msg["chat"]["id"], job.msg["message_id"]))
+        self._enqueue(job.msg["chat"]["id"], functools.partial(self._answer_asked, job))
+
+    async def _answer_asked(self, job: Job) -> None:
+        """A queued request, until its row is written: a remark meanwhile must not answer it too (_to_the_bot)."""
+        try:
+            await self._answer(job)
+        finally:
+            self._asked.discard((job.msg["chat"]["id"], job.msg["message_id"]))
 
     def _enqueue(self, key: _QueueKey, run: Callable[[], Awaitable[None]]) -> None:
         """key: the chat_id of the group whose answer it is, _DIGESTS, or _posts(chat_id)."""
@@ -228,6 +269,7 @@ class Answerer:
 
     async def drain(self) -> None:
         """Wait until all queued jobs are done (tests, shutdown), in queues made meanwhile too."""
+        await self.addresser.drain()        # a yes queues its answer
         joined = 0
         while joined < len(self._queues):
             joined = len(self._queues)
@@ -254,8 +296,13 @@ class Answerer:
         if cmd in ("help", "start"):
             await self._say(msg, prompts.HELP.format(username=self.me.username))
         elif cmd == "privacy":
+            hours = self.cfg.chime.hours
             await self._say(msg, prompts.PRIVACY.format(retention=promises.RETENTION_MONTHS,
-                                                        backup_weeks=promises.BACKUP_WEEKS))
+                                                        backup_weeks=promises.BACKUP_WEEKS,
+                                                        address_context=self.cfg.address.context,
+                                                        chime_from=hours[0].strftime("%H:%M"),
+                                                        chime_to=hours[1].strftime("%H:%M"),
+                                                        chime_window=self.cfg.chime.window))
         elif cmd in ("forget_me", "export") and _shared_sender(msg):
             await self._say(msg, prompts.PERSONAL_ONLY, save=False)
         elif cmd == "forget_me":
@@ -277,14 +324,14 @@ class Answerer:
             await self._unremind(msg, inv.args)
         elif cmd == "status":
             await self._status(msg)
-        elif cmd in ("pause", "resume", "bot_word", "digest", "wisdom", "news", "reactions"):
+        elif cmd in ("pause", "resume", "bot_word", "digest", "wisdom", "news", "reactions", "address", "chime"):
             if not await self._is_admin(msg):
                 await self._say(msg, prompts.ADMINS_ONLY)
                 return
             if cmd == "news" and inv.args.strip().lower() in ("status", "статус"):
                 await self._say(msg, await self._news_status())
                 return
-            if cmd in ("digest", "wisdom", "news", "reactions"):
+            if cmd in ("digest", "wisdom", "news", "reactions", "address", "chime"):
                 await self._toggle(msg, cmd, inv.args)
                 return
             async with self.pool.acquire() as conn:
@@ -320,7 +367,7 @@ class Answerer:
         await self._say(msg, text, save=False)
 
     async def _toggle(self, msg: dict, key: str, args: str) -> None:
-        """/digest, /wisdom, /news, /reactions on|off; without an argument shows the current state.
+        """/digest, /wisdom, /news, /reactions, /address, /chime on|off; without an argument shows the current state.
         /digest N also sets the group's digest period, in days, and switches the digest on."""
         chat_id, arg = msg["chat"]["id"], args.strip().lower()
         change = {key: arg not in _OFF} if arg else {}
@@ -329,10 +376,13 @@ class Answerer:
             if change is None:      # /digest 0, /digest 91, /digest abc: nothing changes
                 await self._say(msg, prompts.DIGEST_USAGE.format(max=daily.DIGEST_MAX_DAYS))
                 return
+        # /chime on starts afresh: a «нестор, помолчи» from earlier today no longer holds.
+        dropped = ["chime_quiet"] if key == "chime" and change.get("chime") else []
         async with self.pool.acquire() as conn:
             if change:
-                await conn.execute("UPDATE chats SET settings = settings || $2::jsonb WHERE chat_id = $1",
-                                   chat_id, change)
+                await conn.execute(
+                    "UPDATE chats SET settings = (settings - $3::text[]) || $2::jsonb WHERE chat_id = $1",
+                    chat_id, change, dropped)
             settings = await conn.fetchval("SELECT settings FROM chats WHERE chat_id = $1", chat_id) or {}
         if key == "digest":
             on, days = bool(settings.get("digest", False)), self._digest_days(settings)
@@ -347,6 +397,13 @@ class Answerer:
             on = self._reactions_on(chat_id, settings)
             text = prompts.REACTIONS_STATE.format(state="включены" if on else "выключены",
                                                   per_hour=self.cfg.reactions.per_hour)
+        elif key == "address":      # /address on is also the announcement to the group
+            text = prompts.ADDRESS_ON if self._address_on(settings) else prompts.ADDRESS_OFF
+        elif key == "chime":        # and so is /chime on
+            per_day, hours = self.cfg.chime.daily, self.cfg.chime.hours
+            text = (prompts.CHIME_ON.format(daily=per_day, times=context.plural(per_day, ("раза", "раз", "раз")),
+                                            start=hours[0].strftime("%H:%M"), end=hours[1].strftime("%H:%M"))
+                    if self._chime_on(settings) else prompts.CHIME_OFF)
         else:
             on = self._wisdom_on(chat_id, settings)
             text = prompts.WISDOM_STATE.format(state="включена" if on else "выключена",
@@ -369,6 +426,16 @@ class Answerer:
     def _reactions_on(self, chat_id: int, settings: dict) -> bool:
         value = (settings or {}).get("reactions")
         return bool(value) if value is not None else chat_id in self.cfg.reaction_chat_ids
+
+    @staticmethod
+    def _address_on(settings: dict) -> bool:
+        """/address on: off by default in every group."""
+        return bool((settings or {}).get("address", False))
+
+    @staticmethod
+    def _chime_on(settings: dict) -> bool:
+        """/chime on: off by default in every group."""
+        return bool((settings or {}).get("chime", False))
 
     def _post_on(self, chat_id: int, kind: str, settings: dict) -> bool:
         """Whether the group has this scheduled post on."""
@@ -395,19 +462,45 @@ class Answerer:
         return row is not None and row["enabled"] and self._reactions_on(chat_id, row["settings"] or {})
 
     async def _reaction_calls_today(self, chat_id: int) -> int:
+        return await self._calls_today(chat_id, "reaction")
+
+    async def _calls_today(self, chat_id: int, scenario: str) -> int:
+        """The model calls of this kind made for the chat since the local day began, failed ones too."""
         async with self.pool.acquire() as conn:
             return await conn.fetchval(
-                "SELECT count(*) FROM bot_requests WHERE chat_id = $1 AND scenario = 'reaction' AND created_at >= $2",
-                chat_id, self._day_start())
+                "SELECT count(*) FROM bot_requests WHERE chat_id = $1 AND scenario = $2 AND created_at >= $3",
+                chat_id, scenario, self._day_start())
 
-    async def _may_spend_on_reactions(self) -> bool:
-        """Reactions stop asking the model at half the daily tokens: answers come first."""
+    async def _may_spend_on_extras(self) -> bool:
+        """Reactions and address checks stop asking the model at half the daily tokens: answers come first."""
         async with self.pool.acquire() as conn:
             return await self._tokens_today(conn) < self.cfg.daily_token_limit // 2
 
     async def _log_reaction(self, chat_id: int, completion: Completion, started: float, status: str) -> None:
         async with self.pool.acquire() as conn:
             await self._log_scheduled(conn, chat_id, "reaction", completion, [], started, status=status)
+
+    # ---- addressing in one's own words (nestor.bot.addressing) ----
+
+    async def _address_wanted(self, chat_id: int) -> bool:
+        """Checked before and after a check: the chat may have been paused or switched off meanwhile."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT enabled, settings FROM chats WHERE chat_id = $1", chat_id)
+        return row is not None and row["enabled"] and self._address_on(row["settings"] or {})
+
+    async def _address_checks_today(self, chat_id: int) -> int:
+        return await self._calls_today(chat_id, "address")
+
+    async def _log_address(self, chat_id: int, completion: Completion, started: float, status: str) -> None:
+        """Tokens, model and status only: not a word of the chat, nor the model's yes or no."""
+        async with self.pool.acquire() as conn:
+            await self._log_scheduled(conn, chat_id, "address", completion, [], started, status=status,
+                                      keep_text=False)
+
+    def open_window(self, msg: dict) -> None:
+        """The bot answered this message's author here (a delivered answer to their request): their
+        conversation window opens (nestor.bot.addressing), so their «а ты?» right after it may be to the bot."""
+        self.addresser.opened(msg["chat"]["id"], _topic(msg), msg["from"]["id"])
 
     async def _put_reaction(self, msg: dict, emoji: str) -> bool:
         try:
@@ -419,14 +512,17 @@ class Answerer:
         return True
 
     async def _acknowledged(self, msg: dict, inv: Invocation) -> bool:
-        """Answer a bare «спасибо», «ок» or emoji with a reaction the chat allows. Not when it
-        answers the bot's own question («Ты про Кино?» — «угу») or replies to someone else's
-        message: then it is a request. False sends the message on to the model."""
+        """Answer a bare «спасибо», «ок» or emoji with a reaction the chat allows, and after an address
+        check's yes also a thanks among other words that ask nothing («супер, спасибо, нестор!»). Not when
+        it answers the bot's own question («Ты про Кино?» — «угу») or replies to someone else's message:
+        then it is a request. False sends the message on to the model."""
         emoji = reactions.acknowledgement(inv.text)
+        if emoji is None and inv.kind == "address" and reactions.thanks(inv.text):
+            emoji = "❤"
         if emoji is None or _reply_target(msg, inv) is not None:
             return False
         replied = (msg.get("reply_to_message") or {}).get("text") or ""
-        if inv.replied_to_bot is not None and "?" in _LINKS.sub("", replied):   # a «?q=» inside a link is not one
+        if inv.replied_to_bot is not None and "?" in URL.sub("", replied):   # a «?q=» inside a link is not one
             return False
         allowed = await self.reactor.allowed(msg["chat"]["id"])
         emoji = next((e for e in (emoji, "👍", "👌", "❤") if e in allowed), None)
@@ -620,14 +716,16 @@ class Answerer:
 
     async def _digest_room(self, conn) -> tuple[int, int]:
         """Today's tokens, and how many of them the digests may still spend: the digests of all groups
-        together, every call of notes and every attempt included, take half of the daily limit at most
-        (answers keep the rest), and never more than the day has left."""
-        spent, digests = await conn.fetchrow(
-            "SELECT coalesce(sum(t), 0), coalesce(sum(t) FILTER (WHERE scenario IN ('digest', 'digest_notes')), 0) "
+        together, every call of notes and every attempt included, take half of the daily limit at most,
+        less what reactions, address checks and remarks spent today (answers keep the rest), and never
+        more than the day has left."""
+        spent, digests, extras = await conn.fetchrow(
+            "SELECT coalesce(sum(t), 0), coalesce(sum(t) FILTER (WHERE scenario IN ('digest', 'digest_notes')), 0), "
+            "       coalesce(sum(t) FILTER (WHERE scenario IN ('reaction', 'address', 'chime', 'chime_check')), 0) "
             "FROM (SELECT scenario, coalesce(input_tokens, 0) + coalesce(output_tokens, 0) AS t "
             "      FROM bot_requests WHERE created_at >= $1) r", self._day_start())
         limit = self.cfg.daily_token_limit
-        return spent, min(limit // 2 - digests, limit - spent)
+        return spent, min(limit // 2 - digests - extras, limit - spent)
 
     async def _log(self, conn, job: Job, status: str, **fields) -> int:
         """Queued requests log holding forget.ERASE_LOCK: a /forget_me of the asker then waits for
@@ -683,6 +781,8 @@ class Answerer:
                               profile=c.profile)
             sent = await self._deliver(msg, out)
             fields.update(answer_msg_ids=[m.message_id for m in sent if m is not None])
+            if status == "ok" and fields["answer_msg_ids"]:
+                self.open_window(msg)
         except asyncio.TimeoutError:
             status = "timeout"
             await self._say(msg, prompts.TIMEOUT)
@@ -939,13 +1039,14 @@ class Answerer:
         async with self.pool.acquire() as conn:
             ids = await context.chat_lineage(conn, msg["chat"]["id"])
             activity = await conn.fetch(
-                """SELECT u.first_name, u.last_name, u.username, count(*) AS n
+                """SELECT u.user_id, u.first_name, u.last_name, u.username, count(*) AS n
                    FROM messages m JOIN users u ON u.user_id = m.user_id
                    WHERE m.chat_id = ANY($1::bigint[]) AND m.kind <> 'service' AND NOT u.is_bot
                      AND m.sent_at > $2
                    GROUP BY u.user_id ORDER BY n DESC LIMIT 10""", ids, since)
             if not activity:
                 return Outgoing(prompts.STATS_EMPTY, html=True)
+            job.quoted |= {r["user_id"] for r in activity}      # it names them: their /forget_me takes it along
             found = await context.top_branches(conn, ids, None, since)
             branches = []
             for b in found:
@@ -1087,6 +1188,15 @@ class Answerer:
             blocks.append(show(chain + [r for r in below if r["message_id"] != msg["message_id"]], "ветка"))
             if _replied_author(msg) is not None:    # the answer is about their message: theses, who is right
                 job.quoted.add(_replied_author(msg))
+        elif parent is not None and parent["scenario"] == "chime":
+            # Nobody asked a remark: the message it answered is shown instead, while it is still there (not
+            # deleted, its author has not used /forget_me), as it may be far back by now.
+            remarked = await conn.fetchval("SELECT reply_to_id FROM messages WHERE chat_id = $1 AND message_id = $2",
+                                           chat_id, job.inv.replied_to_bot)
+            rows = await context.messages_by_id(conn, chat_id, [remarked]) if remarked is not None else []
+            if rows:
+                blocks.append(f"Реплика Нестора, на которую отвечают, была ответом на сообщение #{remarked}:")
+                blocks.append(show(rows, "сообщение"))
 
         for user in await context.mentioned_users(conn, msg, self.me.username):
             rows = await context.user_messages(conn, ids, thread, user["user_id"])
@@ -1106,7 +1216,8 @@ class Answerer:
         history: list[dict] = []
         depth = 0
         while parent and depth < 3:
-            history[:0] = [{"role": "user", "content": parent["question"] or "(вопрос удалён)"},
+            asked = prompts.CHIME_TURN if parent["scenario"] == "chime" else "(вопрос удалён)"    # nobody asked a remark
+            history[:0] = [{"role": "user", "content": parent["question"] or asked},
                            {"role": "assistant", "content": parent["answer"] or "(ответ удалён)"}]
             job.quoted |= set(parent["quoted_user_ids"] or [])     # a follow-up may repeat the quotes
             job.saw(at=parent["oldest_source_at"])
@@ -1416,6 +1527,194 @@ class Answerer:
             lines.append(line)
         return "\n".join(lines[:1] + [html.escape(line) for line in lines[1:]])
 
+    # ---- the bot's own remarks (nestor.bot.chime) ----
+
+    async def run_chimes(self, now: datetime | None = None) -> None:
+        """Called by the scheduler every tick: within CHIME_HOURS, once an hour per group with /chime on,
+        queue a look at its last hour (_chime). A look that finds the chat quiet counts as well."""
+        now = now or datetime.now(UTC)
+        cfg = self.cfg.chime
+        if not chime.in_hours(now.astimezone(self.cfg.tz).time(), cfg.hours):
+            return
+        async with self.pool.acquire() as conn:
+            chats = await conn.fetch(
+                "SELECT chat_id, settings FROM chats WHERE enabled AND migrated_to_chat_id IS NULL "
+                "AND chat_id = ANY($1::bigint[])", list(self.cfg.allowed_chat_ids))
+            for chat in chats:
+                chat_id = chat["chat_id"]
+                if not self._chime_on(chat["settings"] or {}) or (chat_id, "chime") in self._posting:
+                    continue
+                if chat_id not in self._looked:     # since the start: the last look the log knows of
+                    self._looked[chat_id] = await conn.fetchval(
+                        "SELECT max(created_at) FROM bot_requests WHERE chat_id = $1 "
+                        "AND scenario IN ('chime', 'chime_check')", chat_id)
+                last = self._looked[chat_id]
+                if last is not None and now - last < timedelta(minutes=cfg.every_min):
+                    continue
+                self._looked[chat_id] = now     # until it starts (_chime)
+                self._posting.add((chat_id, "chime"))
+                self._enqueue(_posts(chat_id), functools.partial(self._chime, chat_id, now, time.monotonic()))
+
+    async def _chime(self, chat_id: int, now: datetime, queued: float) -> None:
+        """A queued look (run_chimes); a failure is logged and waits for the next hour. It may wait
+        behind the news or the wisdom of the day: it looks as of when it starts, and the next look is an
+        hour after that start (to the second, as the scheduler's ticks go), so remarks are an hour apart."""
+        status = "failed"
+        waited = time.monotonic() - queued
+        self._looked[chat_id] = now + timedelta(seconds=int(waited))
+        try:
+            status = await self._remark(chat_id, now + timedelta(seconds=waited))
+        except Exception as e:  # noqa: BLE001 - a remark is never worth a crash
+            log.warning("remark failed", extra={"chat_id": chat_id, "error": type(e).__name__})
+        finally:
+            self._posting.discard((chat_id, "chime"))
+        log.info("remark", extra={"chat_id": chat_id, "status": status})
+
+    async def _remark(self, chat_id: int, now: datetime) -> str:
+        """A look at the group's last hour, as of `now`: a remark in reply to one person's message, or
+        silence, which is what the model chooses most hours. Everything is checked here, when the look
+        starts: /pause, /chime off or «нестор, помолчи» since it was queued stop it. Returns what came
+        of it, for the log."""
+        cfg, tz = self.cfg.chime, self.cfg.tz
+        llm = self.router.llm("chime")
+        if llm is None:     # no profile without tools: no remarks, never another profile
+            return "no_profile"
+        local, hour = now.astimezone(tz), now - timedelta(minutes=cfg.every_min)
+        if not chime.in_hours(local.time(), cfg.hours):    # it waited in the queue past CHIME_HOURS
+            return "late"
+        async with self.pool.acquire() as conn:
+            if not await self._chime_wanted(conn, chat_id, local.date()):
+                return "off"
+            if await self._tokens_today(conn) >= self.cfg.daily_token_limit // 2:     # answers come first
+                return "no_tokens"
+            # No remark in the last hour either: only a look makes one, and looks are an hour apart from
+            # start to start (_chime). A remark written down a minute into its look does not hold up
+            # the next look, so remarks may come on consecutive looks, one an hour.
+            made = await conn.fetchval(
+                "SELECT count(*) FROM bot_requests WHERE chat_id = $1 AND scenario = 'chime' AND status = 'ok' "
+                "AND created_at >= $2", chat_id, local.replace(hour=0, minute=0, second=0, microsecond=0))
+            if made >= cfg.daily:
+                return "enough"
+            # This chat only: a message of the basic group it moved from cannot be answered here.
+            if await context.count_since(conn, [chat_id], None, hour, except_user=self.me.user_id,
+                                         people_only=True) < cfg.min_messages:
+                return "quiet_chat"
+            rows = await context.period_messages(conn, [chat_id], None, hour, limit=cfg.window)
+            previous = await conn.fetchval(       # whom the last remark answered: not the same person twice
+                "SELECT quoted_user_ids[1:1] FROM bot_requests WHERE chat_id = $1 AND scenario = 'chime' "
+                "AND status = 'ok' ORDER BY created_at DESC LIMIT 1", chat_id)
+            posts = await addressing.bot_posts(conn, rows, self.me.user_id)
+        if not await self._bot_is_member(chat_id):
+            return "not_member"
+        started = time.monotonic()
+        prompt = [{"role": "system", "content": prompts.CHIME_SYSTEM},
+                  {"role": "user", "content": prompts.CHIME_USER.format(
+                      messages=addressing.render(rows, self.me.user_id, posts=posts), n=len(rows))}]
+        try:
+            completion = await asyncio.wait_for(llm.complete(prompt), cfg.timeout_s)
+        except Exception as e:  # noqa: BLE001 - Hermes down or slow: silence
+            log.warning("remark model failed", extra={"chat_id": chat_id, "error": type(e).__name__})
+            async with self.pool.acquire() as conn:
+                await self._log_scheduled(conn, chat_id, "chime_check", Completion("", None, None, None), [], started,
+                                          status="timeout" if isinstance(e, asyncio.TimeoutError) else "error",
+                                          keep_text=False)
+            return "error"
+        pick, target, sources, earlier = chime.parse(completion.text, len(rows)), None, [], []
+        if pick is not None:
+            chosen = rows[pick.n - 1]
+            async with self.pool.acquire() as conn:
+                # The model may take a while: a /pause, /chime off, «помолчи», a deletion or the author's
+                # /forget_me meanwhile still counts.
+                if await self._chime_wanted(conn, chat_id, local.date()):
+                    found = await context.messages_by_id(conn, chat_id, [chosen["message_id"]])
+                    at = now + timedelta(seconds=time.monotonic() - started)
+                    # The model read the message as it was then, and only its text, its first SHOWN characters:
+                    # a long one may end on what it never saw (bad news after a funny start), and so may the one
+                    # it replies to; a voice message or a sticker it never heard or saw; an edited one says
+                    # something else now.
+                    if found and chime.targetable(found[0], bot_id=self.me.user_id, previous=previous, now=at,
+                                                  max_age=timedelta(minutes=cfg.every_min)) \
+                            and found[0]["text"] == chosen["text"] \
+                            and chime.read_whole(found[0], rows, addressing.SHOWN) \
+                            and not await self._to_the_bot(conn, chat_id, found[0]):
+                        target = found[0]
+                        # A remark may repeat any message the model was shown: the claim the target answers, or one
+                        # of a dispute that never used Telegram's replies. They all count, also when they are gone
+                        # since (their author's /forget_me meanwhile). The claim is read back if it was not shown.
+                        claim = target["reply_to_id"]
+                        claimed = await context.messages_by_id(conn, chat_id, [claim]) \
+                            if claim is not None and claim not in {r["message_id"] for r in rows} else []
+                        again = {r["message_id"]: r for r in await context.messages_by_id(
+                            conn, chat_id, [r["message_id"] for r in rows])}     # with forwarded_from
+                        sources = [target, *claimed, *(again.get(r["message_id"], r) for r in rows
+                                                       if r["user_id"] != self.me.user_id)]
+                        # Its own earlier remarks it was shown word for word, too: whoever they quoted is quoted
+                        # again, and the remark carries what they did, as a follow-up does its parent's.
+                        earlier = await conn.fetch(
+                            "SELECT quoted_user_ids, oldest_source_at FROM bot_requests WHERE chat_id = $1 "
+                            "AND scenario = 'chime' AND answer_msg_ids && $2::bigint[]",
+                            chat_id, [r["message_id"] for r in rows if r["user_id"] == self.me.user_id])
+        if target is None:      # the model's silence, or a remark the code refused: no text is kept
+            async with self.pool.acquire() as conn:
+                await self._log_scheduled(conn, chat_id, "chime_check", completion, [], started, keep_text=False)
+            return "silent"
+        # A remark is said to its target or not at all: when Telegram refuses the reply (the message was
+        # deleted and the archive has not heard yet) or the send fails, it is dropped, and no text is kept.
+        sent = await self._send(chat_id, pick.text, reply_to=target["message_id"], without_reply=False)
+        if sent is None:
+            async with self.pool.acquire() as conn:
+                await self._log_scheduled(conn, chat_id, "chime_check", completion, [], started, status="error",
+                                          keep_text=False)
+            return "failed"
+        # Logged as an answer to the target's author and to everyone whose words the model was shown: /forget_me
+        # and the purge take it with any of their messages. The target's author comes first: the next remark is
+        # to someone else (previous).
+        said = [u for r in sources for u in (r["user_id"], r.get("forwarded_from"))]
+        said += [u for e in earlier for u in e["quoted_user_ids"] or ()]
+        quoted = list(dict.fromkeys(u for u in said if u not in (None, self.me.user_id)))
+        oldest = min([r["stored_at"] for r in sources] + [e["oldest_source_at"] for e in earlier
+                                                          if e["oldest_source_at"] is not None])
+        async with self.pool.acquire() as conn, conn.transaction():
+            await forget.erase_lock(conn)       # it may erase: the lock comes before the insert's row locks
+            rid = await self._log_scheduled(conn, chat_id, "chime", replace(completion, text=pick.text), [sent],
+                                            started, quoted_user_ids=quoted, oldest_source_at=oldest)
+            await self._scrub_if_opted_out(conn, rid, quoted)
+        return "posted"
+
+    async def _to_the_bot(self, conn, chat_id: int, row) -> bool:
+        """A request to the bot, still being checked, queued or answered, or answered or refused already;
+        a command (/help, /chime on: answered without a request of its own, or meant for another bot); a
+        reply to the bot; a message that names it. The bot answers those itself, or leaves talk about it
+        alone: a remark on one would be a second reply, or an answer after all."""
+        mid = row["message_id"]
+        if (chat_id, mid) in self._asked or self.addresser.asking(chat_id, mid) \
+                or (row["text"] or "").lstrip().startswith("/") or chime.names_bot(row["text"], self.me):
+            return True
+        return await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM bot_requests WHERE chat_id = $1 AND trigger_msg_id = $2) "
+            "OR EXISTS (SELECT 1 FROM messages WHERE chat_id = $1 AND message_id = $3 AND user_id = $4)",
+            chat_id, mid, row["reply_to_id"], self.me.user_id)
+
+    async def _chime_wanted(self, conn, chat_id: int, day: date) -> bool:
+        """/chime on, not paused, not moved to a supergroup, and nobody said «нестор, помолчи» on this day."""
+        row = await conn.fetchrow("SELECT enabled, migrated_to_chat_id, settings FROM chats WHERE chat_id = $1",
+                                  chat_id)
+        settings = (row["settings"] or {}) if row is not None else {}
+        return (row is not None and row["enabled"] and row["migrated_to_chat_id"] is None
+                and self._chime_on(settings) and settings.get("chime_quiet") != day.isoformat())
+
+    async def _quiet(self, msg: dict) -> None:
+        """«нестор, помолчи»: no remarks in this group until the end of the local day it was said on (one
+        Telegram delivers after midnight, the bot having been down, means that day); the answers go on.
+        A 👌 says it, or one line where the chat takes no such reaction."""
+        chat_id = msg["chat"]["id"]
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE chats SET settings = settings || jsonb_build_object('chime_quiet', $2::text) WHERE chat_id = $1",
+                chat_id, datetime.fromtimestamp(msg["date"], self.cfg.tz).date().isoformat())
+        if "👌" not in await self.reactor.allowed(chat_id) or not await self._put_reaction(msg, "👌"):
+            await self._say(msg, prompts.CHIME_QUIET)
+
     async def _log_scheduled(self, conn, chat_id: int, scenario: str, completion: Completion,
                              sent: list[Message | None], started: float, status: str = "ok",
                              quoted_user_ids: list[int] | None = None,
@@ -1450,15 +1749,17 @@ class Answerer:
 
     async def _send(self, chat_id: int, text: str, *, reply_to: int | None = None, save: bool = True,
                     html: bool = False, preview_url: str | None = None,
-                    keyboard: InlineKeyboardMarkup | None = None, plain: str | None = None) -> Message | None:
-        """plain: the same text without formatting, sent if Telegram refuses the HTML."""
+                    keyboard: InlineKeyboardMarkup | None = None, plain: str | None = None,
+                    without_reply: bool = True) -> Message | None:
+        """plain: the same text without formatting, sent if Telegram refuses the HTML. without_reply=False:
+        when the message replied to is gone, Telegram refuses, and nothing is sent."""
         preview = (LinkPreviewOptions(url=preview_url, prefer_large_media=True, show_above_text=True) if preview_url
                    else LinkPreviewOptions(is_disabled=True))
 
         async def send(body: str, formatted: bool) -> Message:
             return await self.bot.send_message(
                 chat_id, body,
-                reply_parameters=(ReplyParameters(message_id=reply_to, allow_sending_without_reply=True)
+                reply_parameters=(ReplyParameters(message_id=reply_to, allow_sending_without_reply=without_reply)
                                   if reply_to is not None else None),
                 link_preview_options=preview, parse_mode="HTML" if formatted else None, reply_markup=keyboard,
             )
@@ -1518,9 +1819,6 @@ def _oldest(times) -> datetime | None:
 def _out(completion: Completion, refs: dict[int, markup.Ref] | None = None) -> Outgoing:
     """A model answer: its Markdown becomes Telegram formatting."""
     return Outgoing(completion.text or "Мне нечего ответить по этим данным.", completion, markdown=True, refs=refs)
-
-
-_LINKS = re.compile(r"https?://\S+?(?=[.,;:!?)»\"']*(?:\s|$))")      # an address, without its trailing punctuation
 
 
 def _quoted(refs: dict[int, markup.Ref] | None, more: Collection[int] = ()) -> list[int] | None:

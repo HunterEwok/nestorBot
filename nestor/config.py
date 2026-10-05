@@ -51,6 +51,19 @@ class Settings:
     news_telegram_channels: tuple[str, ...] = ("psychedelicsocietyvienna",)
     # Groups where the bot puts reactions on emotional messages; group admins switch it with /reactions on|off.
     reaction_chat_ids: frozenset[int] = frozenset()
+    # Addressing in one's own words (/address on, nestor.bot.addressing): for this many minutes after
+    # the bot answered someone, their «а ты?» may be to the bot; this many messages before a doubtful
+    # one go with it to the model; at most this many such checks per group per day.
+    address_window_min: int = 5
+    address_context: int = 4
+    address_daily_checks: int = 150
+    # The bot's own remarks (/chime on, nestor.bot.chime): once an hour within these local hours, when people
+    # wrote at least this many messages in the last hour, the model reads this many of them; at most this
+    # many remarks per group per day.
+    chime_hours: tuple[time, time] = (time(10), time(23))
+    chime_min_messages: int = 10
+    chime_window: int = 40
+    chime_daily: int = 3
     bot_keywords: tuple[str, ...] = ("нестор", "бот")
     rate_limit: int = 5
     rate_window_min: int = 10
@@ -130,6 +143,18 @@ def _parse_quiet(name: str, default: str) -> tuple[time, time] | None:
     return start, end
 
 
+def _parse_hours(name: str, default: str) -> tuple[time, time]:
+    """HH:MM-HH:MM within one day: from the first, before the second."""
+    value = _env(name, default)
+    try:
+        start, end = (time.fromisoformat(part.strip()) for part in value.split("-"))
+    except ValueError:
+        raise SystemExit(f"{name} must look like 10:00-23:00, got {value!r}") from None
+    if start >= end:
+        raise SystemExit(f"{name} must look like 10:00-23:00, the start before the end, got {value!r}")
+    return start, end
+
+
 def check_alert_chat(settings: Settings) -> str | None:
     """Why ALERT_CHAT_ID cannot work, or None. The bot leaves every group not in ALLOWED_CHAT_IDS."""
     if settings.alert_chat_id is not None and settings.alert_chat_id not in settings.allowed_chat_ids:
@@ -164,13 +189,18 @@ def _channels() -> tuple[str, ...]:
         raise SystemExit(f"NEWS_TELEGRAM_CHANNELS: {e}") from None
 
 
+def _int_in(name: str, default: int, low: int, high: int, what: str) -> int:
+    """A whole number from low to high; what: what it counts, for the error."""
+    value = _int(name, default)
+    if not low <= value <= high:
+        raise SystemExit(f"{name} must be a number of {what} from {low} to {high}, got {value}")
+    return value
+
+
 def _digest_every_days() -> int:
     from .bot.daily import DIGEST_MAX_DAYS
 
-    value = _int("DIGEST_EVERY_DAYS", 30)
-    if not 1 <= value <= DIGEST_MAX_DAYS:
-        raise SystemExit(f"DIGEST_EVERY_DAYS must be a number of days from 1 to {DIGEST_MAX_DAYS}, got {value}")
-    return value
+    return _int_in("DIGEST_EVERY_DAYS", 30, 1, DIGEST_MAX_DAYS, "days")
 
 
 def _player_app() -> str:
@@ -212,6 +242,13 @@ def load_settings() -> Settings:
             news_contact_email=_env("NEWS_CONTACT_EMAIL"),
             news_telegram_channels=_channels(),
             reaction_chat_ids=_parse_ids(_env("REACTION_CHAT_IDS")),
+            address_window_min=_int_in("ADDRESS_WINDOW_MIN", 5, 1, 60, "minutes"),
+            address_context=_int_in("ADDRESS_CONTEXT", 4, 0, 20, "messages"),
+            address_daily_checks=_int_in("ADDRESS_DAILY_CHECKS", 150, 0, 2000, "checks"),
+            chime_hours=_parse_hours("CHIME_HOURS", "10:00-23:00"),
+            chime_min_messages=_int_in("CHIME_MIN_MESSAGES", 10, 1, 500, "messages"),
+            chime_window=_int_in("CHIME_WINDOW", 40, 1, 100, "messages"),
+            chime_daily=_int_in("CHIME_DAILY", 3, 0, 24, "remarks"),
             bot_keywords=tuple(w.strip().lower() for w in _env("BOT_KEYWORDS", "нестор,бот").split(",")
                                if w.strip()),
             rate_limit=_int("RATE_LIMIT_PER_USER", 5),

@@ -1,10 +1,14 @@
-# Hermes profile `news` for sorting the news digest's items: ~/.hermes/profiles/news/config.yaml
+# Hermes profile `news`, the profile without tools: ~/.hermes/profiles/news/config.yaml
 # (hermes profile create news, then copy this file and news/SOUL.md into it).
 #
-# It reads only public news items (titles and teasers from the sources in nestor/news/sources.py)
-# and needs no tools at all: one line in Russian per item, a section, a verdict. No archive,
-# no internet, so a prompt injection in a feed has nothing to use. Without this profile the
-# collector uses `web` for it (its search tools then add some tokens to every call).
+# It sorts the news digest's items (titles and teasers from the sources in nestor/news/sources.py:
+# one line in Russian per item, a section, a verdict). By default (nestor/bot/routing.py) it also
+# gets short numbered chat excerpts without names: for reactions, for the /address checks (is a
+# message to the bot, yes or no) and for the bot's rare /chime remarks, which go to the group.
+# It needs no tools at all: no archive, no internet, so a prompt injection in a feed or in the
+# chat has nothing to use. Without this profile the collector uses `web` for the news (its search
+# tools then add some tokens to every call); reactions are picked by code, and there are no
+# address checks and no remarks.
 # Verify after every Hermes update (deploy/hermes/README.md, "Проверка").
 
 model:

@@ -424,6 +424,21 @@ async def test_the_digests_of_all_groups_take_half_of_the_day_together(make_env,
     assert await conn.fetchval("SELECT count(*) FROM daily_posts WHERE status = 'skipped'") == 3
 
 
+@pytest.mark.parametrize("scenario", ["reaction", "address", "chime", "chime_check"])
+async def test_reactions_checks_and_remarks_share_the_digests_half(make_env, conn, scenario):
+    """They spent half of the day before the digest came: it waits for the next morning, answers keep the rest."""
+    bot, llm, feed = make_env(PartsLLM(tokens=(14_000, 1000)), daily_token_limit=30_000)
+    since, until = daily.digest_bounds(DAY, 7, TZ)
+    await write(conn, spread(since, until, 20))
+    await digest_on(conn, digest_days=7)
+    await conn.execute("INSERT INTO bot_requests (chat_id, scenario, input_tokens, output_tokens, status) "
+                       "VALUES ($1, $2, 15000, 0, 'ok')", CHAT_ID, scenario)
+    await run(feed, at(DAY, 9, 30))
+    assert llm.calls == [] and await conn.fetchval("SELECT status FROM daily_posts") == "skipped"
+    await feed(update("message", message(1, "нестор, как дела?", uid=300)))
+    assert bot.sent[-1]["text"] == "Ответ модели"
+
+
 async def test_new_notes_on_parts_that_changed_must_fit_in_the_half(make_env, conn):
     async def rename(call: int) -> None:
         if call == 3:       # during the last call of notes User200, who writes in every part, changes their name

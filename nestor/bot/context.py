@@ -8,11 +8,13 @@ from zoneinfo import ZoneInfo
 
 import asyncpg
 
+from .. import forget
 from . import reminders
 
 # stored_at: when the message entered the archive. An answer built on it leaves with it (nestor.retention).
+# forwarded: the words are someone else's, whoever posted them here.
 _COLUMNS = """m.chat_id, m.message_id, m.thread_id, m.is_topic_message, m.user_id, m.sent_at,
-              m.reply_to_id, m.kind, m.text, m.edited_at, m.stored_at,
+              m.reply_to_id, m.kind, m.text, m.edited_at, m.stored_at, m.forward_origin IS NOT NULL AS forwarded,
               u.first_name, u.last_name, u.username, u.is_bot"""
 _FROM = "FROM messages m LEFT JOIN users u ON u.user_id = m.user_id"
 _VISIBLE = "m.kind <> 'service' AND (u.user_id IS NULL OR NOT u.opted_out)"
@@ -39,6 +41,21 @@ async def recent(conn, chat_ids: list[int], thread_id: int | None, limit: int = 
               AND ($2::bigint IS NULL OR (m.thread_id = $2 AND m.is_topic_message))
             ORDER BY m.sent_at DESC, m.message_id DESC LIMIT $3""",
         chat_ids, thread_id, limit,
+    )
+    return rows[::-1]
+
+
+async def before(conn, chat_ids: list[int], thread_id: int | None, row, limit: int) -> list[asyncpg.Record]:
+    """The `limit` messages before this archive row in its chat and topic, oldest first. thread_id None:
+    outside the topics, a forum's General (in a group without topics, every message)."""
+    rows = await conn.fetch(
+        f"""SELECT {_COLUMNS} {_FROM}
+            WHERE m.chat_id = ANY($1::bigint[]) AND {_VISIBLE}
+              AND CASE WHEN $2::bigint IS NULL THEN NOT m.is_topic_message
+                       ELSE m.thread_id = $2 AND m.is_topic_message END
+              AND (m.sent_at, m.message_id) < ($3, $4)
+            ORDER BY m.sent_at DESC, m.message_id DESC LIMIT $5""",
+        chat_ids, thread_id, row["sent_at"], row["message_id"], limit,
     )
     return rows[::-1]
 
@@ -147,14 +164,16 @@ async def last_message_at(conn, chat_ids: list[int], thread_id: int | None, user
 
 
 async def count_since(conn, chat_ids: list[int], thread_id: int | None, since: datetime, *,
-                      except_user: int) -> int:
-    """Visible messages by others (bots excluded) since the moment."""
+                      except_user: int, people_only: bool = False) -> int:
+    """Visible messages by others (bots excluded) since the moment. people_only: without the posts of a
+    channel or of an admin as the group either (a sender_chat, forget.SHARED_IDS)."""
     return await conn.fetchval(
         f"""SELECT count(*) {_FROM}
             WHERE m.chat_id = ANY($1::bigint[]) AND {_VISIBLE} AND m.sent_at > $3
               AND m.user_id IS DISTINCT FROM $4 AND (u.user_id IS NULL OR NOT u.is_bot)
+              AND (NOT $5::bool OR (m.sender_chat_id IS NULL AND m.user_id <> ALL($6::bigint[])))
               AND ($2::bigint IS NULL OR (m.thread_id = $2 AND m.is_topic_message))""",
-        chat_ids, thread_id, since, except_user)
+        chat_ids, thread_id, since, except_user, people_only, list(forget.SHARED_IDS))
 
 
 async def addressed_to(conn, chat_ids: list[int], thread_id: int | None, user_id: int, username: str | None,
@@ -202,9 +221,9 @@ async def top_branches(conn, chat_ids: list[int], thread_id: int | None, since: 
 
 async def messages_by_id(conn, chat_id: int, message_ids: list[int]) -> list[asyncpg.Record]:
     """With forwarded_from: who wrote a forwarded message's words (live forwards name a sender_user,
-    imported ones an id), whoever forwarded it."""
+    imported ones an id), whoever forwarded it; and sender_chat_id, a channel or the group itself."""
     return list(await conn.fetch(
-        f"""SELECT {_COLUMNS},
+        f"""SELECT {_COLUMNS}, m.sender_chat_id,
                    coalesce(m.forward_origin->'sender_user'->>'id',
                             CASE WHEN m.forward_origin->>'type' = 'user' THEN m.forward_origin->>'sender_id' END
                            )::bigint AS forwarded_from

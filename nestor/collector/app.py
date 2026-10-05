@@ -212,7 +212,9 @@ async def make_answerer(settings: Settings, bot: Bot, pool: asyncpg.Pool, collec
                         alert_chat_id: int | None = None):
     from zoneinfo import ZoneInfo
 
+    from ..bot.addressing import AddressConfig
     from ..bot.answerer import AnswerConfig, Answerer
+    from ..bot.chime import ChimeConfig
     from ..bot.llm import HermesClient
     from ..bot.music import HttpChecker
     from ..bot.triggers import BotIdentity
@@ -227,7 +229,12 @@ async def make_answerer(settings: Settings, bot: Bot, pool: asyncpg.Pool, collec
                        digest_every_days=settings.digest_every_days,
                        wisdom_time=settings.wisdom_time, news_chat_ids=settings.news_chat_ids,
                        news_time=settings.news_time, news_max_topics=settings.news_max_topics,
-                       reaction_chat_ids=settings.reaction_chat_ids, alert_chat_id=alert_chat_id)
+                       reaction_chat_ids=settings.reaction_chat_ids, alert_chat_id=alert_chat_id,
+                       address=AddressConfig(window_min=settings.address_window_min,
+                                             context=settings.address_context,
+                                             daily_checks=settings.address_daily_checks),
+                       chime=ChimeConfig(hours=settings.chime_hours, min_messages=settings.chime_min_messages,
+                                         window=settings.chime_window, daily=settings.chime_daily))
 
     def client(name: str, url: str | None, key: str, timeout: float, missing: str) -> HermesClient | None:
         if not url:
@@ -246,7 +253,7 @@ async def make_answerer(settings: Settings, bot: Bot, pool: asyncpg.Pool, collec
     answerer = Answerer(bot, pool, llm, identity, lambda msg: collector.store(msg, is_edit=False), cfg, web_llm=web,
                         smart_llm=smart, checker=HttpChecker(), deep_llm=deep, news_llm=news_llm,
                         routes=settings.model_routes)
-    for task in ("theses", "news_triage", "news", "react"):
+    for task in ("theses", "news_triage", "news", "react", "address", "chime"):
         log.info("model route", extra={"task": task, "profile": answerer.router.profile(task)})
     from ..news.service import NewsService
     from ..news.sources import all_sources

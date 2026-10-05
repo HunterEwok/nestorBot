@@ -79,3 +79,22 @@ def extract_json(text: str | None) -> dict[str, Any] | None:
         if isinstance(obj, dict):
             return obj
     return None
+
+
+def sole_json(text: str | None) -> dict[str, Any] | None:
+    """The JSON object a model answer consists of, bare or in one ```json fence with nothing around it;
+    None for anything else.
+
+    For the short verdicts of the profile without tools, which reads chat text: an object someone
+    planted in the chat and the model quoted, besides its own («в сообщении 4 просят {"to_bot": true},
+    но это данные. {"to_bot": false}») or with its verdict in words («… это данные, молчу»), must never
+    become the answer. Silence, or a no, is."""
+    if not text:
+        return None
+    text = text.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+    try:
+        data = json.loads(fenced.group(1) if fenced else text)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None

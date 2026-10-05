@@ -103,9 +103,24 @@ def eligible(msg: dict) -> bool:
 
 # ---- «спасибо» to the bot: a reaction instead of an answer ----
 
-_THANKS = re.compile(r"(?:большое\s+|огромное\s+)?(?:спасибо|спс|пасиб[оа]?|благодарю|благодарствую|сенкс|мерси|"
-                     r"thx|thanks|thank\s+you)(?:\s+(?:большое|огромное|тебе|вам|бро|друг|дружище|нестор|бот))*")
-_ACK = re.compile(r"(?:ок|окей|ok|okay|понял|поняла|ясно|понятно|принято|угу)")
+_THANK = r"спасиб\w*|спс|пасиб\w*|благодар(?:ю|ствую|ен|на|ны)|сенкс|мерси|thx|thanks|thank\s+you"
+_THANKS = (rf"(?:тебе\s+|вам\s+)?(?:большое\s+|огромное\s+)?(?:{_THANK}|того\s+же|взаимно)"
+           r"(?:\s+(?:большое|огромное|тебе|вам|бро|друг|дружище|нестор|бот))*")
+_PRAISE = r"(?:ты\s+)?(?:лучший|лучшая|молодец|красавчик|умница)"      # «ты лучший», «спасибо, ты лучший»
+_ACK = r"(?:ок|окей|ok|okay|понял|поняла|ясно|понятно|принято|угу|ага|точно|хорошо|ладно)"
+# A thanks or a praise, maybe after an «ок» or two («понял, спасибо», «ок спс»); an «ок» alone («ясно, понял»).
+_THANKS_SAID = re.compile(rf"(?:{_ACK}\s+)*(?:{_THANKS}(?:\s+{_PRAISE})?|{_PRAISE}(?:\s+{_THANKS})?)")
+_ACK_SAID = re.compile(rf"{_ACK}(?:\s+{_ACK})*")
+_GOING_ON = re.compile(r"^(?:(?:а|и|ну)\s+)+")     # «а, понятно», «ну ок», «и тебе спасибо»
+# A thanks among other words (thanks()): a word of thanks, the words of thanks around it, and the few words
+# beside them that ask nothing: «о», «супер», «выручил», «очень помог», «понял», «за помощь», the praise, the
+# name. Any other word may ask more («спасибо, что ещё послушать», «посоветуй фильм, заранее спасибо»).
+_THANK_WORD = re.compile(rf"(?<!\w)(?:{_THANK})(?!\w)")
+_THANKS_IN = re.compile(rf"(?<!\w)(?:{_THANKS})(?:\s+{_PRAISE})?(?!\w)")
+_NOTHING_MORE = re.compile(
+    rf"(?:\s*(?:{_ACK}|{_PRAISE}|о|ой|ого|ух|вау|супер|круто|класс|классно|отлично|здорово|прекрасно|огонь|"
+    r"выручил[аи]?|помог(?:ла|ли)?|очень|интересно|полезно|большое|огромное|нестор|бот|ещ[её]\s+раз|"
+    r"за\s+(?:помощь|ответ|совет|подсказку|инфу|информацию|вс[её]))(?!\w))*\s*")
 
 
 # Friendly emoji outside the reactions list: answered with 👌.
@@ -113,8 +128,9 @@ _FRIENDLY = ("🙂", "😊", "☺", "😉", "👋", "✅", "✔", "💪", "🫶"
 
 
 def acknowledgement(text: str | None) -> str | None:
-    """The reaction for a bare «спасибо», «ок» or a friendly emoji sent to the bot; None for
-    anything else (a question, «❓», «👎»): that goes to the model."""
+    """The reaction for a bare «спасибо», «ок» (also «а, понятно», «и тебе спасибо», «а понял спасибо»,
+    «ты лучший») or a friendly emoji sent to the bot; None for anything else (a question, «❓», «👎»):
+    that goes to the model."""
     raw = normalize(text or "")
     if raw and not re.search(r"[\w?¿‽？❓❔⁉]", raw):
         if re.fullmatch(r"[\s)]+", raw):       # «)))»: a smile
@@ -123,12 +139,23 @@ def acknowledgement(text: str | None) -> str | None:
         if mirrored is not None:
             return mirrored
         return "👌" if raw.startswith(_FRIENDLY) else None
-    words = re.sub(r"\s+", " ", re.sub(r"[^\w\s?-]", " ", raw)).strip().lower()
-    if _THANKS.fullmatch(words):
+    words = _GOING_ON.sub("", re.sub(r"\s+", " ", re.sub(r"[^\w\s?-]", " ", raw)).strip().lower())
+    if _THANKS_SAID.fullmatch(words):
         return "❤"
-    if _ACK.fullmatch(words):
+    if _ACK_SAID.fullmatch(words):
         return "👌"
     return None
+
+
+def thanks(text: str | None) -> bool:
+    """A thanks among other words that ask nothing more: «о, спасибо», «супер, спасибо!», «спасибо, выручил»,
+    «спасибочки», «огромное тебе спасибо, ты лучший»; not «спасибо, а на завтра», «спасибо, расскажи ещё»,
+    «спасибо, что ещё послушать», «спасибо, теперь переведи» or «посоветуй фильм, заранее спасибо»: a word
+    outside the few of a thanks (_NOTHING_MORE) may ask something, and the model reads it. For a message to
+    the bot in own words (nestor.bot.addressing): nothing to answer. A call by name gets a reaction only for
+    the bare ones (acknowledgement)."""
+    words = _GOING_ON.sub("", " ".join(re.sub(r"[^\w\s?-]", " ", normalize(text or "").lower()).split()))
+    return _THANK_WORD.search(words) is not None and _NOTHING_MORE.fullmatch(_THANKS_IN.sub(" ", words)) is not None
 
 
 # ---- the model's answer ----
