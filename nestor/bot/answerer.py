@@ -188,7 +188,8 @@ class Answerer:
         self._posting: set[tuple[int, str]] = set()     # (chat_id, kind) of the posts queued or running
         self._digest_parts: dict[int, _DigestParts] = {}    # by chat_id: a digest not posted yet
         self._forgotten: dict[int, int] = {}   # user_id -> when their last /forget_me came, as Job.order
-        self._looked: dict[int, datetime | None] = {}   # chat_id -> its last look for a remark (run_chimes)
+        self._looked: dict[int, datetime | None] = {}   # chat_id -> its last look for a remark (_chime)
+        self._asked: set[tuple[int, int]] = set()       # (chat_id, message_id) of the requests queued or being answered
 
     # ---- entry points, called by the collector ----
 
@@ -246,7 +247,15 @@ class Answerer:
             await self._say(msg, prompts.PRIVATE_HELP, save=False)
 
     def submit(self, job: Job) -> None:
-        self._enqueue(job.msg["chat"]["id"], functools.partial(self._answer, job))
+        self._asked.add((job.msg["chat"]["id"], job.msg["message_id"]))
+        self._enqueue(job.msg["chat"]["id"], functools.partial(self._answer_asked, job))
+
+    async def _answer_asked(self, job: Job) -> None:
+        """A queued request, until its row is written: a remark meanwhile must not answer it too (_to_the_bot)."""
+        try:
+            await self._answer(job)
+        finally:
+            self._asked.discard((job.msg["chat"]["id"], job.msg["message_id"]))
 
     def _enqueue(self, key: _QueueKey, run: Callable[[], Awaitable[None]]) -> None:
         """key: the chat_id of the group whose answer it is, _DIGESTS, or _posts(chat_id)."""
@@ -1173,6 +1182,15 @@ class Answerer:
             blocks.append(show(chain + [r for r in below if r["message_id"] != msg["message_id"]], "ветка"))
             if _replied_author(msg) is not None:    # the answer is about their message: theses, who is right
                 job.quoted.add(_replied_author(msg))
+        elif parent is not None and parent["scenario"] == "chime":
+            # Nobody asked a remark: the message it answered is shown instead, while it is still there (not
+            # deleted, its author has not used /forget_me), as it may be far back by now.
+            remarked = await conn.fetchval("SELECT reply_to_id FROM messages WHERE chat_id = $1 AND message_id = $2",
+                                           chat_id, job.inv.replied_to_bot)
+            rows = await context.messages_by_id(conn, chat_id, [remarked]) if remarked is not None else []
+            if rows:
+                blocks.append(f"Реплика Нестора, на которую отвечают, была ответом на сообщение #{remarked}:")
+                blocks.append(show(rows, "сообщение"))
 
         for user in await context.mentioned_users(conn, msg, self.me.username):
             rows = await context.user_messages(conn, ids, thread, user["user_id"])
@@ -1527,16 +1545,19 @@ class Answerer:
                 last = self._looked[chat_id]
                 if last is not None and now - last < timedelta(minutes=cfg.every_min):
                     continue
-                self._looked[chat_id] = now
+                self._looked[chat_id] = now     # until it starts (_chime)
                 self._posting.add((chat_id, "chime"))
                 self._enqueue(_posts(chat_id), functools.partial(self._chime, chat_id, now, time.monotonic()))
 
     async def _chime(self, chat_id: int, now: datetime, queued: float) -> None:
         """A queued look (run_chimes); a failure is logged and waits for the next hour. It may wait
-        behind the news or the wisdom of the day: it looks as of when it starts."""
+        behind the news or the wisdom of the day: it looks as of when it starts, and the next look is an
+        hour after that start (to the second, as the scheduler's ticks go), so remarks are an hour apart."""
         status = "failed"
+        waited = time.monotonic() - queued
+        self._looked[chat_id] = now + timedelta(seconds=int(waited))
         try:
-            status = await self._remark(chat_id, now + timedelta(seconds=time.monotonic() - queued))
+            status = await self._remark(chat_id, now + timedelta(seconds=waited))
         except Exception as e:  # noqa: BLE001 - a remark is never worth a crash
             log.warning("remark failed", extra={"chat_id": chat_id, "error": type(e).__name__})
         finally:
@@ -1561,7 +1582,7 @@ class Answerer:
             if await self._tokens_today(conn) >= self.cfg.daily_token_limit // 2:     # answers come first
                 return "no_tokens"
             # No remark in the last hour either: only a look makes one, and looks are an hour apart from
-            # start to start (run_chimes). A remark written down a minute into its look does not hold up
+            # start to start (_chime). A remark written down a minute into its look does not hold up
             # the next look, so remarks may come on consecutive looks, one an hour.
             made = await conn.fetchval(
                 "SELECT count(*) FROM bot_requests WHERE chat_id = $1 AND scenario = 'chime' AND status = 'ok' "
@@ -1602,11 +1623,14 @@ class Answerer:
                     found = await context.messages_by_id(conn, chat_id, [chosen["message_id"]])
                     at = now + timedelta(seconds=time.monotonic() - started)
                     if found and chime.targetable(found[0], bot_id=self.me.user_id, previous=previous, now=at,
-                                                  max_age=timedelta(minutes=cfg.every_min)):
+                                                  max_age=timedelta(minutes=cfg.every_min)) \
+                            and not await self._to_the_bot(conn, chat_id, found[0]):
                         target = found[0]
-                        # A remark on a dispute may repeat the claim the target answers: that message counts too.
-                        sources = [target] + (await context.messages_by_id(conn, chat_id, [target["reply_to_id"]])
-                                              if target["reply_to_id"] is not None else [])
+                        # A remark on a dispute may repeat the claim the target answers: that message counts too,
+                        # as the model was shown it, also when it is gone since (its author's /forget_me meanwhile).
+                        claim = target["reply_to_id"]
+                        claimed = await context.messages_by_id(conn, chat_id, [claim]) if claim is not None else []
+                        sources = [target, *(claimed or [r for r in rows if r["message_id"] == claim])]
         if target is None:      # the model's silence, or a remark the code refused: no text is kept
             async with self.pool.acquire() as conn:
                 await self._log_scheduled(conn, chat_id, "chime_check", completion, [], started, keep_text=False)
@@ -1622,7 +1646,7 @@ class Answerer:
         # Logged as an answer to the target's author, and to the author of the message it replies to: /forget_me
         # and the purge take it with either message. The target's author comes first: the next remark is to
         # someone else (previous).
-        quoted = list(dict.fromkeys(u for r in sources for u in (r["user_id"], r["forwarded_from"])
+        quoted = list(dict.fromkeys(u for r in sources for u in (r["user_id"], r.get("forwarded_from"))
                                     if u not in (None, self.me.user_id)))
         async with self.pool.acquire() as conn, conn.transaction():
             await forget.erase_lock(conn)       # it may erase: the lock comes before the insert's row locks
@@ -1631,6 +1655,19 @@ class Answerer:
                                             oldest_source_at=min(r["stored_at"] for r in sources))
             await self._scrub_if_opted_out(conn, rid, quoted)
         return "posted"
+
+    async def _to_the_bot(self, conn, chat_id: int, row) -> bool:
+        """A request to the bot, still being checked, queued or answered, or answered or refused already;
+        a reply to the bot; a message that names it. The bot answers those itself, or leaves talk about it
+        alone: a remark on one would be a second reply, or an answer after all."""
+        mid = row["message_id"]
+        if (chat_id, mid) in self._asked or self.addresser.asking(chat_id, mid) \
+                or chime.names_bot(row["text"], self.me):
+            return True
+        return await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM bot_requests WHERE chat_id = $1 AND trigger_msg_id = $2) "
+            "OR EXISTS (SELECT 1 FROM messages WHERE chat_id = $1 AND message_id = $3 AND user_id = $4)",
+            chat_id, mid, row["reply_to_id"], self.me.user_id)
 
     async def _chime_wanted(self, conn, chat_id: int, day: date) -> bool:
         """/chime on, not paused, not moved to a supergroup, and nobody said «нестор, помолчи» on this day."""
@@ -1641,13 +1678,14 @@ class Answerer:
                 and self._chime_on(settings) and settings.get("chime_quiet") != day.isoformat())
 
     async def _quiet(self, msg: dict) -> None:
-        """«нестор, помолчи»: no remarks in this group until the end of the local day; the answers go on.
+        """«нестор, помолчи»: no remarks in this group until the end of the local day it was said on (one
+        Telegram delivers after midnight, the bot having been down, means that day); the answers go on.
         A 👌 says it, or one line where the chat takes no such reaction."""
         chat_id = msg["chat"]["id"]
         async with self.pool.acquire() as conn:
             await conn.execute(
                 "UPDATE chats SET settings = settings || jsonb_build_object('chime_quiet', $2::text) WHERE chat_id = $1",
-                chat_id, datetime.now(self.cfg.tz).date().isoformat())
+                chat_id, datetime.fromtimestamp(msg["date"], self.cfg.tz).date().isoformat())
         if "👌" not in await self.reactor.allowed(chat_id) or not await self._put_reaction(msg, "👌"):
             await self._say(msg, prompts.CHIME_QUIET)
 

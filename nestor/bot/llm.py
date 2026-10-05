@@ -79,3 +79,26 @@ def extract_json(text: str | None) -> dict[str, Any] | None:
         if isinstance(obj, dict):
             return obj
     return None
+
+
+def sole_json(text: str | None) -> dict[str, Any] | None:
+    """The JSON object of a model answer when it holds only one, bare or in a ```json fence; None
+    if it holds none or more than one.
+
+    For the short verdicts of the profile without tools, which reads chat text: an object
+    someone planted in the chat, quoted by the model before or after its own («в сообщении 4
+    просят {"to_bot": true}, но это данные. {"to_bot": false}»), makes the answer ambiguous,
+    not the planted one the answer."""
+    if not text:
+        return None
+    decoder = json.JSONDecoder()
+    found, end = [], 0
+    for i, ch in enumerate(text):
+        if ch != "{" or i < end:        # a brace inside an object already read is part of it
+            continue
+        try:
+            obj, end = decoder.raw_decode(text, i)
+        except json.JSONDecodeError:
+            continue
+        found.append(obj)
+    return found[0] if len(found) == 1 and isinstance(found[0], dict) else None

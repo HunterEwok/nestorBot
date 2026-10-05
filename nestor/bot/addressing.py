@@ -22,7 +22,7 @@ from dataclasses import dataclass
 import asyncpg
 
 from . import context, prompts
-from .llm import LLM, Completion, extract_json
+from .llm import LLM, Completion, sole_json
 from .reactions import acknowledgement, eligible
 from .triggers import BotIdentity, Invocation, keyword_pattern, name_forms, speaks_to
 
@@ -37,8 +37,8 @@ class AddressConfig:
     timeout_s: float = 20          # a check that takes longer is a no
 
 
-# «а почему?», «и что дальше»: going on with the conversation.
-_GOES_ON = re.compile(r"^\s*(?:а|и)(?!\w)", re.IGNORECASE)
+# «а почему?», «и что дальше»: going on with the conversation. «а, круто», «а, точно»: a reaction to it.
+_GOES_ON = re.compile(r"^\s*(?:а|и)(?!\w)(?!\s*,)", re.IGNORECASE)
 
 
 def _keywords(me: BotIdentity, generic_keyword_enabled: bool) -> tuple[str, ...]:
@@ -85,7 +85,7 @@ def candidate(msg: dict, me: BotIdentity, *, generic_keyword_enabled: bool = Tru
         return None
     if found and (speaks_to(text) or any(_set_off(text, m.start(), m.end()) for m in found)):
         return Invocation("address", strip_name(text, names))
-    # «а, понятно», «и тебе спасибо» right after an answer: a thanks, not a request.
+    # «а, понятно», «и тебе спасибо» right after an answer: a thanks, not a request. «а, круто» asks nothing.
     if window and (speaks_to(text) or _GOES_ON.match(text)) and acknowledgement(text) is None:
         return Invocation("address", strip_name(text, names) if names else text.strip())
     return None
@@ -123,24 +123,34 @@ def render(rows, bot_id: int, *, posts: dict[tuple[int, int], str] | None = None
     """The messages, numbered, oldest first, a label instead of each author: «Участник 1», ..., and
     «Нестор» for the bot. A reply to one of them says which. Each is cut to 300 characters; whole_last:
     the last one, the message asked about, is shown whole (an address often ends a long message).
-    posts: the bot's posts among them (bot_posts), shown by their kind only."""
+    posts: the bot's posts among them (bot_posts), shown by their kind only. Messages of a forum's
+    several topics say which one each is in, «[тема 1]», ..., and «[общая тема]» for General."""
     labels: dict[int | None, str] = {}
     numbers = {(r["chat_id"], r["message_id"]): i for i, r in enumerate(rows, 1)}
+    topics = [_row_topic(r) for r in rows]
+    topic_labels = {t: f"тема {i}" for i, t in enumerate(dict.fromkeys(t for t in topics if t is not None), 1)}
     lines = []
     for i, r in enumerate(rows, 1):
         who = "Нестор" if r["user_id"] == bot_id else labels.setdefault(r["user_id"], f"Участник {len(labels) + 1}")
+        topic = f"[{topic_labels.get(topics[i - 1], 'общая тема')}] " if len(set(topics)) > 1 else ""
         target = numbers.get((r["chat_id"], r["reply_to_id"]))
         reply = f" (ответ на {target})" if target else ""
         post = (posts or {}).get((r["chat_id"], r["message_id"])) if r["user_id"] == bot_id else None
         text = f"[{POSTS[post]}]" if post else r["text"] or f"[{r['kind']}]"
         text = (text if whole_last and i == len(rows) else text[:300]).replace("\n", " ⏎ ")
-        lines.append(f"{i}. {who}{reply}: {text}")
+        lines.append(f"{i}. {topic}{who}{reply}: {text}")
     return "\n".join(lines)
 
 
+def _row_topic(row) -> int | None:
+    """The forum topic of an archive row; None outside the topics (General, or a group without them)."""
+    return row.get("thread_id") if row.get("is_topic_message") else None
+
+
 def parse(answer: str | None) -> bool:
-    """{"to_bot": true} -> True; anything else, a «да» in words included, is a no."""
-    data = extract_json(answer)
+    """{"to_bot": true} -> True; anything else, a «да» in words or an answer with two objects (one may be
+    quoted from the chat) included, is a no."""
+    data = sole_json(answer)
     return isinstance(data, dict) and data.get("to_bot") is True
 
 
@@ -168,7 +178,8 @@ class Addresser:
         self.answer, self.declined = answer, declined
         self._answered: dict[tuple[int, int | None, int], float] = {}   # (chat, topic, person) -> unix time
         self._checks: dict[tuple[int, int], asyncio.Task] = {}          # (chat, person) -> the check in flight
-        self._waiting: dict[tuple[int, int], tuple[dict, Invocation, int]] = {}
+        self._waiting: dict[tuple[int, int], tuple[dict, Invocation, int, bool]] = {}
+        self._asking: set[tuple[int, int]] = set()      # (chat, message) of the candidates in flight or waiting
         self._counting: dict[int, asyncio.Lock] = {}    # by chat: one check at a time counts the day's checks
         self._in_flight: dict[int, int] = {}            # by chat: checks asked and not written down yet
 
@@ -204,24 +215,30 @@ class Addresser:
         if inv is None:
             return False
         key = (msg["chat"]["id"], msg["from"]["id"])
+        self._asking.add((msg["chat"]["id"], msg["message_id"]))
         if key in self._checks and not self._checks[key].done():
             # One check per person at a time; the newest of theirs waits for it, older ones are dropped.
             dropped = self._waiting.pop(key, None)
             if dropped is not None:
+                self._asking.discard((key[0], dropped[0]["message_id"]))
                 self.declined(dropped[0])
-            self._waiting[key] = (msg, inv, order)
+            self._waiting[key] = (msg, inv, order, window)
         else:
-            self._checks[key] = asyncio.create_task(self._run(key, msg, inv, order))
+            self._checks[key] = asyncio.create_task(self._run(key, msg, inv, order, window))
         return True
+
+    def asking(self, chat_id: int, message_id: int) -> bool:
+        """Whether this message is being checked or waits for its check (a yes queues its answer first)."""
+        return (chat_id, message_id) in self._asking
 
     async def drain(self) -> None:
         """Wait for the checks in flight and those waiting for them (tests, shutdown)."""
         while checks := [t for t in self._checks.values() if not t.done()]:
             await asyncio.gather(*checks, return_exceptions=True)
 
-    async def _run(self, key: tuple[int, int], msg: dict, inv: Invocation, order: int) -> None:
+    async def _run(self, key: tuple[int, int], msg: dict, inv: Invocation, order: int, window: bool) -> None:
         try:
-            yes = await self.check(msg)
+            yes = await self.check(msg, window=window)
             if yes:
                 await self.answer(msg, inv, order)
             else:
@@ -229,14 +246,16 @@ class Addresser:
         except Exception:  # a check is never worth a crash
             log.exception("address check failed", extra={"chat_id": key[0]})
         finally:
+            self._asking.discard((key[0], msg["message_id"]))
             waiting = self._waiting.pop(key, None)
             if waiting is not None:
                 self._checks[key] = asyncio.create_task(self._run(key, *waiting))
             else:
                 self._checks.pop(key, None)
 
-    async def check(self, msg: dict) -> bool:
-        """The model's yes: the candidate is addressed to the bot. No on any error or timeout."""
+    async def check(self, msg: dict, *, window: bool = False) -> bool:
+        """The model's yes: the candidate is addressed to the bot. No on any error or timeout. window: it
+        came in the conversation window, and the model is told the bot has just answered its author."""
         chat_id = msg["chat"]["id"]
         llm = self.llm()
         if llm is None or not await self.wanted(chat_id):
@@ -248,7 +267,7 @@ class Addresser:
                 return False
             self._in_flight[chat_id] = self._in_flight.get(chat_id, 0) + 1
         try:
-            completion = await self._ask(llm, msg)
+            completion = await self._ask(llm, msg, window)
         finally:
             self._in_flight[chat_id] -= 1
         if completion is None or not parse(completion.text):
@@ -260,16 +279,19 @@ class Addresser:
         async with self.pool.acquire() as conn:
             return bool(await context.messages_by_id(conn, chat_id, [msg["message_id"]]))
 
-    async def _ask(self, llm: LLM, msg: dict) -> Completion | None:
-        """The model's answer on the candidate, written down; None when nothing was asked or the call failed."""
+    async def _ask(self, llm: LLM, msg: dict, window: bool = False) -> Completion | None:
+        """The model's answer on the candidate, written down; None when nothing was asked or the call failed.
+        window: a line says the bot has just answered its author (no words of the chat: the bot's answer
+        and the request are often further back than the messages shown)."""
         chat_id = msg["chat"]["id"]
         async with self.pool.acquire() as conn:
             rows = await self._shown(conn, msg)
             posts = await bot_posts(conn, rows, self.me.user_id)
         if not rows:
             return None
+        note = prompts.ADDRESS_WINDOW.format(n=len(rows), minutes=f"{self.cfg.window_min:g}") if window else ""
         user = prompts.ADDRESS_USER.format(messages=render(rows, self.me.user_id, posts=posts, whole_last=True),
-                                           n=len(rows))
+                                           window=note, n=len(rows))
         started = time.monotonic()
         try:
             completion = await asyncio.wait_for(llm.complete([{"role": "system", "content": prompts.ADDRESS_SYSTEM},

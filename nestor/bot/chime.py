@@ -5,9 +5,9 @@ to the profile without tools, numbered and without names (nestor.bot.addressing.
 mostly stays silent; now and then it answers one person's message with a short remark: a question
 nobody answered, a dispute about a checkable fact, a light joke, a useful fact. The code picks the
 hours, counts the remarks and checks what the model chose (Answerer.run_chimes): a number it was
-shown, a person's message of the last hour, not the person the previous remark answered, a short
-text without links. Anything else is silence. «нестор, помолчи» silences the remarks until the
-end of the day; the bot's answers are not affected.
+shown, a person's message of the last hour that is neither a request to the bot nor about it, not
+the person the previous remark answered, a short text without links. Anything else is silence.
+«нестор, помолчи» silences the remarks until the end of the day; the bot's answers are not affected.
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 from datetime import time as dtime
 
 from .. import forget
-from .llm import extract_json
+from .llm import sole_json
 from .triggers import BotIdentity, name_forms, quiet
 
 MAX_CHARS = 300         # a remark is one or two sentences
@@ -45,6 +45,13 @@ def asks_quiet(text: str | None, me: BotIdentity) -> bool:
     return quiet(re.sub(rf"(?<!\w)(?:{name_forms(me.keywords)})(?!\w)", " ", (text or "").lower()))
 
 
+def names_bot(text: str | None, me: BotIdentity) -> bool:
+    """Whether a message names the bot anywhere, in any case form or by its @username: a call, which
+    gets an answer anyway, or talk about it, which the bot leaves alone. A remark answers neither."""
+    return re.search(rf"(?<!\w)(?:{name_forms(me.keywords)}|@{re.escape(me.username)})(?!\w)", text or "",
+                     re.IGNORECASE) is not None
+
+
 # A web address in any form: https://…, www.…, t.me/…, example.com, сайт.рф.
 LINK = re.compile(r"https?://|www\.|(?<![\w.])[\w-]+(?:\.[\w-]+)*\.(?:[a-z]{2,}|рф)(?!\w)", re.IGNORECASE)
 
@@ -65,16 +72,19 @@ class Pick:
     text: str
 
 
-# The labels the model reads instead of names (nestor.bot.addressing.render) mean nothing in the chat.
-_LABEL = re.compile(r"участник\w*\s*№?\s*\d", re.IGNORECASE)
-_SIGNED = re.compile(r"^\s*нестор\s*(?::|—|–|-(?!\w))\s*", re.IGNORECASE)     # «Нестор: …», as the model reads its own
+# What the model reads besides the words (nestor.bot.addressing.render) means nothing in the chat: the
+# labels instead of names, «Участник 2» or «участница 3», the numbers of the messages and «(ответ на 3)».
+_LABEL = re.compile(r"участни[кц]\w*\s*№?\s*\d|сообщени\w*\s*№?\s*\d|№\s*\d|\(\s*ответ\s+на\s+\d", re.IGNORECASE)
+# «Нестор: …» or «Нестор (ответ на 3): …», as the model reads its own.
+_SIGNED = re.compile(r"^\s*нестор\s*(?:\(\s*ответ\s+на\s+\d+\s*\)\s*)?(?::|—|–|-(?!\w))\s*", re.IGNORECASE)
 
 
 def parse(answer: str | None, count: int) -> Pick | None:
     """{"reply_to": N, "text": "…"} -> Pick. {"reply_to": null}, a number that was not shown, an empty
-    text, one too long to cut, a link, a label («Участник 2 прав»), anything else: None, the bot stays
-    silent. A «Нестор:» before the text is dropped."""
-    data = extract_json(answer)
+    text, one too long to cut, a link, a label («Участник 2 прав») or a message's number, an answer
+    with two objects (one may be quoted from the chat), anything else: None, the bot stays silent.
+    A «Нестор:» before the text is dropped."""
+    data = sole_json(answer)
     if not isinstance(data, dict):
         return None
     n, text = data.get("reply_to"), data.get("text")
