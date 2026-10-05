@@ -57,8 +57,10 @@ MARK = re.compile(r"[,:;!?.…—–-]")
 _ASKS = re.compile(r"(?:что|чего|кто|кого|кому|где|куда|откуда|когда|сколько|почему|зачем|"
                    r"как(?:ой|ая|ое|ие|ую|ого|ому|им|их)|как(?![\w-])(?!\s+(?:всегда|обычно|будто|и|раз|бы|правило)"
                    r"(?!\w)))(?![\w-])", re.IGNORECASE)
-# A web address, without its trailing punctuation: a «?si=» inside it is not a question.
-URL = re.compile(r"(?:https?://|www\.|(?<![\w.])[\w-]+(?:\.[\w-]+)*\.[a-z]{2,}/)\S+?(?=[.,;:!?)»\"']*(?:\s|$))")
+# A web address, without its trailing punctuation: a «?si=» inside it is not a question, also right after the
+# domain («example.com?si=…»), while «ты видел example.com?» still asks.
+URL = re.compile(r"(?:https?://|www\.|(?<![\w.])[\w-]+(?:\.[\w-]+)*\.[a-z]{2,}(?:/|[?#](?=\w)))\S+?(?=[.,;:!?)»\"']*(?:\s|$))",
+                 re.IGNORECASE)
 
 
 def speaks_to(text: str) -> bool:

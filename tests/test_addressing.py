@@ -96,6 +96,10 @@ def verdict(text: str | None, *, on: bool = True, bot_word: bool = True, window:
     ("нестор как всегда всё перепутал", "candidate"),
     ("бот когда-то работал", "candidate"),
     ("нестор вчера скинул ролик https://youtu.be/abc?si=xyz", "candidate"),    # a «?» in a link is no question
+    ("нестор вчера скинул example.com?si=xyz", "candidate"),                  # also right after a bare domain
+    ("нестор вчера скинул Example.COM/abc?si=xyz", "candidate"),
+    ("нестор вчера скинул HTTPS://YOUTU.BE/abc?si=xyz", "candidate"),
+    ("нестор видел example.com?", "explicit"),                                # the question after a link still asks
     # The name elsewhere with a sign of an address.
     ("слушай, Нестор, а ты как думаешь?", "candidate"),
     ("Ну что, Нестор, пойдём", "candidate"),
