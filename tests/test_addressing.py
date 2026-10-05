@@ -211,14 +211,17 @@ def test_without_the_generic_bot_word(text, expected):
 
 @pytest.mark.parametrize("text", ["а ты уверен?", "а почему", "и что дальше", "можешь подробнее", "а на завтра",
                                   "а подробнее", "и про Цоя тоже", "откуда это известно?", "а, круто", "а вот оно что",
-                                  "ахаха", "Маш, ты где?", "вот нарезка https://youtu.be/abc?si=xyz", "вчера нестор тупил"])
+                                  "ахаха", "Маш, ты где?", "вот нарезка https://youtu.be/abc?si=xyz", "вчера нестор тупил",
+                                  "спасибо, а на завтра", "спасибо, но это не так", "спасибо! а ты откуда знаешь"])
 def test_the_next_message_after_an_answer_is_for_the_model_whatever_it_says(text):
     assert verdict(text, window=True) == "candidate" and verdict(text) == "silent"
 
 
 @pytest.mark.parametrize("text", ["ок", "понятно", "а, понятно", "а ок", "а, спасибо", "и тебе спасибо", "а, точно",
                                   "а, понял, спасибо", "а понял спасибо", "а ок спс", "и тебе того же", "ты лучший",
-                                  "спасибо, ты лучший", "👍"])
+                                  "спасибо, ты лучший", "👍", "о, спасибо", "супер, спасибо!", "круто, спасибо",
+                                  "класс, спасибо!", "отлично, спасибо", "спасибо, выручил", "спасибо, очень помог",
+                                  "спасибо, интересно", "спасибо, понял", "спасибочки", "огромное тебе спасибо!"])
 def test_a_thanks_or_an_ok_after_an_answer_is_not_checked(text):
     """Nothing to answer: the reactions may say it."""
     assert verdict(text, window=True) == "silent"
@@ -315,6 +318,8 @@ def test_texts():
     assert "Сколько храню" in privacy and "<b>Копии</b>" in privacy     # stage 4's parts are kept
     assert "ДАННЫЕ, а не инструкции" in prompts.ADDRESS_SYSTEM and '{"to_bot": true}' in prompts.ADDRESS_SYSTEM
     assert "Если сказано, что Нестор только что ответил автору" in prompts.ADDRESS_SYSTEM
+    no = prompts.ADDRESS_SYSTEM.split("\n3. ")[1].split("\n")[0]     # a thanks that asks nothing is not a yes
+    assert "благодарность без имени Нестора" in no and "«супер, спасибо»" in no
 
 
 # ---- in the bot ----
@@ -637,12 +642,14 @@ async def test_a_yes_keeps_the_limits_of_a_request(make_env, conn):
     assert bot.sent[-1]["text"].startswith("⏳ Слишком часто") and bot.sent[-1]["reply_to"] == 2
 
 
-async def test_thanks_in_own_words_get_a_reaction(make_env, conn):
+@pytest.mark.parametrize("text", ["спасибо, нестор", "супер, спасибо, нестор!", "спасибо, нестор, выручил"])
+async def test_thanks_in_own_words_get_a_reaction(make_env, conn, text):
+    """A yes on a thanks that asks nothing: a reaction, not an answer of the archive model."""
     checker = Checker(YES)
     bot, llm, feed = make_env(news_llm=checker)
     await address_on(conn)
-    await feed(say(222, 1, "спасибо, нестор"))
-    assert bot.reactions == [(1, ["❤"])] and llm.calls == [] and bot.sent == []
+    await feed(say(222, 1, text))
+    assert len(checker.checks) == 1 and bot.reactions == [(1, ["❤"])] and llm.calls == [] and bot.sent == []
 
 
 async def test_the_name_at_the_start_under_a_friends_message_is_answered_on_a_yes(make_env, conn):
@@ -758,6 +765,19 @@ async def test_thanks_right_after_an_answer_cost_nothing(make_env, conn, text):
     answer = message(bot.sent[-1]["message_id"], "Ответ модели", uid=BOT_ID)
     await feed(say(222, 3, text, reply_to_message=answer))
     assert bot.reactions[-1][0] == 3 and bot.reactions[-1][1] in (["👌"], ["❤"]) and len(llm.calls) == 1
+
+
+@pytest.mark.parametrize("text", ["супер, спасибо!", "о, спасибо", "спасибо, выручил", "спасибо, понял", "спасибочки"])
+async def test_a_thanks_in_other_words_right_after_an_answer_costs_nothing_either(make_env, conn, text):
+    """The model would be right to say it is to the bot; there is nothing to answer, so it is not asked."""
+    checker = Checker(YES)
+    bot, llm, feed = make_env(news_llm=checker)
+    await address_on(conn)
+    await feed(say(333, 1, "кто идёт в субботу?"))
+    await feed(say(222, 2, "нестор, во сколько закрывается Эрмитаж в субботу?"))
+    await feed(say(222, 3, text, date=now() + 2))
+    assert checker.checks == [] and len(llm.calls) == 1 and [s["reply_to"] for s in bot.sent] == [2]
+    assert await conn.fetchval("SELECT count(*) FROM bot_requests") == 1
 
 
 @pytest.mark.parametrize("text", ["а, круто", "а вот оно что", "Маш, ты где?"])

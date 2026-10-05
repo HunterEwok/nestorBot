@@ -5,10 +5,11 @@ a reply to the bot, the name at the start with a comma, or alone. In a group whe
 /address, the doubtful ones are candidates: the name elsewhere in the message with a sign of
 an address («слушай, Нестор, а ты как думаешь?»), the name at the start without a comma
 («нестор вчера тупил», «нестор кто прав»), and the next message of someone the bot has just answered,
-whatever it says («а ты уверен?», «а на завтра» a minute later), but for a thanks or an «ок». A candidate,
-with the few messages before it and without names, goes to the profile without tools for a yes or
-a no; a yes is answered as if the bot had been called by name. No profile, past the daily number
-of checks, or when the day's tokens run low: no check, and no answer. The code never guesses yes.
+whatever it says («а ты уверен?», «а на завтра» a minute later), but for a thanks or an «ок» that asks
+nothing more («супер, спасибо!»). A candidate, with the few messages before it and without names, goes
+to the profile without tools for a yes or a no; a yes is answered as if the bot had been called by name
+(a thanks that asks nothing gets a reaction). No profile, past the daily number of checks, or when the
+day's tokens run low: no check, and no answer. The code never guesses yes.
 """
 from __future__ import annotations
 
@@ -23,7 +24,7 @@ import asyncpg
 
 from . import context, prompts
 from .llm import LLM, Completion, sole_json
-from .reactions import acknowledgement, eligible
+from .reactions import acknowledgement, eligible, thanks
 from .triggers import (
     MARK,
     BotIdentity,
@@ -71,9 +72,10 @@ def candidate(msg: dict, me: BotIdentity, *, generic_keyword_enabled: bool = Tru
     """Whether a message that detect() did not take may still be addressed to the bot, for the
     model to decide; None when it is clearly not. window: it is the person's next message here
     after the bot answered them a moment ago, a candidate whatever it says, but for a thanks or an
-    «ок» (nothing to answer: the reactions may say it). Only a person's own words: no bots, channels,
-    forwards or commands. A reply to someone else is said to them, unless it starts with the name
-    («нестор кто прав» under a friend's message)."""
+    «ок» that asks nothing more («ок», «супер, спасибо!», «спасибо, выручил»: nothing to answer, the
+    reactions may say it). Only a person's own words: no bots, channels, forwards or commands. A reply
+    to someone else is said to them, unless it starts with the name («нестор кто прав» under a friend's
+    message)."""
     text = msg.get("text") or msg.get("caption") or ""
     if not eligible(msg):
         return None
@@ -86,7 +88,7 @@ def candidate(msg: dict, me: BotIdentity, *, generic_keyword_enabled: bool = Tru
         return None
     if found and (speaks_to(text) or any(_set_off(text, m.start(), m.end()) for m in found)):
         return Invocation("address", strip_name(text, names))
-    if window and acknowledgement(text) is None:
+    if window and acknowledgement(text) is None and not thanks(text):
         return Invocation("address", strip_name(text, names) if names else text.strip())
     return None
 

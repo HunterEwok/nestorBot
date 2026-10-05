@@ -10,7 +10,17 @@ from aiogram.methods import SetMessageReaction
 from aiogram.types import ReactionTypeEmoji
 
 from nestor.bot import markup, prompts, reactions
-from nestor.bot.reactions import ALLOWED, STANDARD, Guess, ReactionConfig, acknowledgement, eligible, guess, parse
+from nestor.bot.reactions import (
+    ALLOWED,
+    STANDARD,
+    Guess,
+    ReactionConfig,
+    acknowledgement,
+    eligible,
+    guess,
+    parse,
+    thanks,
+)
 
 from .factories import CHAT_ID, message, update
 from .test_answerer import FakeLLM, make_env_fixture  # noqa: F401 - the fixture is used by name
@@ -96,6 +106,7 @@ def test_eligible():
     # «ок» and thanks together, with or without commas, and the thanks of a compliment.
     ("а понял спасибо", "❤"), ("ок спс", "❤"), ("Ясно, спасибо!", "❤"), ("точно, спасибо", "❤"),
     ("спасибо, ты лучший", "❤"), ("ты лучший", "❤"), ("и тебе того же", "❤"), ("а, ясно, понял", "👌"),
+    ("спасибочки", "❤"), ("Благодарен!", "❤"),
     ("а круто", None), ("ок, спасибо, а завтра?", None), ("понял, спасибо, но ты не прав", None),
     ("👍", "👍"), ("❤️", "❤"), ("🔥🔥", "🔥"), (")))", "😁"), ("🙂", "👌"),
     ("❓", None), ("⁉️", None), ("？", None), ("👎", None), ("🤬", None), ("!!!", None), ("🍺", None),
@@ -104,6 +115,25 @@ def test_eligible():
 ])
 def test_acknowledgement(text, emoji):
     assert acknowledgement(text) == emoji
+
+
+@pytest.mark.parametrize("text, expected", [
+    # A thanks among other words that ask nothing.
+    ("о, спасибо", True), ("супер, спасибо!", True), ("круто, спасибо", True), ("класс, спасибо!", True),
+    ("отлично, спасибо", True), ("спасибо, выручил", True), ("спасибо, очень помог", True),
+    ("спасибо, интересно", True), ("спасибо, понял", True), ("спасибочки", True), ("огромное тебе спасибо!", True),
+    ("огромное тебе спасибо, ты лучший", True), ("спасибо тебе за помощь", True), ("а, супер, спасибо", True),
+    ("спасибо, нестор, выручил", True), ("спасибо", True), ("мерси 🙏", True),
+    # More to say: a question, «ты», a request, or an «а», «и», «но» after the thanks.
+    ("спасибо, а на завтра", False), ("спасибо, но это не так", False), ("спасибо, и про Цоя тоже", False),
+    ("спасибо, расскажи ещё", False), ("спасибо, ты уверен?", False), ("спасибо! а почему так?", False),
+    ("понял, спасибо, но ты не прав", False),
+    # No thanks at all: a praise, «того же», «благодаря».
+    ("ну ты молодец, выручил", False), ("а какой лучший фильм", False), ("а того же автора посоветуешь", False),
+    ("благодаря дождю матч отменили", False), ("ок", False), ("🙏", False), ("", False), (None, False),
+])
+def test_thanks(text, expected):
+    assert thanks(text) is expected
 
 
 def test_parse():

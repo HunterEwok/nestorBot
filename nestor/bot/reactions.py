@@ -27,6 +27,7 @@ from aiogram.types import ReactionTypeEmoji
 
 from . import prompts
 from .llm import LLM, Completion, extract_json
+from .triggers import speaks_to
 
 log = logging.getLogger("nestor.reactions")
 
@@ -103,8 +104,8 @@ def eligible(msg: dict) -> bool:
 
 # ---- «спасибо» to the bot: a reaction instead of an answer ----
 
-_THANKS = (r"(?:тебе\s+|вам\s+)?(?:большое\s+|огромное\s+)?(?:спасибо|спс|пасиб[оа]?|благодарю|благодарствую|"
-           r"сенкс|мерси|thx|thanks|thank\s+you|того\s+же|взаимно)"
+_THANK = r"спасиб\w*|спс|пасиб\w*|благодар(?:ю|ствую|ен|на|ны)|сенкс|мерси|thx|thanks|thank\s+you"
+_THANKS = (rf"(?:тебе\s+|вам\s+)?(?:большое\s+|огромное\s+)?(?:{_THANK}|того\s+же|взаимно)"
            r"(?:\s+(?:большое|огромное|тебе|вам|бро|друг|дружище|нестор|бот))*")
 _PRAISE = r"(?:ты\s+)?(?:лучший|лучшая|молодец|красавчик|умница)"      # «ты лучший», «спасибо, ты лучший»
 _ACK = r"(?:ок|окей|ok|okay|понял|поняла|ясно|понятно|принято|угу|ага|точно|хорошо|ладно)"
@@ -112,6 +113,11 @@ _ACK = r"(?:ок|окей|ok|okay|понял|поняла|ясно|понятн�
 _THANKS_SAID = re.compile(rf"(?:{_ACK}\s+)*(?:{_THANKS}(?:\s+{_PRAISE})?|{_PRAISE}(?:\s+{_THANKS})?)")
 _ACK_SAID = re.compile(rf"{_ACK}(?:\s+{_ACK})*")
 _GOING_ON = re.compile(r"^(?:(?:а|и|ну)\s+)+")     # «а, понятно», «ну ок», «и тебе спасибо»
+# A thanks among other words (thanks()): a word of thanks, the words of thanks around it, and the words after
+# which more is said: «спасибо, а на завтра», «спасибо, но это не так».
+_THANK_WORD = re.compile(rf"(?<!\w)(?:{_THANK})(?!\w)")
+_THANKS_IN = re.compile(rf"(?<!\w)(?:{_THANKS})(?:\s+{_PRAISE})?(?!\w)")
+_MORE = re.compile(r"(?<!\w)(?:а|и|но)(?!\w)")
 
 
 # Friendly emoji outside the reactions list: answered with 👌.
@@ -136,6 +142,17 @@ def acknowledgement(text: str | None) -> str | None:
     if _ACK_SAID.fullmatch(words):
         return "👌"
     return None
+
+
+def thanks(text: str | None) -> bool:
+    """A thanks among other words that ask nothing more: «о, спасибо», «супер, спасибо!», «спасибо, выручил»,
+    «спасибочки», «огромное тебе спасибо, ты лучший»; not «спасибо, а на завтра», «спасибо, но это не так»,
+    «спасибо, расскажи ещё» or «спасибо, ты уверен?». For a message to the bot in own words
+    (nestor.bot.addressing): nothing to answer. A call by name gets a reaction only for the bare ones
+    (acknowledgement): with more words it may still ask something."""
+    words = _GOING_ON.sub("", " ".join(re.sub(r"[^\w\s?-]", " ", normalize(text or "").lower()).split()))
+    rest = _THANKS_IN.sub(" ", words)
+    return _THANK_WORD.search(words) is not None and not speaks_to(rest) and not _MORE.search(rest)
 
 
 # ---- the model's answer ----

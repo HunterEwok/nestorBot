@@ -512,10 +512,13 @@ class Answerer:
         return True
 
     async def _acknowledged(self, msg: dict, inv: Invocation) -> bool:
-        """Answer a bare «спасибо», «ок» or emoji with a reaction the chat allows. Not when it
-        answers the bot's own question («Ты про Кино?» — «угу») or replies to someone else's
-        message: then it is a request. False sends the message on to the model."""
+        """Answer a bare «спасибо», «ок» or emoji with a reaction the chat allows, and after an address
+        check's yes also a thanks among other words that ask nothing («супер, спасибо, нестор!»). Not when
+        it answers the bot's own question («Ты про Кино?» — «угу») or replies to someone else's message:
+        then it is a request. False sends the message on to the model."""
         emoji = reactions.acknowledgement(inv.text)
+        if emoji is None and inv.kind == "address" and reactions.thanks(inv.text):
+            emoji = "❤"
         if emoji is None or _reply_target(msg, inv) is not None:
             return False
         replied = (msg.get("reply_to_message") or {}).get("text") or ""
