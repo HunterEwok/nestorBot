@@ -36,7 +36,7 @@ from .triggers import BotIdentity, Invocation, detect
 
 log = logging.getLogger("nestor.answerer")
 
-ANONYMOUS_ADMIN_ID = 1087968824  # GroupAnonymousBot: an admin posting as the group
+ANONYMOUS_ADMIN_ID = 1087968824  # GroupAnonymousBot: an admin posting as the group (one of forget.SHARED_IDS)
 STATUS_STALE_AFTER = timedelta(minutes=15)     # the watchdog runs every 5 minutes
 _OFF = ("off", "выкл", "0", "нет", "no")
 
@@ -138,7 +138,7 @@ class Answerer:
             if not paused and self._reactions_on(msg["chat"]["id"], settings):
                 self.reactor.consider(msg)
             return
-        if paused and inv.command not in ("resume", "status"):
+        if paused and inv.command not in ("resume", "status", "forget_me", "privacy"):   # /forget_me never waits
             return
         if inv.kind == "command":
             await self._command(msg, inv)
@@ -197,6 +197,8 @@ class Answerer:
         elif cmd == "privacy":
             await self._say(msg, prompts.PRIVACY.format(retention=promises.RETENTION_MONTHS,
                                                         backup_weeks=promises.BACKUP_WEEKS))
+        elif cmd in ("forget_me", "export") and _shared_sender(msg):
+            await self._say(msg, prompts.PERSONAL_ONLY, save=False)
         elif cmd == "forget_me":
             count = await self.forget_user(user_id)
             await self._say(msg, prompts.FORGOTTEN.format(count=count, backup_weeks=promises.BACKUP_WEEKS), save=False)
@@ -1315,6 +1317,12 @@ def _numbered(text: str, n: int) -> list[str | None]:
 def _snippet(text: str | None, limit: int = 60) -> str:
     text = re.sub(r"\s+", " ", text or "").strip() or "без текста"
     return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+def _shared_sender(msg: dict) -> bool:
+    """Whether the sender is not one person: an anonymous admin, someone posting as a channel, Telegram's
+    forwards from a linked channel. Their messages share one id, so /forget_me would forget everybody's."""
+    return "sender_chat" in msg or msg["from"]["id"] in forget.SHARED_IDS or bool(msg["from"].get("is_bot"))
 
 
 def _replied_author(msg: dict) -> int | None:

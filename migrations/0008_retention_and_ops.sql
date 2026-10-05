@@ -63,6 +63,10 @@ FROM (SELECT c.chat_id, min(m.stored_at) AS first_at
       GROUP BY c.chat_id) f
 WHERE b.chat_id = f.chat_id AND f.first_at < b.oldest_source_at;
 
+-- Telegram's shared senders (nestor.forget.SHARED_IDS: anonymous admins, whoever posts as a channel,
+-- forwards from a linked channel) are not one person: a /forget_me from one of them was no opt-out.
+UPDATE users SET opted_out = FALSE WHERE opted_out AND user_id IN (1087968824, 136817688, 777000);
+
 -- /forget_me keeps only the opt-out itself.
 UPDATE users SET username = NULL, first_name = NULL, last_name = NULL
 WHERE opted_out AND (username IS NOT NULL OR first_name IS NOT NULL OR last_name IS NOT NULL);
@@ -102,10 +106,10 @@ WHERE u.opted_out AND r.raw ? 'quote' AND f.chat_id = r.chat_id AND f.message_id
   AND coalesce(f.forward_origin->'sender_user'->>'id',
                CASE WHEN f.forward_origin->>'type' = 'user' THEN f.forward_origin->>'sender_id' END) = u.user_id::text;
 
--- Imported replies carry no author of the replied message: when that message is not in the
--- archive (possibly forgotten), its quote cannot be attributed and goes.
+-- A quote stays only beside a replied message the archive holds, which /forget_me and the purge find
+-- it by. When that message is not in the archive (forgotten, purged, never stored) the quote goes.
 UPDATE messages r SET raw = r.raw - 'quote'
-WHERE r.raw ? 'quote' AND r.raw ? 'reply_to_message' AND NOT (r.raw->'reply_to_message' ? 'from')
+WHERE r.raw ? 'quote'
   AND NOT EXISTS (SELECT 1 FROM messages t WHERE t.chat_id = r.chat_id AND t.message_id = r.reply_to_id);
 
 -- Forwards of opted-out authors: keep the row (it is the forwarder's), drop the words and names.

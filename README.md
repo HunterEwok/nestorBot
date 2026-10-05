@@ -6,7 +6,7 @@
 
 ## Устройство
 
-- `nestor/collector` — сборщик. Единственный владелец токена бота, long polling, без LLM.
+- `nestor/collector` — сборщик. Единственный, кто забирает обновления бота (long polling), без LLM; тем же токеном бота пишет и сторож.
   - `parse.py` — чистое преобразование JSON Bot API в строки базы.
   - `store.py` — идемпотентная запись: ключ `(chat_id, message_id)`, правки в `message_edits`.
   - `app.py` — aiogram-диспетчер, allowlist (FR-7), повтор записи при недоступной базе.
@@ -115,7 +115,9 @@ sudo -u nestor /opt/nestor/.venv/bin/python -m nestor.retention --run           
 sudo -u nestor /opt/nestor/.venv/bin/python -m nestor.retention --confirm        # разрешить всё, что уйдёт за 7 дней
 ```
 
-`/forget_me` удаляет сразу (`nestor/forget.py`), из копий — в течение 5 недель. Сроки живут в `nestor/promises.py`, текст `/privacy` собирается из них.
+После `--confirm` остановленная ночь идёт по `--run` сразу, а без него сборщик начнёт её сам в течение 5 минут. Если `--run` ничего не запустил, он пишет, что с сегодняшней чисткой: уже прошла, идёт, ждёт подтверждения или упала.
+
+`/forget_me` удаляет сразу, и в группе на паузе тоже (`nestor/forget.py`), из копий — в течение 5 недель. От имени группы или канала (анонимный админ) команда не работает: под этим именем пишут многие. Сроки живут в `nestor/promises.py`, текст `/privacy` собирается из них.
 
 ## Резервные копии
 
@@ -202,13 +204,23 @@ sudo -u nestor /opt/nestor/.venv/bin/python -m nestor.watchdog --mute 60   # н�
 
 `/status` в группе оповещений показывает её админам то, что сторож увидел в последний раз; в других группах бот на неё не отвечает, в `/help` её нет. Если сторож сам перестал запускаться, через 20 минут об этом один раз напишет сборщик.
 
+Сводка в 09:30 — это и проверка самой связи. Сторож и сборщик пишут одним токеном бота: если токен отозван, Pi выключен или сторож не запускается, не придёт ни одно оповещение, и единственный признак — сводки нет. Тогда проверить:
+
+```sh
+sudo -u nestor /opt/nestor/.venv/bin/python -m nestor.watchdog --test      # «test failed» и TelegramUnauthorizedError: токен отозван
+systemctl status nestor-watchdog.timer nestor-collector --no-pager
+sudo -u nestor /opt/nestor/.venv/bin/python -m nestor.watchdog --dry-run   # какие проблемы открыты
+```
+
+Новый токен из @BotFather — в `BOT_TOKEN` в `/opt/nestor/.env`, затем `sudo systemctl restart nestor-collector`: сборщик читает токен только при запуске, сторож — при каждом.
+
 Ни в оповещения, ни в журнал, ни в состояние сторожа не попадают тексты сообщений, токены, ключи и пароли: только коды, числа и имена групп.
 
 ## Импорт старой истории
 
 Bot API не отдаёт сообщения, написанные до добавления бота, поэтому история читается разово через твой аккаунт Telegram (Telethon) и запускается с ноутбука, не с Pi.
 
-1. На https://my.telegram.org → API development tools получить `api_id` и `api_hash`, вписать в `.env` как `TG_API_ID` и `TG_API_HASH`. В `DATABASE_URL` указать базу на сервере (роль `nestor`, через туннель), в `BOT_TOKEN` — настоящий токен бота: по нему импорт узнаёт сообщения бота и пропускает их.
+1. На https://my.telegram.org → API development tools получить `api_id` и `api_hash`, вписать в `.env` как `TG_API_ID` и `TG_API_HASH`. В `DATABASE_URL` указать базу на сервере (роль `nestor`, через туннель), в `BOT_ID` — число до двоеточия в токене бота: по нему импорт узнаёт сообщения бота и пропускает их. Сам токен на ноутбук не нужен.
 2. `pip install -e ".[import]"` (в dev-окружении уже стоит).
 3. `python -m nestor.importer --list`: список твоих групп с `chat_id`, звёздочкой отмечены те, что уже в `ALLOWED_CHAT_IDS`. Первый запуск спросит телефон и код входа; сессия сохранится в `nestor-import.session`, это залогиненный аккаунт, файл никому не отдавать.
 4. `python -m nestor.importer`: импорт всех групп из `ALLOWED_CHAT_IDS` (или `--chat <id>` для одной).

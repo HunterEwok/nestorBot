@@ -168,11 +168,11 @@ def _forward_author(origin: Any) -> Any:
 
 
 async def _quote_of_nobody(conn: asyncpg.Connection, msg: MessageRow) -> bool:
-    """A quote beside a replied message that does not name its author (imported replies): whose
-    words it holds is known only from that message in the archive. Without it (forgotten, purged,
-    never stored) the quote goes, as migration 0008 does to what was stored."""
-    reply = msg.raw.get("reply_to_message")
-    if "quote" not in msg.raw or not isinstance(reply, dict) or "from" in reply:
+    """A quote is kept only beside a replied message the archive holds: /forget_me and the purge find it
+    by that message. Without it (forgotten, purged, the bot's answer scrubbed, never stored) the quote
+    goes, also when Telegram sends it again with an edit or a new reply, as migration 0008 does to what
+    was stored."""
+    if "quote" not in msg.raw:
         return False
     return not await conn.fetchval("SELECT EXISTS (SELECT 1 FROM messages WHERE chat_id = $1 AND message_id = $2)",
                                    msg.chat_id, msg.reply_to_id)

@@ -343,6 +343,52 @@ async def test_forget_me(make_env, conn):
     assert bot.sent[-1]["text"].startswith("🧹 Готово: удалил из архива твои сообщения (2)")
 
 
+@pytest.mark.parametrize("sender, sender_chat", [
+    (1087968824, {"id": CHAT_ID, "type": "supergroup", "title": "Test group"}),    # an anonymous admin
+    (136817688, {"id": -1001000000777, "type": "channel", "title": "Канал Пети"}),  # someone posting as a channel
+    (777000, {"id": -1001000000777, "type": "channel", "title": "Канал"}),          # the linked channel's forward
+])
+async def test_forget_me_and_export_from_a_shared_sender_are_refused(make_env, conn, sender, sender_chat):
+    """One id stands for many people there: /forget_me would erase everybody's posts and stop storing them."""
+    bot, _, feed = make_env()
+
+    def post(mid, text):
+        msg = message(mid, text, uid=sender, sender_chat=sender_chat)
+        msg["from"]["is_bot"] = sender != 777000
+        return msg
+
+    await feed(update("message", post(1, "объявление Ани")))
+    await feed(update("message", message(2, "ответ", uid=111, reply_to_message=post(1, "объявление Ани"),
+                                         quote={"text": "объявление", "position": 0})))
+    await feed(update("message", post(3, "/forget_me")))
+    await feed(update("message", post(4, "/export")))
+    await feed(update("message", post(5, "объявление Бори")))
+    assert [s["text"] for s in bot.sent] == [prompts.PERSONAL_ONLY] * 2 and bot.documents == []
+    assert await conn.fetchval("SELECT opted_out FROM users WHERE user_id = $1", sender) is False
+    kept = {r["message_id"] for r in await conn.fetch("SELECT message_id FROM messages WHERE user_id = $1", sender)}
+    assert {1, 5} <= kept
+    assert (await conn.fetchval("SELECT raw FROM messages WHERE message_id = 2"))["quote"]["text"] == "объявление"
+
+
+async def test_forget_me_works_while_paused(make_env, conn):
+    bot, _, feed = make_env(admins={111})
+    await feed(update("message", message(1, "моё личное", uid=222)))
+    await feed(update("message", message(2, "/pause", uid=111)))
+    await feed(update("message", message(3, "/privacy", uid=222)))
+    await feed(update("message", message(4, "/forget_me", uid=222)))
+    paused, privacy, forgotten = bot.sent
+    assert paused["text"] == prompts.PAUSED and "<b>Сколько храню</b>" in privacy["text"]
+    assert forgotten["text"].startswith("🧹 Готово: удалил из архива твои сообщения (1)")
+    assert forgotten["reply_to"] == 4
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE user_id = 222") == 0
+    assert await conn.fetchval("SELECT opted_out FROM users WHERE user_id = 222") is True
+    # Neither the commands nor the answers were archived while paused, and nothing of 222's is after /resume.
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE message_id IN (3, 4) OR user_id = $1", BOT_ID) == 0
+    await feed(update("message", message(5, "/resume", uid=111)))
+    await feed(update("message", message(6, "снова пишу", uid=222)))
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE user_id = 222") == 0
+
+
 async def test_pause_requires_admin_and_stops_archiving(make_env, conn):
     bot, llm, feed = make_env(admins={111})
     await feed(update("message", message(1, "/pause", uid=222)))
@@ -449,6 +495,12 @@ async def test_forget_me_also_removes_answers_that_quote_them(make_env, conn):
     assert await conn.fetchval("SELECT count(*) FROM messages WHERE message_id = $1", answer_id) == 0
     assert "палатку" not in str(await conn.fetchval("SELECT raw FROM messages WHERE message_id = 3"))
     assert await conn.fetchval("SELECT answer FROM bot_requests WHERE scenario = 'other'") is None
+    # The answer is still in the group: Telegram sends its quote again with an edit of the reply, and with
+    # a new reply to it. Neither brings the words back.
+    await feed(update("edited_message", reply | {"text": "точно!", "edit_date": 1_790_000_060}))
+    await feed(update("message", message(6, "и я", uid=333, reply_to_message=reply["reply_to_message"],
+                                         quote={"text": "палатку", "position": 0})))
+    assert "палатк" not in str([r["raw"] for r in await conn.fetch("SELECT raw FROM messages")])
     # The next request does not carry their words to the model in any form.
     await feed(update("message", message(5, "нестор, а теперь?", uid=111)))
     assert "палатк" not in str(llm.calls[-1])
@@ -764,6 +816,12 @@ async def test_forget_me_strips_imported_quotes_forwards_and_names(make_env, con
                       forward_origin={"type": "user", "date": 1_789_000_000, "sender_user": author},
                       forward_from=author, forward_date=1_789_000_000)    # the legacy fields Telegram still sends
     await feed(update("message", forward))
+    # ... and his photo, the words in its caption.
+    await feed(update("message", message(6, None, uid=111, photo=[{"file_id": "p", "file_unique_id": "q", "width": 1,
+                                                                    "height": 1}],
+                                         caption="секрет Пети на фото", caption_entities=[{"type": "bold", "offset": 0,
+                                                                                           "length": 6}],
+                                         forward_origin={"type": "user", "date": 1_789_000_000, "sender_user": author})))
     # An imported forward names its author by an id.
     origin = {"type": "user", "date": 1_789_000_000, "sender_id": 222}
     await conn.execute(
@@ -779,13 +837,13 @@ async def test_forget_me_strips_imported_quotes_forwards_and_names(make_env, con
     await feed(update("message", message(4, "/forget_me", uid=222)))
     assert bot.sent[-1]["text"].startswith("🧹 Готово: удалил из архива твои сообщения (2)")
 
-    rows = {r["message_id"]: r for r in await conn.fetch("SELECT * FROM messages WHERE message_id IN (2, 3, 5)")}
+    rows = {r["message_id"]: r for r in await conn.fetch("SELECT * FROM messages WHERE message_id IN (2, 3, 5, 6)")}
     assert "quote" not in rows[2]["raw"] and "личное" not in str(rows[2]["raw"])
-    for fwd in (rows[3], rows[5]):
+    for fwd in (rows[3], rows[5], rows[6]):
         assert (fwd["user_id"], fwd["text"], fwd["entities"]) == (111, None, None)
         assert fwd["forward_origin"] == {"type": "user", "sender_user": {"id": 222}}
         assert fwd["raw"]["forward_origin"] == {"type": "user", "sender_user": {"id": 222}}
-        assert not {"text", "entities", "forward_from"} & set(fwd["raw"])
+        assert not {"text", "entities", "caption", "caption_entities", "forward_from"} & set(fwd["raw"])
         assert "Петров" not in str(fwd["raw"]) and "секрет" not in str(fwd["raw"])
     names = await conn.fetchrow("SELECT username, first_name, last_name, opted_out FROM users WHERE user_id = 222")
     assert tuple(names) == (None, None, None, True)

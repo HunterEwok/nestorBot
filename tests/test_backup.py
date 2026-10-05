@@ -882,7 +882,7 @@ def cfg(tmp_path, pg_bin, monkeypatch):
     # With the example's libpq parameters (keepalives, timeouts): this pg_dump has to accept all of them.
     query = _env_file(DEPLOY / "nestor-backup.env.example")["BACKUP_DATABASE_URL"].split("?", 1)[1]
     return bk.BackupConfig(database_url=f"postgresql://nestor_backup@{host.hostname}:{host.port}/{DB}?{query}", tz=MSK,
-                           state_dir=tmp_path / "state", pg_bindir=pg_bin, attempts=2, retry_delay_s=0)
+                           state_dir=tmp_path / "state", pg_bindir=pg_bin, min_free_mb=1, attempts=2, retry_delay_s=0)
 
 
 async def _fill(conn, rows: int = 300) -> None:
@@ -1042,9 +1042,10 @@ async def _restored(database, name: str = RESTORED):
 
 async def test_restore_into_a_fresh_database_replays_optouts_and_purges(
         conn, cfg, pg_bin, fresh, restore_env, database, tmp_path, caplog):
-    X, Y = 777, 888
+    X, Y, ANON = 777, 888, 1087968824
     await conn.execute("INSERT INTO chats (chat_id, type) VALUES ($1, 'supergroup')", CHAT_ID)
-    for uid, name, is_bot in ((X, "Икс", False), (Y, "Игрек", False), (BOT_ID, "Нестор", True)):
+    for uid, name, is_bot in ((X, "Икс", False), (Y, "Игрек", False), (BOT_ID, "Нестор", True),
+                              (ANON, "Group", True)):
         await conn.execute("INSERT INTO users (user_id, first_name, username, is_bot) VALUES ($1, $2, $3, $4)",
                            uid, name, f"u{uid}", is_bot)
 
@@ -1061,6 +1062,7 @@ async def test_restore_into_a_fresh_database_replays_optouts_and_purges(
     await message(2, Y, "обычное сообщение")
     await message(3, Y, "ответ с цитатой", reply_to=1, quote="слова человека")
     await message(4, Y, "это попало в архив 13 месяцев назад", stored="13 months")
+    await message(5, ANON, "объявление анонимного админа")
     await message(900, BOT_ID, "ответ бота, где процитирован человек", reply_to=2)
     await conn.execute(
         """INSERT INTO bot_requests (chat_id, trigger_msg_id, user_id, scenario, question, answer, status, answer_msg_ids,
@@ -1076,7 +1078,7 @@ async def test_restore_into_a_fresh_database_replays_optouts_and_purges(
     async with conn.transaction():
         await forget.forget(conn, X, BOT_ID)
     optouts = tmp_path / "optouts.json"
-    optouts.write_text(json.dumps([X]))
+    optouts.write_text(json.dumps([X, ANON]))       # an anonymous admin's, from before /forget_me refused it
 
     pipe = _pipe(dump)
     try:
@@ -1085,7 +1087,7 @@ async def test_restore_into_a_fresh_database_replays_optouts_and_purges(
     finally:
         pipe.stdout.close()
         pipe.wait()
-    assert done == {"messages": 2, "users": 3, "chats": 1, "bot_requests": 1, "forgotten": 1, "purged": 1,
+    assert done == {"messages": 3, "users": 4, "chats": 1, "bot_requests": 1, "forgotten": 1, "purged": 1,
                     "last_migration": "0008_retention_and_ops"}
 
     db = await _restored(database)
@@ -1093,7 +1095,8 @@ async def test_restore_into_a_fresh_database_replays_optouts_and_purges(
         assert await db.fetchval("SELECT count(*) FROM messages WHERE user_id = $1", X) == 0
         user = await db.fetchrow("SELECT opted_out, username, first_name FROM users WHERE user_id = $1", X)
         assert (user["opted_out"], user["username"], user["first_name"]) == (True, None, None)
-        assert sorted(r[0] for r in await db.fetch("SELECT message_id FROM messages")) == [2, 3]
+        assert sorted(r[0] for r in await db.fetch("SELECT message_id FROM messages")) == [2, 3, 5]
+        assert await db.fetchval("SELECT opted_out FROM users WHERE user_id = $1", ANON) is False
         assert await db.fetchval("SELECT count(*) FROM messages WHERE raw::text LIKE '%слова человека%' "
                                  "OR text LIKE '%слова человека%'") == 0       # nor the quote of them in Y's reply
         assert await db.fetchval("SELECT answer FROM bot_requests") is None   # the answer that quoted X is scrubbed
@@ -1101,7 +1104,7 @@ async def test_restore_into_a_fresh_database_replays_optouts_and_purges(
         assert await db.fetchval("SELECT count(*) FROM messages WHERE message_id = 4") == 0   # outlived 12 months
         assert await db.fetchval("SELECT count(*) FROM schema_migrations") == 8
         # What the dump held is still there, as the owner sees it, and the reader's views came along.
-        assert await db.fetchval("SELECT count(*) FROM reader.messages") == 2
+        assert await db.fetchval("SELECT count(*) FROM reader.messages") == 3
     finally:
         await db.close()
     assert "CANARY" not in caplog.text and "слова" not in caplog.text and "token" not in caplog.text.lower()

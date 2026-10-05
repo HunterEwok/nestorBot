@@ -10,6 +10,10 @@ from __future__ import annotations
 
 import asyncpg
 
+# Telegram's shared senders: GroupAnonymousBot (an admin posting as the group), Channel_Bot (whoever posts
+# as a channel) and Telegram itself (forwards from a linked channel). One id stands for many people, so it
+# is never forgotten as one person.
+SHARED_IDS = frozenset({1087968824, 136817688, 777000})
 ERASE_LOCK = 0x6E6573746F73      # nestor.migrate takes ...72; transaction-scoped, released at commit
 # How long to wait for it: more than a purge batch can hold it (nestor.retention.STATEMENT_TIMEOUT_S,
 # 120 s, and its bookkeeping), not the pool's 30 s per query. A /forget_me or an answer being logged

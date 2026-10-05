@@ -234,20 +234,25 @@ async def confirmed(conn, today: date, would_delete: int) -> bool:
 
 async def claim(conn, day: date, cutoff: datetime) -> asyncpg.Record | None:
     """(id, cutoff, counts) if this call may run the day's purge: the first time that day, a failed
-    run after 10 minutes (6 attempts a day), a blocked one after 10 minutes (it may be confirmed
-    by now), or one that stopped mid-way (no batch for 15 minutes) with the counts it reached."""
+    run after 10 minutes (6 attempts a day), a blocked one after 10 minutes or as soon as it is
+    confirmed, or one that stopped mid-way (no batch for 15 minutes) with the counts it reached."""
     return await conn.fetchrow(
         """INSERT INTO maintenance_runs (job, day, status, cutoff) VALUES ($1, $2, 'running', $3)
            ON CONFLICT (job, day) DO UPDATE
-             SET status = 'running', attempts = maintenance_runs.attempts + 1, cutoff = EXCLUDED.cutoff,
+             SET status = 'running', cutoff = EXCLUDED.cutoff,
                  error = NULL, updated_at = now(), finished_at = NULL,
-                 -- a blocked run removed nothing: its counts were what it would have removed
+                 -- a blocked run removed nothing: its counts were what it would have removed, and its
+                 -- attempts were no failures (the confirmed run still gets its 6)
+                 attempts = CASE WHEN maintenance_runs.status = 'blocked' THEN 1 ELSE maintenance_runs.attempts + 1 END,
                  counts = CASE WHEN maintenance_runs.status = 'blocked' THEN '{}' ELSE maintenance_runs.counts END
              WHERE (maintenance_runs.status = 'failed' AND maintenance_runs.attempts < 6
                     AND maintenance_runs.updated_at < now() - interval '10 minutes')
-                OR (maintenance_runs.status = 'blocked' AND maintenance_runs.updated_at < now() - interval '10 minutes')
+                OR (maintenance_runs.status = 'blocked'
+                    AND (maintenance_runs.updated_at < now() - interval '10 minutes'
+                         OR EXISTS (SELECT 1 FROM maintenance_runs c
+                                    WHERE c.job = $4 AND c.updated_at > maintenance_runs.updated_at)))
                 OR (maintenance_runs.status = 'running' AND maintenance_runs.updated_at < now() - interval '15 minutes')
-           RETURNING id, cutoff, counts""", JOB, day, cutoff)
+           RETURNING id, cutoff, counts""", JOB, day, cutoff, CONFIRM_JOB)
 
 
 async def finish(conn, run_id: int, status: str, counts: dict | None, error: str | None = None) -> None:
@@ -374,6 +379,22 @@ class Retention:
         return status
 
 
+def _not_run(row, tz: ZoneInfo) -> str:
+    """What --run says when it could not take today's run: where that run is."""
+    if row is None or row["status"] == "ok":
+        return "nothing to do: today's run is done"
+    at = row["updated_at"].astimezone(tz).strftime("%H:%M")
+    if row["status"] == "running":
+        return f"nothing to do: today's run is still running (last batch at {at})"
+    if row["status"] == "blocked":
+        counts = row["counts"] or {}
+        return (f"blocked at {at}: it would remove {counts.get('would_delete')} of {counts.get('total')} messages; "
+                "--confirm allows it, then --run starts it")
+    if row["attempts"] >= 6:
+        return f"failed {row['attempts']} times today ({row['error']}): the next night tries again"
+    return f"failed at {at} ({row['error']}): tried again 10 minutes later"
+
+
 async def _main(argv: list[str] | None = None) -> None:
     import argparse
     import json
@@ -405,12 +426,13 @@ async def _main(argv: list[str] | None = None) -> None:
         now = utcnow()
         if args.run:
             status = await Retention(pool, tz=tz, at=dtime(0)).run_once(now)
-            if status is None:
-                print("nothing to do: today's run is done or still running")
-                return
             async with pool.acquire() as conn:
-                row = await conn.fetchrow("SELECT error, counts FROM maintenance_runs WHERE job = $1 AND day = $2",
-                                          JOB, now.astimezone(tz).date())
+                row = await conn.fetchrow(
+                    "SELECT status, attempts, error, counts, updated_at FROM maintenance_runs WHERE job = $1 AND day = $2",
+                    JOB, now.astimezone(tz).date())
+            if status is None:
+                print(_not_run(row, tz))
+                return
             print(status, row["error"] or "", json.dumps(row["counts"]))
         elif args.confirm:
             async with pool.acquire() as conn:

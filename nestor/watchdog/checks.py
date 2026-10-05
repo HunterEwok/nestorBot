@@ -60,6 +60,7 @@ HUNG_AFTER = timedelta(minutes=3)       # the heartbeat is written every minute
 POLL_STALE = timedelta(minutes=5)
 UNSYNCED_FOR = timedelta(minutes=30)
 BACKUP_STALE = timedelta(hours=26)
+BACKUP_DB_CODES = ("unreachable", "starting_up", "too_many_connections")    # nestor.backup's: the database's fault
 RETENTION_STALE = timedelta(hours=26)
 NEWS_FAILING_FOR = timedelta(hours=24)
 NEWS_AFTER_NETWORK = timedelta(hours=2)     # sources fail with the Pi's network: not their own fault
@@ -229,6 +230,12 @@ async def check_collector(ctx: Ctx) -> CheckResult:
     restarts, base = as_int(unit.get("NRestarts")), ctx.state.baselines.get("collector_restarts")
     db_down = ctx.conn is None or ctx.is_open("db.unreachable")
     events = []
+    # NRestarts starts from 0 at each boot, and the restarts before this boot's first run were seen by nobody:
+    # after a power cut the collector restarts until the router's database is up. They count from here.
+    boot = ctx.host.boot_id()
+    if boot is not None and ctx.memo("boot").get("id") != boot:
+        ctx.memo("boot")["id"] = boot
+        base = None
     if restarts is not None:
         # While the database is down the collector cannot start: those restarts are its fault, said already.
         if base is not None and restarts > base and not db_down:
@@ -360,14 +367,22 @@ async def check_backup(ctx: Ctx) -> CheckResult:
             started = _when(status.get("started_at"))
             line = prompts.ALERT_BACKUP_INTERRUPTED.format(since=ctx.fmt(started) if started else "—")
             findings.append(Finding("backup.interrupted", "crit", line))
-    if status.get("ok") is False:
+    finished = _when(status.get("finished_at"))
+    failed = status.get("ok") is False
+    if failed:
         code = safe_code(status.get("error") or "failed")
         nights = status.get("failed_nights") if isinstance(status.get("failed_nights"), int) else 1
         line = prompts.ALERT_BACKUP_FAILED.format(nights=nights, reason=prompts.BACKUP_REASONS.get(code) or _code(code),
                                                   last_ok=last_ok_text)
-        findings.append(Finding("backup.failed", "crit", line, repeat_token=str(nights)))
-    if last_ok is not None and ctx.now - last_ok > BACKUP_STALE:
-        findings.append(Finding("backup.stale", "crit", prompts.ALERT_BACKUP_STALE.format(last_ok=last_ok_text)))
+        if code in BACKUP_DB_CODES and (ctx.conn is None or ctx.is_open("db.unreachable")):
+            unknown_keys.append("backup.failed")    # the database is down: db.unreachable says it already
+        else:
+            findings.append(Finding("backup.failed", "crit", line, repeat_token=str(nights)))
+    # A night that failed says so above, with the last good copy; stale is for runs that stopped coming.
+    failed_lately = failed and finished is not None and ctx.now - finished <= BACKUP_STALE
+    if last_ok is not None and ctx.now - last_ok > BACKUP_STALE and not failed_lately:
+        findings.append(Finding("backup.stale", "crit", prompts.ALERT_BACKUP_STALE.format(last_ok=last_ok_text),
+                                label=prompts.BACKUP_STALE_LABEL))
     if oldest is not None and ctx.now - oldest > timedelta(days=BACKUP_MAX_AGE_DAYS):
         line = prompts.ALERT_BACKUP_OLD.format(days=(ctx.now - oldest).days, max_days=BACKUP_MAX_AGE_DAYS)
         findings.append(Finding("backup.old_copies", "crit", line))
@@ -424,7 +439,8 @@ async def check_retention(ctx: Ctx) -> CheckResult:
         counts = last["counts"] or {}
         line = prompts.ALERT_RETENTION_BLOCKED.format(count=int(counts.get("would_delete", 0)),
                                                       total=int(counts.get("total", 0)))
-        findings.append(Finding("retention.blocked", "warn", line, repeat_token=str(last["day"])))
+        findings.append(Finding("retention.blocked", "warn", line, label=prompts.RETENTION_BLOCKED_LABEL,
+                                repeat_token=str(last["day"])))
     # A failed run is claimed again after 10 minutes, up to 6 times: only one that stays failed is news.
     retrying = last is not None and last["status"] == "failed" and last["attempts"] < 6 \
         and ctx.db_now - last["updated_at"] <= timedelta(minutes=20)

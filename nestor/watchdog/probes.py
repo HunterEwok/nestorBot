@@ -17,6 +17,7 @@ from ..backup import TIMESYNC_FLAG
 from ..config import Settings
 
 HERMES_TIMEOUT_S = 10
+BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
 # A news source's status may be "error: <what a server said>"; only these leave the database as they are.
 _SAFE_STATUS = re.compile(r"^(ok|skipped|timeout|http_\d{3})$")
 _SAFE_CODE = re.compile(r"[A-Za-z0-9_.\-]{1,64}")
@@ -130,9 +131,18 @@ def _readable(path: Path) -> bool:
     return os.access(path, os.R_OK)
 
 
+def _boot_id() -> str | None:
+    """This boot's id: systemd's counters (NRestarts) start again from 0 when it changes."""
+    try:
+        return BOOT_ID.read_text(encoding="ascii").strip() or None
+    except OSError:
+        return None
+
+
 @dataclass(frozen=True)
 class Host:
     """The Pi as the checks see it; tests replace what they need."""
     synced: Callable[[], Awaitable[bool]] = clock_synced
     disk_usage: Callable[[str], tuple] = field(default=shutil.disk_usage)
     readable: Callable[[Path], bool] = _readable      # as the user the watchdog runs as (nestor)
+    boot_id: Callable[[], str | None] = _boot_id

@@ -1,9 +1,9 @@
-from nestor import forget
+from nestor import forget, retention
 from nestor.collector import store
 from nestor.collector.parse import parse_chat, parse_message
 from nestor.collector.store import Result
 
-from .factories import chat, message, user
+from .factories import CHAT_ID, chat, message, user
 
 
 async def save(conn, msg, *, is_edit=False):
@@ -166,3 +166,43 @@ async def test_a_quote_of_a_forward_holds_the_words_of_its_author_not_of_the_one
     for mid in (2, 3, 4):
         assert "quote" not in raws[mid] and "секрет" not in str(raws[mid]) and raws[mid]["text"] == "ого"
     assert raws[6]["quote"]["text"] == "мысль"
+
+
+async def test_a_quote_of_a_message_that_left_does_not_come_back(pool, conn):
+    """A quote stays only beside a replied message the archive holds: Telegram sends it again with every
+    edit of the reply, and with replies to a message the archive never had."""
+    await save(conn, message(1, "старая тайна Пети", uid=222))
+    reply = message(2, "помню", uid=111, reply_to_message=message(1, "старая тайна Пети", uid=222),
+                    quote={"text": "старая тайна", "position": 0})
+    await save(conn, reply)
+    await conn.execute("UPDATE messages SET stored_at = now() - interval '13 months' WHERE message_id = 1")
+    _, cutoff = await retention.db_times(conn)
+    await retention.purge(pool, cutoff, pause_s=0)
+    assert "quote" not in await conn.fetchval("SELECT raw FROM messages WHERE message_id = 2")
+    assert await save(conn, reply | {"text": "помню!", "edit_date": 1_790_000_060}, is_edit=True) is Result.EDITED
+    await save(conn, message(3, "и я", uid=333, reply_to_message=message(900, "чьё-то", uid=444),
+                             quote={"text": "чьё-то", "position": 0}))
+    raws = {r["message_id"]: r["raw"] for r in await conn.fetch("SELECT message_id, raw FROM messages")}
+    assert raws[2]["text"] == "помню!" and "quote" not in raws[3]
+    assert "тайна" not in str(raws) and "чьё-то" not in str(raws)
+
+
+async def test_forget_takes_the_quotes_telegram_attributes_to_them_and_their_questions(conn):
+    """Replies an older collector stored with a quote of a message the archive does not have (the author
+    named by Telegram), and what they asked the bot: /forget_me takes both, and nobody else's."""
+    await save(conn, message(100, "привет"))
+    for uid in (222, 333, 444):
+        await conn.execute("INSERT INTO users (user_id) VALUES ($1)", uid)
+    for mid, uid, replied, author in ((1, 111, 5, 222), (2, 444, 6, 333)):
+        row = parse_message(message(mid, "да", uid=uid, reply_to_message=message(replied, "тайна", uid=author),
+                                    quote={"text": "тайна", "position": 0}))
+        await conn.execute(store._INSERT_MESSAGE, *store._message_args(row))
+    for uid in (222, 333):
+        await conn.execute("INSERT INTO bot_requests (chat_id, user_id, scenario, question, status) "
+                           "VALUES ($1, $2, 'archive', $3, 'ok')", CHAT_ID, uid, f"что спросил {uid}?")
+    async with conn.transaction():
+        await forget.forget(conn, 222, 42)
+    raws = {r["message_id"]: r["raw"] for r in await conn.fetch("SELECT message_id, raw FROM messages")}
+    assert "quote" not in raws[1] and raws[2]["quote"]["text"] == "тайна"
+    questions = {r["user_id"]: r["question"] for r in await conn.fetch("SELECT user_id, question FROM bot_requests")}
+    assert questions == {222: None, 333: "что спросил 333?"}

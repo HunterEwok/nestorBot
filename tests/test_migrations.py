@@ -270,7 +270,7 @@ async def test_0008_external_reply_matches_parse(conn):
     ]
     for mid, sample in enumerate(samples, 1):
         sample |= {"message_id": mid, "text": "ответ"}
-        await _msg(conn, mid, 111, "ответ", extra=sample)
+        await _msg(conn, mid, 111, "ответ", reply_to=parse_message(message(mid) | sample).reply_to_id, extra=sample)
     await conn.execute(RETENTION)
     stored = {r["message_id"]: r["raw"] for r in await conn.fetch("SELECT message_id, raw FROM messages")}
     assert [stored[mid] for mid in range(1, len(samples) + 1)] == [reduce_raw(sample) for sample in samples]
@@ -339,6 +339,11 @@ async def test_0008_scrubs_what_was_stored_the_way_a_new_message_is_stored(conn)
         # A reply to Петя's forward of Вася's message names Петя: the words are Вася's all the same.
         ("ого", {"reply_to_message": {"message_id": 2, "date": 1, "from": {"id": 222}}, "quote": quote}),
         ("ого", {"reply_to_message": {"message_id": 2}, "quote": quote}),                   # imported
+        # A live reply quoting a message the archive does not have (sent before the bot came, purged).
+        ("да", {"reply_to_message": {"message_id": 901, "date": 1, "from": {"id": 222}}, "quote": quote}),
+        # Вася's photo, the words in its caption.
+        (None, {"forward_origin": live, "photo": [{"file_id": "p", "file_unique_id": "q", "width": 1, "height": 1}],
+                "caption": "адрес Васи", "caption_entities": [{"type": "bold", "offset": 0, "length": 5}]}),
     ]
     await _msg(conn, 1, 222, "мой текст")
     await _msg(conn, 2, 222, "секрет Васи целиком", forward_origin=live, extra={"forward_origin": live})
@@ -362,6 +367,19 @@ async def test_0008_scrubs_what_was_stored_the_way_a_new_message_is_stored(conn)
     assert "quote" not in backfilled[4]["raw"] and "quote" not in backfilled[5]["raw"]
     assert backfilled[6]["raw"]["quote"]["text"] == "мой текст"
     assert "quote" not in backfilled[8]["raw"] and "quote" not in backfilled[9]["raw"]
+    assert "quote" not in backfilled[10]["raw"]
+    assert (backfilled[11]["text"], backfilled[11]["entities"]) == (None, None)
+    assert not {"caption", "caption_entities"} & set(backfilled[11]["raw"]) and "адрес" not in str(backfilled[11]["raw"])
+
+
+async def test_0008_takes_the_opt_out_of_a_shared_sender_back(conn):
+    """A /forget_me from an anonymous admin or a channel forgot no person (nestor.forget.SHARED_IDS)."""
+    await _setup(conn)
+    for uid in (1087968824, 136817688, 777000):
+        await conn.execute("INSERT INTO users (user_id, is_bot, opted_out) VALUES ($1, TRUE, TRUE)", uid)
+    await conn.execute("UPDATE users SET opted_out = TRUE WHERE user_id = 333")
+    await conn.execute(RETENTION)
+    assert {r["user_id"] for r in await conn.fetch("SELECT user_id FROM users WHERE opted_out")} == {333}
 
 
 async def test_a_migration_gives_up_waiting_for_a_locked_table_and_says_so(database, tmp_path, caplog):

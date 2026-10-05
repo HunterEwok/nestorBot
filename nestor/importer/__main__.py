@@ -5,7 +5,8 @@
     python -m nestor.importer --chat -100123    # import one chat
 
 Needs TG_API_ID / TG_API_HASH (https://my.telegram.org → API development tools),
-DATABASE_URL (collector role), BOT_TOKEN and ALLOWED_CHAT_IDS in the environment or .env.
+DATABASE_URL (collector role), BOT_ID (the number before the colon in the bot's token; the
+token itself stays on the Pi) and ALLOWED_CHAT_IDS in the environment or .env.
 The first run asks for your phone number and login code and stores the session in
 nestor-import.session next to it; keep that file private, it is a logged-in account.
 Re-running is safe: already stored messages are skipped, and an interrupted run
@@ -34,6 +35,7 @@ from .convert import IMPORT_SOURCE, chat_dict, to_bot_api
 
 log = logging.getLogger("nestor.importer")
 BATCH = 200
+PLACEHOLDER_BOT_ID = 123456             # BOT_TOKEN in .env.example
 
 
 async def import_ranges(conn: asyncpg.Connection, chat_id: int) -> list[tuple[int, int | None]]:
@@ -122,6 +124,20 @@ async def list_groups(client: TelegramClient, allowed: frozenset[int]) -> None:
     print("\n* = in ALLOWED_CHAT_IDS")
 
 
+def bot_id_from(env) -> int:
+    """The bot's id, by which its own messages are told and left out: BOT_ID, or the number before the
+    colon in BOT_TOKEN. Not .env.example's placeholder: then the bot's messages would be imported."""
+    value = env.get("BOT_ID") or env.get("BOT_TOKEN", "").split(":", 1)[0]
+    try:
+        bot_id = int(value)
+    except ValueError:
+        bot_id = None
+    if bot_id is None or bot_id == PLACEHOLDER_BOT_ID:
+        raise SystemExit("missing BOT_ID: the number before the colon in the bot's token (the token itself is not "
+                         "needed here); the bot's own messages are told by it and not imported")
+    return bot_id
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(prog="python -m nestor.importer", description=__doc__.split("\n\n")[0])
     parser.add_argument("--list", action="store_true", help="list your groups with chat ids and exit")
@@ -135,10 +151,7 @@ async def main() -> None:
         api_id, api_hash = int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"]
     except KeyError as e:
         raise SystemExit(f"missing {e.args[0]}: get it at https://my.telegram.org → API development tools") from None
-    try:
-        bot_id = int(os.environ.get("BOT_TOKEN", "").split(":", 1)[0])
-    except ValueError:
-        raise SystemExit("missing BOT_TOKEN: the bot's own messages are told by its id and not imported") from None
+    bot_id = bot_id_from(os.environ)
     allowed = _parse_ids(os.environ.get("ALLOWED_CHAT_IDS", ""))
 
     async with TelegramClient(args.session, api_id, api_hash) as client:

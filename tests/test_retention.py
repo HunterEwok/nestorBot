@@ -223,12 +223,10 @@ async def test_a_cliff_is_blocked_until_confirmed(pool, conn):
     row = await _run(conn)
     assert (row["status"], row["counts"], row["error"]) == ("blocked", {"would_delete": 6000, "total": 9500}, "too_many")
     assert await conn.fetchval("SELECT count(*) FROM messages") == 9500
-    assert await ret.run_once(pi_now) is None                   # asked again only after 10 minutes
+    assert await ret.run_once(pi_now) is None                   # asked again only after 10 minutes ...
 
     assert await retention.confirm(conn, pi_now.astimezone(MSK).date()) == 6500
-    await conn.execute("UPDATE maintenance_runs SET updated_at = now() - interval '11 minutes' WHERE job = $1",
-                       retention.JOB)
-    assert await ret.run_once(pi_now) == "ok"
+    assert await ret.run_once(pi_now) == "ok"                   # ... or as soon as it is confirmed
     row = await _run(conn)
     assert (row["status"], row["error"], row["counts"]["messages"]) == ("ok", None, 6000)
     assert "would_delete" not in row["counts"]
@@ -243,12 +241,52 @@ async def test_confirm_does_not_cover_more_than_it_saw(pool, conn):
     day = pi_now.astimezone(MSK).date()
     assert await retention.confirm(conn, day) == 6000
     assert await retention.confirmed(conn, day, 6600) and not await retention.confirmed(conn, day, 6601)
+    for later in (1, 7):                                                        # the nights after it are covered
+        assert await retention.confirmed(conn, day + timedelta(days=later), 6600)
     assert not await retention.confirmed(conn, day + timedelta(days=8), 10)     # a week later it is asked again
     await _many(conn, 9001, 10000, stored="13 months")                          # 7000 now: more than 6000 + 10 %
     ret = retention.Retention(pool, tz=MSK, at=dtime(0), pause_s=0)
     assert await ret.run_once(pi_now) == "blocked"
     assert (await _run(conn))["counts"] == {"would_delete": 7000, "total": 10000}
     assert await conn.fetchval("SELECT count(*) FROM messages") == 10000
+
+
+async def test_a_confirm_covers_the_nights_after_it(pool, conn):
+    await _setup(conn)
+    await _many(conn, 1, 6000, stored="13 months")
+    await _many(conn, 6001, 9000, stored="1 day")
+    pi_now = await _now(conn)
+    await retention.confirm(conn, pi_now.astimezone(MSK).date() - timedelta(days=6))   # confirmed 6 nights ago
+    ret = retention.Retention(pool, tz=MSK, at=dtime(0), pause_s=0)
+    assert await ret.run_once(pi_now) == "ok"
+    assert await conn.fetchval("SELECT count(*) FROM messages") == 3000
+
+
+async def test_a_night_blocked_for_hours_keeps_its_six_tries_once_confirmed(pool, conn):
+    await _setup(conn)
+    await _many(conn, 1, 6000, stored="13 months")
+    await _many(conn, 6001, 9000, stored="1 day")
+    pi_now = await _now(conn)
+    ret = retention.Retention(pool, tz=MSK, at=dtime(0), pause_s=0)
+    assert await ret.run_once(pi_now) == "blocked"
+    for _ in range(7):                  # asked again every 10 minutes while the owner sleeps: no failures
+        await conn.execute("UPDATE maintenance_runs SET updated_at = now() - interval '11 minutes' WHERE job = $1",
+                           retention.JOB)
+        assert await ret.run_once(pi_now) == "blocked"
+    assert (await _run(conn))["attempts"] == 1
+    await retention.confirm(conn, pi_now.astimezone(MSK).date())
+    async with pool.acquire() as other:
+        holding = other.transaction()
+        await holding.start()
+        await other.execute("SELECT 1 FROM messages WHERE message_id = 1 FOR UPDATE")      # SKIP LOCKED passes it by
+        assert await ret.run_once(pi_now) == "failed"
+        await holding.rollback()
+    row = await _run(conn)
+    assert (row["status"], row["attempts"], row["error"]) == ("failed", 1, "rows_left")
+    await conn.execute("UPDATE maintenance_runs SET updated_at = now() - interval '11 minutes' WHERE job = $1",
+                       retention.JOB)
+    assert await ret.run_once(pi_now) == "ok"                   # tried again, as any failed run is
+    assert await conn.fetchval("SELECT count(*) FROM messages") == 3000
 
 
 async def test_a_busy_month_that_is_a_small_share_of_the_archive_runs_without_confirm(pool, conn):
@@ -494,7 +532,34 @@ async def test_the_cli_previews_a_day_confirms_and_runs(database, conn, monkeypa
                                retention.CONFIRM_JOB) == {"messages": 1}
     assert await conn.fetchval("SELECT count(*) FROM messages") == 2        # nothing above deleted anything
     assert (await cli("--run"))[0].startswith("ok ")
-    assert await cli("--run") == ["nothing to do: today's run is done or still running"]
+    assert await cli("--run") == ["nothing to do: today's run is done"]
+
+
+async def test_the_cli_says_where_todays_run_is(database, conn, monkeypatch, capsys):
+    await _setup(conn)
+    await _many(conn, 1, 6000, stored="13 months")
+    await _many(conn, 6001, 9000, stored="1 day")
+    monkeypatch.setenv("DATABASE_URL", database["collector"])
+    monkeypatch.setattr("nestor.logs.setup_logging", lambda level: None)        # keeps pytest's log capture
+
+    async def cli(*args) -> list[str]:
+        await retention._main(list(args))
+        return capsys.readouterr().out.splitlines()
+
+    async def today_was(status, attempts=1, error="rows_left"):
+        await conn.execute("UPDATE maintenance_runs SET status = $2, attempts = $3, error = $4, updated_at = now() "
+                           "WHERE job = $1", retention.JOB, status, attempts, error)
+        return (await cli("--run"))[0]
+
+    assert (await cli("--run"))[0].startswith("blocked too_many ")
+    blocked = (await cli("--run"))[0]                       # within 10 minutes: not asked again, but not «done»
+    assert blocked.startswith("blocked at ") and "it would remove 6000 of 9000 messages; --confirm" in blocked
+    assert await cli("--confirm") == ["confirmed 6000"]
+    assert (await cli("--run"))[0].startswith("ok ")       # confirmed: it starts at once
+    assert await cli("--run") == ["nothing to do: today's run is done"]
+    assert (await today_was("running", error=None)).startswith("nothing to do: today's run is still running")
+    assert (await today_was("failed", 2)).endswith("(rows_left): tried again 10 minutes later")
+    assert await today_was("failed", 6) == "failed 6 times today (rows_left): the next night tries again"
 
 
 async def test_overdue_counts_every_kind(conn):

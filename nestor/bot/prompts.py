@@ -102,6 +102,7 @@ PRIVACY = """🔒 <b>Что я храню и куда это уходит</b>
 • /export присылает твои сообщения файлом в личку.
 • /forget_me сразу удаляет из архива все твои сообщения, цитаты из них в чужих ответах, твои напоминания и мои ответы, где я тебя цитировал, и дальше они не сохраняются. Из копий это исчезает в течение {backup_weeks} недель."""
 
+PERSONAL_ONLY = "🙅 Эта команда работает только от твоего личного аккаунта, не от имени группы или канала."
 FORGOTTEN = ("🧹 Готово: удалил из архива твои сообщения ({count}) и больше не буду их сохранять. "
              "Из резервных копий они исчезнут в течение {backup_weeks} недель.")
 RATE_LIMITED_USER = "⏳ Слишком часто: не больше {limit} обращений за {window} мин. Попробуй чуть позже."
@@ -335,7 +336,8 @@ ALERT_COLLECTOR_RESTARTS = "Сборщик сам перезапускался {
 ALERT_COLLECTOR_HUNG = "Сборщик молчит с {since}: процесс есть, но в базу не пишет"
 ALERT_POLLING = "Не получаю сообщения из Telegram с {since} ({error})"
 ALERT_POLLING_CONFLICT = "Сообщения бота забирает ещё один процесс (409). Не запущен ли сборщик на Mac?"
-ALERT_TOKEN_REVOKED = "Telegram не принимает токен бота (401): обнови BOT_TOKEN в /opt/nestor/.env"
+ALERT_TOKEN_REVOKED = ("Telegram не принимает токен бота (401): обнови BOT_TOKEN в /opt/nestor/.env и перезапусти "
+                       "сборщик: <code>sudo systemctl restart nestor-collector</code>")
 ALERT_HERMES_DOWN = "Hermes не отвечает ({error}). Перезапуск: <code>systemctl --user restart hermes-gateway</code>"
 ALERT_HERMES_PROFILE = "Профиль Hermes <b>{profile}</b>: {problem}"
 ALERT_MODEL_ERRORS = "Ответы не получаются: {failed} из {total} за час. Проверь лимит трат в консоли Anthropic"
@@ -405,9 +407,12 @@ BACKUP_REASONS = {
 BACKUP_WARNINGS = {"clock_unsynced": "часы Pi не синхронизированы, старые копии не удалялись",
                    "clock_backwards": "часы Pi отстают от времени прошлой копии, старые копии не удалялись",
                    "rotation_failed": "старые копии удалить не получилось"}
-# What «снова в порядке» names for them: not «Резервные копии», which may still be failing.
+# What «снова в порядке» names for them (and for backup.stale, retention.blocked): not «Резервные копии» or
+# «Чистка архива», which may still be failing.
 BACKUP_WARNING_LABELS = {"clock_unsynced": "Удаление старых копий", "clock_backwards": "Удаление старых копий",
                          "rotation_failed": "Удаление старых копий", "shrank": "Размер копии"}
+BACKUP_STALE_LABEL = "Свежая копия"
+RETENTION_BLOCKED_LABEL = "Большая чистка"
 RETENTION_REASONS = {"clock_skew": "часы Pi и базы расходятся больше чем на 10 минут",
                      "future_rows": "в архиве есть сообщения с датой из будущего",
                      "cutoff_invalid": "срок хранения вышел короче 360 дней",

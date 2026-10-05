@@ -568,7 +568,7 @@ async def restore(source: BinaryIO, database: str, *, optouts: Path | None) -> d
         bot_id = int(setting("BOT_TOKEN").split(":", 1)[0])
     except ValueError:
         raise SystemExit("BOT_TOKEN is missing or not a bot token: in the environment or in " + ENV_FILE) from None
-    ids = _load_optouts(optouts)
+    ids = [i for i in _load_optouts(optouts) if i not in forget.SHARED_IDS]     # not one person: never forgotten
     bindir = find_bindir(Path(_env("BACKUP_PG_BINDIR")) if _env("BACKUP_PG_BINDIR") else None)
     url = with_database(setting("DATABASE_URL"), database)
     try:

@@ -30,6 +30,7 @@ from aiogram import Bot
 
 from ..collector import store
 from ..config import Settings
+from ..forget import SHARED_IDS
 from . import alerts, notify
 from .alerts import AlertState
 from .checks import (
@@ -172,11 +173,12 @@ async def _publish(conn: asyncpg.Connection, snap: dict) -> None:
 
 
 async def keep_optouts(conn: asyncpg.Connection, state_dir: Path) -> None:
-    """Adds the ids of everyone who used /forget_me to optouts.json; an id once there stays. Ids only."""
+    """Adds the ids of everyone who used /forget_me to optouts.json; an id once there stays. Ids only, and
+    never one of forget.SHARED_IDS, which are not one person."""
     path = state_dir / OPTOUTS_FILE
     try:
         async with conn.transaction(readonly=True):
-            ids = {r["user_id"] for r in await conn.fetch("SELECT user_id FROM users WHERE opted_out")}
+            ids = {r["user_id"] for r in await conn.fetch("SELECT user_id FROM users WHERE opted_out")} - SHARED_IDS
         try:
             before = {i for i in json.loads(path.read_text(encoding="utf-8")) if isinstance(i, int)}
         except FileNotFoundError:

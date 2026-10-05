@@ -7,7 +7,7 @@ t = pytest.importorskip("telethon.tl.types")
 from nestor import forget, retention
 from nestor.collector.parse import parse_message  # noqa: E402
 from nestor.collector.store import Result
-from nestor.importer.__main__ import import_history, import_ranges
+from nestor.importer.__main__ import bot_id_from, import_history, import_ranges
 from nestor.importer.convert import chat_dict, to_bot_api  # noqa: E402
 
 from .test_answerer import BOT_ID
@@ -21,6 +21,15 @@ WHEN = datetime(2025, 5, 1, 12, 0, tzinfo=timezone.utc)
 
 def msg(i, text="", **kw):
     return t.Message(id=i, peer_id=t.PeerChannel(1000000001), date=WHEN, message=text, **kw)
+
+
+def test_the_bot_is_told_by_its_id_and_its_token_is_not_needed():
+    assert bot_id_from({"BOT_ID": "987654321"}) == 987654321
+    assert bot_id_from({"BOT_ID": "987654321", "BOT_TOKEN": "123456:ABC..."}) == 987654321
+    assert bot_id_from({"BOT_TOKEN": "987654321:AAH-secret"}) == 987654321         # an .env from before BOT_ID
+    for env in ({}, {"BOT_TOKEN": "123456:ABC..."}, {"BOT_ID": "", "BOT_TOKEN": "123456:ABC..."}, {"BOT_ID": "x"}):
+        with pytest.raises(SystemExit, match="missing BOT_ID"):         # .env.example's placeholder is no bot
+            bot_id_from(env)
 
 
 def test_chat_dict_uses_bot_api_ids():

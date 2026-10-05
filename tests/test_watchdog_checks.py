@@ -117,6 +117,10 @@ async def test_migrations_pending_unknown_and_crash_text(conn, monkeypatch):
     ctx = await make_ctx(conn, systemd=Systemd(nestor_collector={"ActiveState": "activating", "SubState": "auto-restart",
                                                                   "Result": "exit-code", "NRestarts": "4"}))
     assert (await check(ctx, "migrations")).findings[0].line == prompts.ALERT_MIGRATION_CRASH.format(versions="0009_next")
+    # ... or systemd gave up on it.
+    ctx = await make_ctx(conn, systemd=Systemd(nestor_collector={"ActiveState": "failed", "SubState": "failed",
+                                                                  "Result": "exit-code"}))
+    assert (await check(ctx, "migrations")).findings[0].line == prompts.ALERT_MIGRATION_CRASH.format(versions="0009_next")
     # The database is newer than the code on the Pi.
     monkeypatch.setattr(checks, "migration_files", lambda: files[:-1])
     res = await check(ctx, "migrations")
@@ -153,7 +157,9 @@ async def test_heartbeat_stale_only_when_unit_active(conn, caplog):
     assert keys(res) == ["telegram.polling"] and res.findings[0].confirm == 2
     assert res.findings[0].line == prompts.ALERT_POLLING.format(since=alerts.fmt_since(now - timedelta(minutes=10), now, MSK),
                                                                 error="<code>5xx</code>")
-    # 401 and 409 are not a passing outage: said on the first run.
+    # 401 and 409 are not a passing outage: said on the first run. The watchdog sends with the same token, so
+    # the 401 line arrives only once .env has a new one, which the running collector has not read yet.
+    assert prompts.ALERT_TOKEN_REVOKED.endswith("<code>sudo systemctl restart nestor-collector</code>")
     for code, text in (("401", prompts.ALERT_TOKEN_REVOKED), ("409", prompts.ALERT_POLLING_CONFLICT)):
         await _beat(conn, started_at=iso, updates_ok_at=iso, updates_failures=1, updates_error=code)
         res = await check(await make_ctx(conn), "heartbeat")
@@ -190,6 +196,36 @@ async def test_collector_down_and_restarts(conn):
     res = await check(await make_ctx(conn, state=state, systemd=systemd), "collector")
     assert [(f.key, f.level, f.confirm) for f in res.findings] == [("collector.down", "crit", 2)]
     assert "<code>failed/failed, exit-code</code>" in res.findings[0].line
+
+
+async def test_restarts_before_the_first_run_after_a_reboot_are_not_the_collectors(database, conn, tmp_path):
+    bot, good = AlertBot(), settings(database["collector"], alert_daily_at=None)
+    systemd = Systemd()
+    now = datetime.now(MSK).replace(hour=14)
+
+    async def run_on(boot, minutes, restarts, result="success"):
+        systemd.units["nestor-collector"] = {**ACTIVE, "NRestarts": str(restarts), "Result": result}
+        await run.run_once(good, now=now + timedelta(minutes=minutes), bot=bot, systemctl=systemd,
+                           host=replace(host(), boot_id=lambda: boot), state_dir=tmp_path,
+                           checks=(BY_NAME["collector"],))
+
+    await run_on("boot-a", 0, 0)
+    # A power cut: the Pi is up before the router, and the collector restarts until the database is.
+    await run_on("boot-b", 63, 9)
+    assert bot.sent == [] and json.loads((tmp_path / run.STATE_FILE).read_text())["baselines"] == {
+        "collector_restarts": 9}
+    await run_on("boot-b", 68, 11, "oom-kill")             # its own, after that
+    assert [m["text"] for m in bot.sent] == ["\n".join([prompts.ALERT_EVENTS, "• " + prompts.ALERT_COLLECTOR_RESTARTS.format(
+        count=2, reason="не хватило памяти (oom-kill)")])]
+
+
+async def test_db_unreachable_clears_after_two_good_runs(conn):
+    ctx, state = await make_ctx(conn), AlertState()
+    for error in ("ConnectionRefusedError", "ConnectionRefusedError", None):
+        alerts.evaluate(state, [checks.db_result(ctx, error)], ctx.now, tz=MSK, quiet=None)
+    assert "db.unreachable" in state.problems                              # one good run is not enough
+    alerts.evaluate(state, [checks.db_result(ctx, None)], ctx.now, tz=MSK, quiet=None)
+    assert "db.unreachable" not in state.problems
 
 
 async def test_db_down_makes_db_checks_unknown_and_suppresses_collector(database, pool, tmp_path):
@@ -260,8 +296,8 @@ async def test_retention_check_reads_maintenance_runs(conn):
         reason=prompts.RETENTION_ERROR.format(error="error"))
     await last_run("blocked", counts={"would_delete": 6000, "total": 9000}, error="too_many")
     res = await check(await make_ctx(conn), "retention")
-    assert [f.line for f in res.findings if f.key == "retention.blocked"] == [
-        prompts.ALERT_RETENTION_BLOCKED.format(count=6000, total=9000)]
+    assert [(f.line, f.label) for f in res.findings if f.key == "retention.blocked"] == [
+        (prompts.ALERT_RETENTION_BLOCKED.format(count=6000, total=9000), "Большая чистка")]
 
 
 async def test_a_failed_night_stays_open_while_the_next_one_is_tried_again(conn):
@@ -351,7 +387,11 @@ async def test_backup_contract_from_backup_write_status(conn, tmp_path, monkeypa
         nights=1, reason="база на роутере недоступна", last_ok="5 октября 04:30")
     bk.backup(replace(cfg, attempts=1), NIGHT + timedelta(days=2), run=Tools(down))
     res = await look(now=after + timedelta(days=2))
-    assert sorted((f.key, f.repeat_token) for f in res.findings) == [("backup.failed", "2"), ("backup.stale", None)]
+    # The last good copy is 2 days old: said in that line, not once more as stale.
+    assert [(f.key, f.repeat_token) for f in res.findings] == [("backup.failed", "2")]
+    # The runs stopped after it (the timer): stale again, under a name of its own.
+    res = await look(now=after + timedelta(days=3, hours=3))
+    assert [(f.key, f.label) for f in res.findings] == [("backup.failed", ""), ("backup.stale", "Свежая копия")]
     # A run that died: `running` is left set while the unit is not running any more.
     with pytest.raises(RuntimeError):
         bk.backup(cfg, NIGHT + timedelta(days=3), run=Tools(RuntimeError("bug")))
@@ -419,14 +459,66 @@ async def test_a_night_without_a_copy_never_says_one_was_made(conn, tmp_path, mo
     retry = boot.replace(hour=13, minute=30)
     assert bk.backup(replace(cfg, attempts=1), retry, run=Tools(down), force=True)["warnings"] == []
     await look(retry + timedelta(minutes=15))
-    assert "🔴 Свежей резервной копии нет" in said[-1] and "• Удаление старых копий: снова в порядке" in said[-1]
+    assert "• Удаление старых копий: снова в порядке" in said[-1]
     assert "Резервные копии: снова в порядке" not in "\n".join(said) and "сделана, но" not in "\n".join(said)
-    assert {"backup.failed", "backup.stale", "backup.warning:shrank"} <= set(state.problems)
+    assert {"backup.failed", "backup.warning:shrank"} <= set(state.problems)
+    assert "Свежей резервной копии нет" not in "\n".join(said)     # the failed nights say it, with the last good one
     # The next copy: the size is news again, and the backups are fine.
     bk.backup(cfg, NIGHT + timedelta(days=2), run=Tools(size=100))
     await look(NIGHT + timedelta(days=2, minutes=15))
     assert "• Размер копии: снова в порядке" in said[-1] and "• Резервные копии: снова в порядке" in said[-1]
     assert state.problems == {}
+
+
+async def test_a_failed_night_rings_once(conn, tmp_path, monkeypatch):
+    monkeypatch.setattr(bk, "TIMESYNC_FLAG", tmp_path / "no-timesync-flag")     # Tools(synced=...) decides
+    cfg = cfg_in(tmp_path)
+    down = "pg_dump: error: connection to server at \"192.168.0.1\", port 5432 failed: Connection refused"
+    state, said = AlertState(), []
+
+    async def look(now):
+        nonlocal state
+        ctx = await make_ctx(conn, now=now, state=state, backup_status_file=str(cfg.status_file))
+        state, out = alerts.evaluate(state, [await check(ctx, "backup")], now, tz=MSK, quiet=(time(23), time(8)))
+        if out is not None:
+            alerts.delivered(state, out, now)
+            said.append(out)
+
+    bk.backup(cfg, NIGHT - timedelta(days=1), run=Tools(size=1000))
+    bk.backup(replace(cfg, attempts=1), NIGHT, run=Tools(down))
+    for minutes in range(15, 5 * 60, 15):                  # 04:45 to 09:30
+        await look(NIGHT + timedelta(minutes=minutes))
+    assert [o.silent for o in said] == [True, False]       # said at once, rung after an hour
+    assert "Свежей резервной копии нет" not in "\n".join(o.text for o in said)    # 26 h after the last good one
+    bk.backup(cfg, NIGHT.replace(hour=13, minute=30), run=Tools(size=1000), force=True)
+    await look(NIGHT.replace(hour=13, minute=45))
+    assert said[-1].text.count("снова в порядке") == 1 and "• Резервные копии: снова в порядке" in said[-1].text
+
+
+async def test_a_backup_that_failed_with_the_database_waits_for_it(conn, tmp_path, monkeypatch):
+    monkeypatch.setattr(bk, "TIMESYNC_FLAG", tmp_path / "no-timesync-flag")
+    cfg = cfg_in(tmp_path)
+    down = "pg_dump: error: connection to server at \"192.168.0.1\", port 5432 failed: Connection refused"
+    bk.backup(cfg, NIGHT - timedelta(days=1), run=Tools(size=1000))
+    bk.backup(replace(cfg, attempts=1), NIGHT, run=Tools(down))
+    ctx = await make_ctx(conn, now=NIGHT + timedelta(minutes=30), backup_status_file=str(cfg.status_file))
+    for _ in range(2):
+        alerts.evaluate(ctx.state, [checks.db_result(ctx, "ConnectionRefusedError")], ctx.now, tz=MSK, quiet=None)
+    res = await check(ctx, "backup")                      # db.unreachable says it: no second alarm for one cause
+    assert keys(res) == [] and "backup.failed" in res.unknown
+    ctx.conn = None                                       # the run could not connect at all
+    assert "backup.failed" in (await check(ctx, "backup")).unknown
+    ctx = await make_ctx(conn, now=NIGHT + timedelta(minutes=30), backup_status_file=str(cfg.status_file))
+    assert keys(await check(ctx, "backup")) == ["backup.failed"]     # the database is fine: the backup's own
+
+
+async def test_backup_old_copies_from_the_promised_age(conn, tmp_path):
+    status = tmp_path / "status.json"
+    now = await conn.fetchval("SELECT clock_timestamp()")
+    for age, expected in ((timedelta(days=34), []), (timedelta(days=35, hours=1), ["backup.old_copies"])):
+        status.write_text(json.dumps({"ok": True, "last_ok_at": now.isoformat(),
+                                      "oldest_dump_at": (now - age).isoformat()}))
+        assert keys(await check(await make_ctx(conn, now=now, backup_status_file=str(status)), "backup")) == expected
 
 
 async def test_backup_dir_readable_by_nestor_is_alerted(conn, tmp_path):
@@ -486,6 +578,7 @@ async def test_model_errors(conn):
     ctx = await make_ctx(conn)
     assert (await check(ctx, "model")).status == "ok"
     await requests("error", 2)
+    assert (await check(ctx, "model")).status == "ok"                      # 2 of 2: fewer than 3
     await requests("timeout", 1)
     await requests("ok", 3, model="claude-test")
     res = await check(ctx, "model")
@@ -528,8 +621,10 @@ async def test_news_aggregated_key(conn):
     await source("old", failures=9, ok_ago="9 days", run_ago="5 days")           # not read any more
     ctx = await make_ctx(conn)
     assert (await check(ctx, "news")).status == "ok"                      # 1 of 4: only the daily summary
-    await conn.execute("UPDATE news_sources SET failures = 4, last_ok_at = now() - interval '30 hours', "
+    await conn.execute("UPDATE news_sources SET failures = 2, last_ok_at = now() - interval '30 hours', "
                        "status = 'error: Server says <CANARY>' WHERE key = 'arctic'")
+    assert (await check(ctx, "news")).status == "ok"                      # failed twice in a row: not yet
+    await conn.execute("UPDATE news_sources SET failures = 3 WHERE key = 'arctic'")
     res = await check(ctx, "news")
     assert [(f.key, f.line) for f in res.findings] == [
         ("news.sources", prompts.ALERT_NEWS.format(count=2, total=4, names="arctic, reggaeville"))]
@@ -584,7 +679,8 @@ async def test_a_check_that_hangs_loses_the_database_for_the_rest_of_the_run(dat
 
 
 async def test_optouts_file_accumulates(conn, tmp_path):
-    for uid, out in ((111, True), (222, False), (333, True)):
+    # An anonymous admin's opt-out (from before /forget_me refused it) is no person's: not kept for a restore.
+    for uid, out in ((111, True), (222, False), (333, True), (1087968824, True)):
         await conn.execute("INSERT INTO users (user_id, opted_out) VALUES ($1, $2)", uid, out)
     await run.keep_optouts(conn, tmp_path)
     path = tmp_path / run.OPTOUTS_FILE
