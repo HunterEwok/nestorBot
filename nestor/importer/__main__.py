@@ -31,7 +31,7 @@ from ..collector import store
 from ..collector.parse import parse_chat, parse_message
 from ..config import _parse_ids
 from ..logs import setup_logging
-from .convert import IMPORT_SOURCE, chat_dict, to_bot_api
+from .convert import chat_dict, to_bot_api
 
 log = logging.getLogger("nestor.importer")
 BATCH = 200

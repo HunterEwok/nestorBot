@@ -189,7 +189,6 @@ class ReactionConfig:
 @dataclass
 class _Candidate:
     message_id: int
-    guess: Guess
     sent_at: int                   # unix time
 
 
@@ -216,12 +215,11 @@ class Reactor:
         """A new stored group message: queue it if it looks emotional."""
         if not eligible(msg):
             return False
-        found = guess(msg.get("text") or msg.get("caption"))
-        if found is None:
+        if guess(msg.get("text") or msg.get("caption")) is None:
             return False
         chat_id = msg["chat"]["id"]
         queue = self._pending.setdefault(chat_id, [])
-        queue.append(_Candidate(msg["message_id"], found, int(msg.get("date") or time.time())))
+        queue.append(_Candidate(msg["message_id"], int(msg.get("date") or time.time())))
         del queue[:-self.cfg.batch]
         if chat_id not in self._timers or self._timers[chat_id].done():
             self._timers[chat_id] = asyncio.create_task(self._flush_later(chat_id))
@@ -250,24 +248,28 @@ class Reactor:
         if not queue or room <= 0 or not await self.wanted(chat_id):
             return 0
         texts = await self._texts(chat_id, [c.message_id for c in queue])
-        queue = [c for c in queue if c.message_id in texts]
+        # On the words as they are now: an edit since it came may have made a message plain («ахахах» -> «жаль»).
+        guesses = {c.message_id: g for c in queue
+                   if c.message_id in texts and (g := guess(texts[c.message_id])) is not None}
+        queue = [c for c in queue if c.message_id in guesses]
         allowed = await self.allowed(chat_id)
         if not queue or not allowed:
             return 0
         picks = await self._ask(chat_id, queue, texts, allowed, room)
         if picks is None:   # no model now: only the sure guesses
-            picks = {i: c.guess.emoji for i, c in enumerate(queue, 1)
-                     if c.guess.sure and c.guess.emoji in allowed}
+            picks = {i: g.emoji for i, c in enumerate(queue, 1)
+                     if (g := guesses[c.message_id]).sure and g.emoji in allowed}
         if not picks:
             return 0
-        # The model may take a while: a /pause, /reactions off or an author's /forget_me
+        # The model may take a while: a /pause, /reactions off, an edit or an author's /forget_me
         # meanwhile still counts.
         if not await self.wanted(chat_id):
             return 0
         still = await self._texts(chat_id, [queue[i - 1].message_id for i in picks])
         put = 0
         for i, emoji in sorted(picks.items())[:room]:
-            if queue[i - 1].message_id in still and await self._put(chat_id, queue[i - 1].message_id, emoji):
+            mid = queue[i - 1].message_id
+            if still.get(mid) == texts[mid] and await self._put(chat_id, mid, emoji):
                 put += 1
         return put
 

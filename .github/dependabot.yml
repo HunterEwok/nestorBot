@@ -1,10 +1,9 @@
-# Dependabot: weekly check of Python dependencies from pyproject.toml.
+# Dependabot: weekly check of Python dependencies from pyproject.toml and of the GitHub Actions CI uses.
 # Docs: https://docs.github.com/code-security/dependabot/working-with-dependabot/dependabot-options-reference
 #
 # Not covered on purpose:
 #   - docker-compose.yml uses the floating tag postgres:18, so the only possible
 #     update is a new major version, and production stays on 18 (the router).
-#   - there are no GitHub Actions workflows yet; add a "github-actions" entry with the first one.
 version: 2
 updates:
   - package-ecosystem: "pip"
@@ -21,3 +20,14 @@ updates:
         update-types: ["minor", "patch"]
     commit-message:
       prefix: "deps"
+
+  # The actions in .github/workflows (checkout, setup-python): a new major version gets its own PR.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Europe/Moscow"
+    commit-message:
+      prefix: "ci"

@@ -186,6 +186,13 @@ def _topic(msg: dict) -> int | None:
     return msg.get("message_thread_id") if msg.get("is_topic_message") else None
 
 
+def _as_sent(row, msg: dict) -> bool:
+    """Whether the archived candidate still says what it said when it came. A yes is answered as sent (the
+    answer, as to any call, is to the message that came), so an edit before or during the check («ой, это я
+    не тебе», a new question) is silence: the model's verdict would be on other words than the answer's."""
+    return row["text"] == msg.get("text", msg.get("caption"))
+
+
 class Addresser:
     """Keeps the conversation windows, finds the candidates and checks them with the model.
     answer(msg, inv, order) gets every yes; declined(msg) every candidate that was not one."""
@@ -296,12 +303,13 @@ class Addresser:
             self._in_flight[chat_id] -= 1
         if completion is None or not parse(completion.text):
             return False
-        # The model may take a while: a /pause, /address off, a deletion or the author's /forget_me
+        # The model may take a while: a /pause, /address off, a deletion, an edit or the author's /forget_me
         # meanwhile still counts.
         if not await self.wanted(chat_id):
             return False
         async with self.pool.acquire() as conn:
-            return bool(await context.messages_by_id(conn, chat_id, [msg["message_id"]]))
+            found = await context.messages_by_id(conn, chat_id, [msg["message_id"]])
+        return bool(found) and _as_sent(found[0], msg)
 
     async def _ask(self, llm: LLM, msg: dict, window: bool = False) -> Completion | None:
         """The model's answer on the candidate, written down; None when nothing was asked or the call failed.
@@ -333,10 +341,10 @@ class Addresser:
     async def _shown(self, conn, msg: dict) -> list:
         """The candidate read back from the archive and the ADDRESS_CONTEXT messages before it in
         its chat and topic, oldest first; nothing when the candidate is gone (deleted, its author's
-        /forget_me). Messages of people who used /forget_me are not among them."""
+        /forget_me) or edited since it came. Messages of people who used /forget_me are not among them."""
         chat_id = msg["chat"]["id"]
         found = await context.messages_by_id(conn, chat_id, [msg["message_id"]])
-        if not found:
+        if not found or not _as_sent(found[0], msg):
             return []
         ids = await context.chat_lineage(conn, chat_id)
         before = await context.before(conn, ids, _topic(msg), found[0], self.cfg.context) if self.cfg.context else []

@@ -101,10 +101,19 @@ def _parse_ids(value: str) -> frozenset[int]:
     return frozenset(int(part) for part in value.replace(" ", "").split(",") if part)
 
 
+def _clock(value: str) -> time:
+    """HH:MM local time. An offset («10:00+03:00», «10:00Z») is refused: the times are compared with the
+    local clock of TIMEZONE, and Python cannot compare a time with an offset to one without."""
+    at = time.fromisoformat(value.strip())
+    if at.tzinfo is not None:
+        raise ValueError(value)
+    return at
+
+
 def _parse_time(name: str, default: str) -> time:
     value = _env(name, default)
     try:
-        return time.fromisoformat(value)
+        return _clock(value)
     except ValueError:
         raise SystemExit(f"{name} must look like 21:00, got {value!r}") from None
 
@@ -135,7 +144,7 @@ def _parse_quiet(name: str, default: str) -> tuple[time, time] | None:
     if value.lower() in _OFF:
         return None
     try:
-        start, end = (time.fromisoformat(part.strip()) for part in value.split("-"))
+        start, end = (_clock(part) for part in value.split("-"))
     except ValueError:
         raise SystemExit(f"{name} must look like 23:00-08:00 or off, got {value!r}") from None
     if start == end:
@@ -147,7 +156,7 @@ def _parse_hours(name: str, default: str) -> tuple[time, time]:
     """HH:MM-HH:MM within one day: from the first, before the second."""
     value = _env(name, default)
     try:
-        start, end = (time.fromisoformat(part.strip()) for part in value.split("-"))
+        start, end = (_clock(part) for part in value.split("-"))
     except ValueError:
         raise SystemExit(f"{name} must look like 10:00-23:00, got {value!r}") from None
     if start >= end:
