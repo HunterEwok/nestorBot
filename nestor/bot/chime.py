@@ -5,8 +5,9 @@ to the profile without tools, numbered and without names (nestor.bot.addressing.
 mostly stays silent; now and then it answers one person's message with a short remark: a question
 nobody answered, a dispute about a checkable fact, a light joke, a useful fact. The code picks the
 hours, counts the remarks and checks what the model chose (Answerer.run_chimes): a number it was
-shown, a person's message of the last hour that is neither a request to the bot nor about it, not
-the person the previous remark answered, a short text without links. Anything else is silence.
+shown, a person's own message of the last hour (not a forward) that the model read whole (text, not
+cut, nor a reply to a cut one), that is neither a request to the bot nor about it, not of the person
+the previous remark answered, a short text without links. Anything else is silence.
 «нестор, помолчи» silences the remarks until the end of the day; the bot's answers are not affected.
 """
 from __future__ import annotations
@@ -73,16 +74,20 @@ class Pick:
 
 
 # What the model reads besides the words (nestor.bot.addressing.render) means nothing in the chat: the
-# labels instead of names («Участник 2», «участнику-3», «третий участник», «участник три»), the numbers of
-# the messages («сообщение 3», «в сообщении номер 3», «в 3-м сообщении», «#3», «№3», «(ответ на 3)») and of
-# the topics («[тема 2]», «в теме 2», «в общей теме»). Years and amounts («в 1943-м», «первый синтез») pass.
+# labels instead of names («Участник 2», «участнику-3», «третий участник», «2-й участник», «участник три»,
+# «участник под номером 2», «участник второй,»), the numbers of the messages («сообщение 3», «в сообщении
+# номер 3», «в 3-м сообщении», «#3», «№3», «(ответ на 3)») and of the topics («[тема 2]», «в теме 2», «во
+# второй теме», «в общей теме»). Years and amounts («в 1943-м», «первый синтез», «5 участников группы»,
+# «участники первого состава») pass.
 _ORDINAL = (r"(?:перв|втор|трет|четв[её]рт|пят|шест|седьм|восьм|девят|десят)"
             r"(?:ый|ой|ий|ая|ое|ого|ому|ым|ом|ую|ей|ья|ье|ьего|ьему|ьим|ьем|ью|ьей)")
 _NUMBER = r"(?:один|одна|два|две|три|четыре|пять|шесть|семь|восемь|девять|десять)(?!\w)"
 _LABEL = re.compile(
-    r"участни[кц]\w*\W{0,3}(?:номер\s*|№\s*)?(?:\d|" + _NUMBER + r")|"
+    r"участни[кц]\w*\W{0,3}(?:(?:под\s+)?номер\w*\s*|№\s*)?(?:\d|" + _NUMBER + r"|"
+    r"(?<!\w)" + _ORDINAL + r"(?!\s*\w))|"
+    r"\d+\s*-?\s*(?:й|ий|ый|ой|го|ого|му|ому|ему|м|ым|ом|я|ая|ую|ю|ей)\s+участни[кц]|"
     r"сообщени\w*\W{0,3}(?:номер\s*|№\s*|#\s*)?\d|\d+\s*-?\s*(?:[а-яё]{1,3}\s+)?сообщени|"
-    r"(?<!\w)" + _ORDINAL + r"\s+(?:участни[кц]|сообщени)|"
+    r"(?<!\w)" + _ORDINAL + r"\s+(?:участни[кц]|сообщени|тем[аеуыо])|"
     r"№\s*\d|(?<![\w&#])#\s*\d|\(\s*ответ\s+на\s+\d|"
     r"(?<!\w)тем[аеуыо]й?\W{0,3}(?:номер\s*|№\s*)?\d|\[\s*(?:тема|общая\s+тема)|(?<!\w)в\s+общей\s+теме",
     re.IGNORECASE)
@@ -110,8 +115,22 @@ def parse(answer: str | None, count: int) -> Pick | None:
 def targetable(row, *, bot_id: int, previous: list[int] | None, now: datetime, max_age: timedelta) -> bool:
     """Whether a remark may answer this archive row (context.messages_by_id), read back after the model
     chose it (a deleted message, or one whose author used /forget_me meanwhile, is not found at all): a
-    person's message, not a bot's, a channel's post or an admin's as the group, at most max_age old, and
-    not of the person the chat's previous remark answered."""
+    person's own words, not a bot's, a channel's post, an admin's as the group or a forward (a remark «на
+    ты» would take someone else's words for theirs), at most max_age old, and not of the person the chat's
+    previous remark answered."""
     return (row is not None and row["user_id"] is not None and row["user_id"] != bot_id and not row["is_bot"]
-            and row["sender_chat_id"] is None and row["user_id"] not in forget.SHARED_IDS
+            and row["sender_chat_id"] is None and not row["forwarded"] and row["user_id"] not in forget.SHARED_IDS
             and row["user_id"] not in (previous or ()) and now - row["sent_at"] <= max_age)
+
+
+def read_whole(row, shown: list, cut: int) -> bool:
+    """Whether the model read all of the message and of the shown ones it replies to, one to another: text,
+    at most `cut` characters of each (a longer one is cut, «…[обрезано]»). A voice message, a sticker, a
+    photo are only their kind to it; and «ого, вот это поворот» under a long story reacts to how it ends."""
+    by_id, seen = {r["message_id"]: r for r in shown}, set()
+    while row is not None and row["message_id"] not in seen:
+        if row["kind"] != "text" or not (row["text"] or "").strip() or len(row["text"]) > cut:
+            return False
+        seen.add(row["message_id"])
+        row = by_id.get(row["reply_to_id"])
+    return True

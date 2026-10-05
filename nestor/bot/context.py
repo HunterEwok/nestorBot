@@ -12,8 +12,9 @@ from .. import forget
 from . import reminders
 
 # stored_at: when the message entered the archive. An answer built on it leaves with it (nestor.retention).
+# forwarded: the words are someone else's, whoever posted them here.
 _COLUMNS = """m.chat_id, m.message_id, m.thread_id, m.is_topic_message, m.user_id, m.sent_at,
-              m.reply_to_id, m.kind, m.text, m.edited_at, m.stored_at,
+              m.reply_to_id, m.kind, m.text, m.edited_at, m.stored_at, m.forward_origin IS NOT NULL AS forwarded,
               u.first_name, u.last_name, u.username, u.is_bot"""
 _FROM = "FROM messages m LEFT JOIN users u ON u.user_id = m.user_id"
 _VISIBLE = "m.kind <> 'service' AND (u.user_id IS NULL OR NOT u.opted_out)"

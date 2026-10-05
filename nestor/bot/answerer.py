@@ -209,6 +209,9 @@ class Answerer:
                                                                         order=order)):
                 self._not_addressed(msg, settings)
             return
+        # Said to the bot outright, it is the person's next message: their window after the last answer is used
+        # up, «нестор, спасибо», /help or «помолчи» included. A delivered answer to it opens a new one.
+        self.addresser.closed(msg["chat"]["id"], _topic(msg), msg["from"]["id"])
         if paused and inv.command not in ("resume", "status", "forget_me", "privacy"):   # /forget_me never waits
             return
         if inv.kind == "command":
@@ -1613,7 +1616,7 @@ class Answerer:
                                           status="timeout" if isinstance(e, asyncio.TimeoutError) else "error",
                                           keep_text=False)
             return "error"
-        pick, target, sources = chime.parse(completion.text, len(rows)), None, []
+        pick, target, sources, earlier = chime.parse(completion.text, len(rows)), None, [], []
         if pick is not None:
             chosen = rows[pick.n - 1]
             async with self.pool.acquire() as conn:
@@ -1622,11 +1625,14 @@ class Answerer:
                 if await self._chime_wanted(conn, chat_id, local.date()):
                     found = await context.messages_by_id(conn, chat_id, [chosen["message_id"]])
                     at = now + timedelta(seconds=time.monotonic() - started)
-                    # The model read the message as it was then, and only its first SHOWN characters: a long one
-                    # may end on what it never saw (bad news after a funny start), an edited one say something else.
+                    # The model read the message as it was then, and only its text, its first SHOWN characters:
+                    # a long one may end on what it never saw (bad news after a funny start), and so may the one
+                    # it replies to; a voice message or a sticker it never heard or saw; an edited one says
+                    # something else now.
                     if found and chime.targetable(found[0], bot_id=self.me.user_id, previous=previous, now=at,
                                                   max_age=timedelta(minutes=cfg.every_min)) \
-                            and found[0]["text"] == chosen["text"] and len(chosen["text"] or "") <= addressing.SHOWN \
+                            and found[0]["text"] == chosen["text"] \
+                            and chime.read_whole(found[0], rows, addressing.SHOWN) \
                             and not await self._to_the_bot(conn, chat_id, found[0]):
                         target = found[0]
                         # A remark may repeat any message the model was shown: the claim the target answers, or one
@@ -1639,6 +1645,12 @@ class Answerer:
                             conn, chat_id, [r["message_id"] for r in rows])}     # with forwarded_from
                         sources = [target, *claimed, *(again.get(r["message_id"], r) for r in rows
                                                        if r["user_id"] != self.me.user_id)]
+                        # Its own earlier remarks it was shown word for word, too: whoever they quoted is quoted
+                        # again, and the remark carries what they did, as a follow-up does its parent's.
+                        earlier = await conn.fetch(
+                            "SELECT quoted_user_ids, oldest_source_at FROM bot_requests WHERE chat_id = $1 "
+                            "AND scenario = 'chime' AND answer_msg_ids && $2::bigint[]",
+                            chat_id, [r["message_id"] for r in rows if r["user_id"] == self.me.user_id])
         if target is None:      # the model's silence, or a remark the code refused: no text is kept
             async with self.pool.acquire() as conn:
                 await self._log_scheduled(conn, chat_id, "chime_check", completion, [], started, keep_text=False)
@@ -1654,13 +1666,15 @@ class Answerer:
         # Logged as an answer to the target's author and to everyone whose words the model was shown: /forget_me
         # and the purge take it with any of their messages. The target's author comes first: the next remark is
         # to someone else (previous).
-        quoted = list(dict.fromkeys(u for r in sources for u in (r["user_id"], r.get("forwarded_from"))
-                                    if u not in (None, self.me.user_id)))
+        said = [u for r in sources for u in (r["user_id"], r.get("forwarded_from"))]
+        said += [u for e in earlier for u in e["quoted_user_ids"] or ()]
+        quoted = list(dict.fromkeys(u for u in said if u not in (None, self.me.user_id)))
+        oldest = min([r["stored_at"] for r in sources] + [e["oldest_source_at"] for e in earlier
+                                                          if e["oldest_source_at"] is not None])
         async with self.pool.acquire() as conn, conn.transaction():
             await forget.erase_lock(conn)       # it may erase: the lock comes before the insert's row locks
             rid = await self._log_scheduled(conn, chat_id, "chime", replace(completion, text=pick.text), [sent],
-                                            started, quoted_user_ids=quoted,
-                                            oldest_source_at=min(r["stored_at"] for r in sources))
+                                            started, quoted_user_ids=quoted, oldest_source_at=oldest)
             await self._scrub_if_opted_out(conn, rid, quoted)
         return "posted"
 

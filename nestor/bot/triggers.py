@@ -52,6 +52,11 @@ _SPEAKS_TO = re.compile(
     r"слушай|оцени|проверь|включи|подумай|перескажи)(?!\w)", re.IGNORECASE)
 # A mark right after the name: «нестор, ...», «нестор: ...», «нестор — ...», «нестор?».
 _MARK = re.compile(r"[,:;!?.…—–-]")
+# A question by its first word, without its «?»: «нестор что я пропустил», «нестор кто прав», «нестор как дела».
+# Not «что-то», «когда-то», nor «как всегда», «как и все»: «нестор что-то тупит» is about the bot.
+_ASKS = re.compile(r"(?:что|чего|кто|кого|кому|где|куда|откуда|когда|сколько|почему|зачем|"
+                   r"как(?:ой|ая|ое|ие|ую|ого|ому|им|их)|как(?![\w-])(?!\s+(?:всегда|обычно|будто|и|раз|бы|правило)"
+                   r"(?!\w)))(?![\w-])", re.IGNORECASE)
 # A web address, without its trailing punctuation: a «?si=» inside it is not a question.
 URL = re.compile(r"(?:https?://|www\.|(?<![\w.])[\w-]+(?:\.[\w-]+)*\.[a-z]{2,}/)\S+?(?=[.,;:!?)»\"']*(?:\s|$))")
 
@@ -99,8 +104,9 @@ def detect(msg: dict, me: BotIdentity, *, generic_keyword_enabled: bool = True,
            addressing: bool = False) -> Invocation | None:
     """An explicit call: a command, an @mention, a reply to the bot, or the name at the start.
     addressing (/address on): the name at the start counts only when a comma or another mark comes
-    after it, the rest speaks to someone or asks it to keep quiet, or there is no rest («нестор»,
-    «нестор 👋»); «нестор вчера тупил» and «нестор-то вчера тупил» are left to nestor.bot.addressing."""
+    after it, the rest speaks to someone, asks something or asks it to keep quiet, or there is no rest
+    («нестор», «нестор 👋»); «нестор вчера тупил» and «нестор-то вчера тупил» are left to
+    nestor.bot.addressing."""
     text = msg.get("text") or msg.get("caption") or ""
     entities = msg.get("entities") or msg.get("caption_entities") or []
 
@@ -134,7 +140,7 @@ def detect(msg: dict, me: BotIdentity, *, generic_keyword_enabled: bool = True,
             if re.search(r"\w-$", mark) and re.match(r"\w", rest):
                 mark = mark[:-1]
             # The bare name, maybe with an emoji or a bracket after it, calls the bot as it always did.
-            if not addressing or _MARK.search(mark) or _MARK.match(rest) or speaks_to(rest) or quiet(rest) \
-                    or not re.search(r"\w", rest):
+            if not addressing or _MARK.search(mark) or _MARK.match(rest) or speaks_to(rest) or _ASKS.match(rest) \
+                    or quiet(rest) or not re.search(r"\w", rest):
                 return Invocation("keyword", rest.strip())
     return None

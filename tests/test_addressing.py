@@ -2,8 +2,9 @@
 tools, the conversation window after an answer, the caps, and what is shown and stored."""
 import asyncio
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from datetime import time as dtime
+from zoneinfo import ZoneInfo
 
 import pytest
 from aiogram.exceptions import TelegramBadRequest
@@ -11,6 +12,7 @@ from aiogram.methods import SendMessage
 
 from nestor.bot import markup, prompts
 from nestor.bot.addressing import AddressConfig, Addresser, candidate, parse, render
+from nestor.bot.chime import ChimeConfig
 from nestor.bot.reactions import ReactionConfig
 from nestor.bot.triggers import BotIdentity, detect
 
@@ -20,6 +22,7 @@ from .test_news_bot import local, plan_all, with_news
 from .test_news_pipeline import ScriptedLLM
 
 ME = BotIdentity(BOT_ID, "ewok_nestor_bot", ("нестор", "бот"))
+MSK = ZoneInfo("Europe/Moscow")
 YES, NO = json.dumps({"to_bot": True}), json.dumps({"to_bot": False})
 PETYA = {"id": 222, "is_bot": False, "first_name": "Петя", "last_name": "Петров", "username": "petya"}
 # The bot's posts that name people, as the answerer writes them down, and the kind the models read instead.
@@ -50,12 +53,21 @@ def verdict(text: str | None, *, on: bool = True, bot_word: bool = True, window:
     ("нестор — кто прав", "explicit"),
     ("нестор - кто прав", "explicit"),
     ("нестор!", "explicit"),
+    ("Нестор! Расписание на завтра", "explicit"),
+    ("Нестор!!! Расписание на завтра", "explicit"),
+    ("нестор. вчера тупил", "explicit"),
+    ("нестор… вчера тупил", "explicit"),
     ("Нестор? ты тут", "explicit"),
     ("нестор ты где", "explicit"),
     ("нестор как думаешь, будет дождь", "explicit"),
     ("нестор оцени тезисы", "explicit"),
     ("нестор напомни завтра в 10 про встречу", "explicit"),
     ("нестор вчера тупил?", "explicit"),
+    ("нестор что я пропустил", "explicit"),         # a question by its first word, without its «?»
+    ("нестор кто прав", "explicit"),
+    ("нестор как дела", "explicit"),
+    ("нестор что нового", "explicit"),
+    ("бот сколько времени", "explicit"),
     ("бот, привет", "explicit"),
     ("нестор, глянь https://youtu.be/abc?si=xyz", "explicit"),
     # «помолчи» needs no check: it asks nothing of the model (nestor.bot.chime).
@@ -78,6 +90,9 @@ def verdict(text: str | None, *, on: bool = True, bot_word: bool = True, window:
     ("бот-то опять всё перепутал", "candidate"),
     ("Нестор-то молодец", "candidate"),
     ("бот-помощник опять всё перепутал", "candidate"),
+    ("нестор что-то тупит", "candidate"),            # not a question: «что-то», «как всегда», «когда-то»
+    ("нестор как всегда всё перепутал", "candidate"),
+    ("бот когда-то работал", "candidate"),
     ("нестор вчера скинул ролик https://youtu.be/abc?si=xyz", "candidate"),    # a «?» in a link is no question
     # The name elsewhere with a sign of an address.
     ("слушай, Нестор, а ты как думаешь?", "candidate"),
@@ -96,6 +111,10 @@ def verdict(text: str | None, *, on: bool = True, bot_word: bool = True, window:
     ("доброе утро, нестор ☀️", "candidate"),
     ("Всем привет. Нестор, доброе утро", "candidate"),           # set off after the end of a sentence
     ("Ребята, привет! Нестор, расписание на завтра", "candidate"),
+    ("Ребята, привет\nНестор, расписание на завтра", "candidate"),     # a line, a smiley or an emoji ends it too
+    ("Всем привет\n\nНестор, доброе утро", "candidate"),
+    ("Всем привет) Нестор, расписание на завтра", "candidate"),
+    ("Доброе утро ☀️ Нестор, расписание на завтра", "candidate"),
     ("Нестору, привет от Пети", "candidate"),
     # The name in another case form.
     ("Нестору вопрос: ты как думаешь?", "candidate"),
@@ -112,6 +131,7 @@ def verdict(text: str | None, *, on: bool = True, bot_word: bool = True, window:
     ("бота опять забанили", "silent"),
     ("спасибо нестор 🙏", "silent"),
     ("Всем привет. Нестор вчера тупил", "silent"),               # no comma after it
+    ("Всем привет\nНестор вчера тупил", "silent"),
     ("скинул нестору ссылку https://youtu.be/abc?si=xyz", "silent"),
     # «бот» in a compound word is not the name, nor is «Нестор-летописец».
     ("кто делал чат-бот?", "silent"),
@@ -229,6 +249,20 @@ def test_without_the_generic_bot_word(text, expected):
     ("спасибо, ты лучший", "silent"),
     ("а почему", "candidate"),                  # a question without its «?»
     ("ну и что", "candidate"),
+    ("а на завтра", "candidate"),               # «а …», «и …»: the conversation goes on
+    ("а подробнее", "candidate"),
+    ("а в Питере", "candidate"),
+    ("а про Кино", "candidate"),
+    ("и про Цоя тоже", "candidate"),
+    ("а теперь про Аквариум", "candidate"),
+    ("и ещё одну", "candidate"),
+    ("а Цой где похоронен", "candidate"),
+    ("а сам как считаешь", "candidate"),
+    ("а дальше что", "candidate"),
+    ("а в каком году", "candidate"),
+    ("а да", "silent"),
+    ("а ахах", "silent"),
+    ("а интересно", "silent"),
     ("а сколько это стоит", "candidate"),
     ("а, а ты откуда знаешь", "candidate"),
     ("тебе не кажется, что это не так", "candidate"),
@@ -257,13 +291,15 @@ def test_not_a_candidate_whatever_the_words(kw):
     assert verdict("а ты уверен?", window=True, **kw) == "silent"
 
 
-@pytest.mark.parametrize("text", ["нестор кто прав", "бот кто прав", "нестор переведи", "Нестор\nкто тут прав",
-                                  "нестор вчера тоже тупил"])
-def test_the_name_at_the_start_of_a_reply_to_someone_is_for_the_model(text):
-    """As a call by name it was answered with /address off: under a friend's message it is checked, not dropped."""
+@pytest.mark.parametrize("text, expected", [("нестор переведи", "candidate"), ("нестор вчера тоже тупил", "candidate"),
+                                            ("нестор кто прав", "explicit"), ("бот кто прав", "explicit"),
+                                            ("Нестор\nкто тут прав", "explicit")])
+def test_the_name_at_the_start_of_a_reply_to_someone_is_for_the_model(text, expected):
+    """As a call by name it was answered with /address off: under a friend's message it is checked, not dropped,
+    and a question after the name is answered as it always was."""
     friend = message(7, "налоги надо снизить вдвое", uid=222)
     assert verdict(text, on=False, reply_to_message=friend) == "explicit"
-    assert verdict(text, reply_to_message=friend) == "candidate"
+    assert verdict(text, reply_to_message=friend) == expected
 
 
 def test_replies_that_still_may_be_to_the_bot():
@@ -312,9 +348,14 @@ def test_rendered_without_names():
             {"chat_id": CHAT_ID, "message_id": 2, "user_id": BOT_ID, "reply_to_id": 1, "text": "Привет!", "kind": "text"},
             {"chat_id": CHAT_ID, "message_id": 3, "user_id": 333, "reply_to_id": 99, "text": None, "kind": "photo"},
             {"chat_id": CHAT_ID, "message_id": 4, "user_id": 222, "reply_to_id": 2, "text": "а ты\nуверен?",
-             "kind": "text"}]
+             "kind": "text"},
+            {"chat_id": CHAT_ID, "message_id": 5, "user_id": 333, "reply_to_id": None, "text": "вот что выросло",
+             "kind": "photo"},
+            {"chat_id": CHAT_ID, "message_id": 6, "user_id": 333, "reply_to_id": None, "text": "Учёные доказали",
+             "kind": "text", "forwarded": True}]
     assert render(rows, BOT_ID) == ("1. Участник 1: Всем привет\n2. Нестор (ответ на 1): Привет!\n"
-                                    "3. Участник 2: [photo]\n4. Участник 1 (ответ на 2): а ты ⏎ уверен?")
+                                    "3. Участник 2: [photo]\n4. Участник 1 (ответ на 2): а ты ⏎ уверен?\n"
+                                    "5. Участник 2: [photo] вот что выросло\n6. Участник 2 переслал: Учёные доказали")
 
 
 def test_texts():
@@ -603,13 +644,16 @@ async def test_the_daily_checks_per_chat(make_env, conn):
     await address_on(conn)
     await conn.execute("INSERT INTO bot_requests (chat_id, scenario, status, created_at) "
                        "VALUES ($1, 'address', 'ok', now() - interval '2 days')", CHAT_ID)    # not today's
+    yesterday = datetime.combine(datetime.now(MSK).date(), dtime(0), MSK) - timedelta(minutes=1)   # the local day
+    await conn.execute("INSERT INTO bot_requests (chat_id, scenario, status, created_at) "
+                       "VALUES ($1, 'address', 'ok', $2), ($1, 'address', 'ok', $2)", CHAT_ID, yesterday)
     await conn.execute("INSERT INTO bot_requests (chat_id, scenario, status) "
                        "VALUES ($1, 'address', 'ok'), ($1, 'address', 'ok')", CHAT_ID - 1)    # another group's
     for i in range(1, 5):
         await feed(say(222, i, f"слушай, Нестор, а ты как думаешь? {i}"))
     assert len(checker.checks) == 2
     assert await conn.fetchval("SELECT count(*) FROM bot_requests WHERE scenario = 'address' AND chat_id = $1",
-                               CHAT_ID) == 3
+                               CHAT_ID) == 5
 
 
 async def test_checks_of_several_people_at_once_keep_the_daily_number(make_env, conn):
@@ -663,11 +707,22 @@ async def test_the_name_at_the_start_under_a_friends_message_is_answered_on_a_ye
     bot, llm, feed = make_env(news_llm=checker)
     await address_on(conn)
     await feed(say(333, 1, "налоги надо снизить вдвое"))
-    await feed(say(222, 2, "нестор кто прав", reply_to_message=message(1, "налоги надо снизить вдвое", uid=333)))
+    await feed(say(222, 2, "нестор переведи", reply_to_message=message(1, "налоги надо снизить вдвое", uid=333)))
     assert checker.checks[0][1]["content"].startswith(
-        "1. Участник 1: налоги надо снизить вдвое\n2. Участник 2 (ответ на 1): нестор кто прав")
+        "1. Участник 1: налоги надо снизить вдвое\n2. Участник 2 (ответ на 1): нестор переведи")
     assert len(llm.calls) == 1 and bot.sent[-1]["reply_to"] == 2
-    assert await conn.fetchval("SELECT scenario FROM bot_requests WHERE trigger_msg_id = 2") == "who_is_right"
+    assert await conn.fetchval("SELECT question FROM bot_requests WHERE trigger_msg_id = 2") == "переведи"
+
+
+@pytest.mark.parametrize("text, scenario", [("нестор кто прав", "who_is_right"), ("нестор что я пропустил", "catchup")])
+async def test_a_question_after_the_name_needs_no_check(make_env, conn, text, scenario):
+    """Without its «?» too: answered as with /address off, also with no profile to check it with."""
+    bot, llm, feed = make_env()
+    await address_on(conn)
+    await feed(say(333, 1, "налоги надо снизить вдвое"))
+    await feed(say(222, 2, text, reply_to_message=message(1, "налоги надо снизить вдвое", uid=333)))
+    assert len(llm.calls) == 1 and bot.sent[-1]["reply_to"] == 2
+    assert await conn.fetchval("SELECT scenario FROM bot_requests WHERE trigger_msg_id = 2") == scenario
 
 
 async def test_a_no_still_may_get_a_reaction(make_env, conn):
@@ -721,6 +776,41 @@ async def test_the_window_is_for_the_next_message_only(make_env, conn):
     await feed(say(222, 5, "а ты уверен?", date=now() + 5))             # checked: a no
     await feed(say(222, 6, "а почему?", date=now() + 10))
     assert len(checker.checks) == 1 and len(llm.calls) == 2
+
+
+@pytest.mark.parametrize("between", ["спасибо", "нестор, спасибо", "/help", "нестор, помолчи"])
+async def test_a_call_with_no_answer_uses_up_the_window_too(make_env, conn, between):
+    """A thanks in reply to the answer, /help or «нестор, помолчи» is the person's next message: the one after it
+    is not the next one after the answer any more, whatever it says."""
+    checker = Checker(YES)
+    bot, llm, feed = make_env(news_llm=checker)
+    await address_on(conn)
+    await feed(say(222, 1, "нестор, кто выиграл вчера?"))
+    answer = message(bot.sent[-1]["message_id"], "Ответ модели", uid=BOT_ID)
+    await feed(say(222, 2, between, date=now() + 10, **({"reply_to_message": answer} if between == "спасибо" else {})))
+    await feed(say(222, 3, "а ты завтра идёшь на матч?", date=now() + 60))      # to a friend
+    assert checker.checks == [] and len(llm.calls) == 1
+
+
+async def test_an_answered_call_opens_the_window_again(make_env, conn):
+    checker = Checker(YES)
+    bot, llm, feed = make_env(news_llm=checker)
+    await address_on(conn)
+    await feed(say(222, 1, "нестор, кто выиграл вчера?"))
+    answer = message(bot.sent[-1]["message_id"], "Ответ модели", uid=BOT_ID)
+    await feed(say(222, 2, "а точно вчера?", date=now() + 10, reply_to_message=answer))
+    await feed(say(222, 3, "а почему?", date=now() + 60))
+    assert len(checker.checks) == 1 and len(llm.calls) == 3 and bot.sent[-1]["reply_to"] == 3
+
+
+@pytest.mark.parametrize("text", ["а на завтра", "и про Цоя тоже", "а подробнее"])
+async def test_a_follow_up_without_a_question_is_checked(make_env, conn, text):
+    checker = Checker(YES)
+    bot, llm, feed = make_env(news_llm=checker)
+    await address_on(conn)
+    await feed(say(222, 1, "нестор, кто выиграл вчера?"))
+    await feed(say(222, 2, text, date=now() + 5))
+    assert len(checker.checks) == 1 and len(llm.calls) == 2 and bot.sent[-1]["reply_to"] == 2
 
 
 @pytest.mark.parametrize("text", ["а, понятно", "а, спасибо", "и тебе спасибо", "а ок", "а понял спасибо", "а ок спс",
@@ -984,7 +1074,9 @@ async def test_the_numbers_from_the_env_reach_the_answerer():
             return SimpleNamespace(id=BOT_ID, username="ewok_nestor_bot")
 
     settings = Settings(bot_token="42:TEST", database_url="", allowed_chat_ids=frozenset({CHAT_ID}),
-                        address_context=0, address_window_min=10, address_daily_checks=7)
+                        address_context=0, address_window_min=10, address_daily_checks=7,
+                        chime_hours=(dtime(12), dtime(20)), chime_min_messages=5, chime_window=7, chime_daily=1)
     answerer = await make_answerer(settings, Bot(), None, None)
     assert answerer.cfg.address == AddressConfig(window_min=10, context=0, daily_checks=7)
     assert answerer.addresser.cfg is answerer.cfg.address
+    assert answerer.cfg.chime == ChimeConfig(hours=(dtime(12), dtime(20)), min_messages=5, window=7, daily=1)

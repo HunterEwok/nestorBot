@@ -5,10 +5,10 @@ a reply to the bot, the name at the start with a comma, or alone. In a group whe
 /address, the doubtful ones are candidates: the name elsewhere in the message with a sign of
 an address («слушай, Нестор, а ты как думаешь?»), the name at the start without a comma
 («нестор вчера тупил»), and the next message of someone the bot has just answered, with «ты»,
-a request or a question («а ты уверен?» a minute later). A candidate, with the few messages
-before it and without names, goes to the profile without tools for a yes or a no; a yes is
-answered as if the bot had been called by name. No profile, past the daily number of checks, or
-when the day's tokens run low: no check, and no answer. The code never guesses yes.
+a request, a question or an «а …» («а ты уверен?», «а на завтра» a minute later). A candidate,
+with the few messages before it and without names, goes to the profile without tools for a yes or
+a no; a yes is answered as if the bot had been called by name. No profile, past the daily number
+of checks, or when the day's tokens run low: no check, and no answer. The code never guesses yes.
 """
 from __future__ import annotations
 
@@ -37,10 +37,16 @@ class AddressConfig:
     timeout_s: float = 20          # a check that takes longer is a no
 
 
-# «а почему», «и что дальше», «ну как так»: going on with the conversation, a question without its «?».
-# «а круто», «а, точно», «а вот оно что»: a reaction to it, which asks nothing.
-_GOES_ON = re.compile(r"^\s*(?:(?:а|и|ну)(?!\w)[\s,]*)+(?:почему|зачем|откуда|куда|как\w{0,3}|что|чего|чем|где|"
-                      r"когда|кто|кого|кому|сколько|разве|неужели|если)(?!\w)", re.IGNORECASE)
+# «а почему», «и что дальше», «а на завтра», «и про Цоя тоже»: going on with the conversation.
+_GOES_ON = re.compile(r"^\s*(?:(?:а|и|ну)(?!\w)[\s,]*)+\w", re.IGNORECASE)
+# «а круто», «а, точно», «а вот оно что», «а ну да», «и ахаха»: a reaction to it, which asks nothing.
+_REACTION = re.compile(r"(?:(?:а|и|ну)\s+)*(?:круто|прикольно|класс|здорово|супер|норм|точно|да|конечно|ясно|понятно|"
+                       r"логично|интересно|бывает|жесть|ого|вау|ничего\s+себе|во[тн]\s+оно\s+(?:что|как)|вот\s+как|"
+                       r"а?х[ах]*)")
+
+
+def _reaction(text: str) -> bool:
+    return _REACTION.fullmatch(" ".join(re.sub(r"[^\w\s]", " ", text.lower()).split())) is not None
 
 
 def _keywords(me: BotIdentity, generic_keyword_enabled: bool) -> tuple[str, ...]:
@@ -49,12 +55,15 @@ def _keywords(me: BotIdentity, generic_keyword_enabled: bool) -> tuple[str, ...]
 
 def _set_off(text: str, start: int, end: int) -> bool:
     """The name at text[start:end] is said to someone: set off by commas («слушай, Нестор, а ...»,
-    «спасибо, нестор», «спасибо, нестор 🙏»), or at the very end before «?» or «!» («привет нестор!»)."""
+    «спасибо, нестор», «спасибо, нестор 🙏»), or at the very end before «?» or «!» («привет нестор!»).
+    A sentence or a line that starts with it needs only the comma after it: «Ребята, привет! Нестор, ...»,
+    «Всем привет) Нестор, ...», «Доброе утро ☀️ Нестор, ...», or «Нестор, ...» on a line of its own."""
     before, after = text[:start].rstrip(), text[end:].lstrip()
     if re.fullmatch(r"[?!]+\W*", after):
         return True
+    starts = not before or "\n" in text[len(before):start] or not re.match(r"[\w,(«\"'—–-]", before[-1])
     return (before.endswith(",") and (not after or after[0] in ",.!?…" or not re.search(r"\w", after))) or \
-        (after.startswith(",") and (not before or before[-1] in ".!?…"))
+        (after.startswith(",") and starts)
 
 
 def _replies_to_someone(msg: dict) -> bool:
@@ -88,7 +97,8 @@ def candidate(msg: dict, me: BotIdentity, *, generic_keyword_enabled: bool = Tru
     if found and (speaks_to(text) or any(_set_off(text, m.start(), m.end()) for m in found)):
         return Invocation("address", strip_name(text, names))
     # «а понятно», «и тебе спасибо», «а понял спасибо» right after an answer: a thanks, not a request.
-    if window and (speaks_to(text) or _GOES_ON.match(text)) and acknowledgement(text) is None:
+    if window and (speaks_to(text) or (_GOES_ON.match(text) and not _reaction(text))) \
+            and acknowledgement(text) is None:
         return Invocation("address", strip_name(text, names) if names else text.strip())
     return None
 
@@ -137,7 +147,8 @@ def render(rows, bot_id: int, *, posts: dict[tuple[int, int], str] | None = None
     «…[обрезано]» after it; whole_last: the last one, the message asked about, is shown whole (an address
     often ends a long message). posts: the bot's answers and posts among them (bot_posts), shown by their
     kind only. Messages of a forum's several topics say which one each is in, «[тема 1]», ..., and
-    «[общая тема]» for General."""
+    «[общая тема]» for General. A forward says so, «Участник 2 переслал: …»: the words are someone else's.
+    A photo, a voice message, a sticker are their kind, «[voice]», a caption comes after it: «[photo] …»."""
     labels: dict[int | None, str] = {}
     numbers = {(r["chat_id"], r["message_id"]): i for i, r in enumerate(rows, 1)}
     topics = [_row_topic(r) for r in rows]
@@ -150,10 +161,13 @@ def render(rows, bot_id: int, *, posts: dict[tuple[int, int], str] | None = None
         reply = f" (ответ на {target})" if target else ""
         post = (posts or {}).get((r["chat_id"], r["message_id"])) if r["user_id"] == bot_id else None
         text = f"[{POSTS.get(post, ANSWER)}]" if post else r["text"] or f"[{r['kind']}]"
+        if not post and r["text"] and r["kind"] != "text":
+            text = f"[{r['kind']}] {text}"
+        forwarded = " переслал" if r.get("forwarded") else ""
         if len(text) > SHOWN and not (whole_last and i == len(rows)):
             text = text[:SHOWN] + CUT
         text = text.replace("\n", " ⏎ ")
-        lines.append(f"{i}. {topic}{who}{reply}: {text}")
+        lines.append(f"{i}. {topic}{who}{forwarded}{reply}: {text}")
     return "\n".join(lines)
 
 
@@ -208,6 +222,11 @@ class Addresser:
         for key in [k for k, t in self._answered.items() if now - t > span]:
             del self._answered[key]
         self._answered[(chat_id, topic, user_id)] = now
+
+    def closed(self, chat_id: int, topic: int | None, user_id: int) -> None:
+        """The person's next message here is to the bot outright (by name, a command, a reply to it): the
+        window after the last answer is used up. A delivered answer to it opens a new one (opened)."""
+        self._answered.pop((chat_id, topic, user_id), None)
 
     def window(self, msg: dict) -> bool:
         """Whether the message was written within the window after the bot's last answer to its
