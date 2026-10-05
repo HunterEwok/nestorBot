@@ -32,7 +32,7 @@ TASKS: dict[str, tuple[tuple[str, ...], str]] = {
     "theses": (ARCHIVE, "deep"),         # «оцени тезисы»
     "who_is_right": (ARCHIVE, "deep"),   # «кто прав»
     "think": (ARCHIVE, "deep"),          # «нестор, подумай …» about the chat
-    "digest": (ARCHIVE, "group"),        # the morning digest of the chat
+    "digest": (ARCHIVE, "group"),        # the digest of the chat, and its notes on parts of a long period
     "topics": (ARCHIVE, "group"),        # topics of the week in /stats, themes for the wisdom of the day
     "web": (WEB, "web"),                 # questions about the world
     "think_web": (WEB, "smart"),         # «нестор, подумай …» about the world

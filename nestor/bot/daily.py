@@ -1,4 +1,8 @@
-"""Scheduled posts: the morning digest and the wisdom of the day.
+"""Scheduled posts: the group digest and the wisdom of the day.
+
+The digest comes at DIGEST_TIME once every N days (DIGEST_EVERY_DAYS, or the group's own
+/digest N) and retells the N local days before that morning; with N = 1 it is the morning
+digest of yesterday.
 
 The wisdom is searched by a model with internet access, which must never see the chat.
 So the archive model only picks today's themes from the fixed list below, the list is
@@ -11,15 +15,20 @@ import html
 import ipaddress
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, time, timedelta
 from typing import Any
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 import asyncpg
 
 from . import prompts
+from .context import plural
 from .llm import extract_json
 from .reminders import MONTHS
+
+DIGEST_MAX_DAYS = 90        # DIGEST_EVERY_DAYS and /digest N: from 1 to this
+DAYS = ("день", "дня", "дней")
 
 THEMES = (
     "любовь", "дружба", "семья", "дети", "родители", "одиночество", "счастье", "радость", "грусть", "страх",
@@ -139,6 +148,37 @@ def day_name(day: date) -> str:
     return f"{day.day} {MONTHS[day.month - 1]}"
 
 
+def days_name(n: int) -> str:
+    """5 -> «5 дней», 21 -> «21 день»."""
+    return f"{n} {plural(n, DAYS)}"
+
+
+def digest_bounds(day: date, days: int, tz: ZoneInfo) -> tuple[datetime, datetime]:
+    """What the digest posted on `day` retells: [day - days, day), local midnight to local midnight,
+    so a day with a clock change is as long as it really was."""
+    return datetime.combine(day - timedelta(days=days), time(0), tz), datetime.combine(day, time(0), tz)
+
+
+def span_name(first: date, last: date) -> str:
+    """«5 сентября — 4 октября», or one day's name."""
+    return day_name(first) if first == last else f"{day_name(first)} — {day_name(last)}"
+
+
+def digest_period(day: date, days: int) -> str:
+    """How the digest posted on `day` names what it retells: «4 октября» for yesterday,
+    «30 дней, 5 сентября — 4 октября» for more."""
+    if days == 1:
+        return day_name(day - timedelta(days=1))
+    return f"{days_name(days)}, {span_name(day - timedelta(days=days), day - timedelta(days=1))}"
+
+
+def digest_header(day: date, days: int) -> str:
+    """The first line of the post (Markdown, as the model's text under it)."""
+    if days == 1:
+        return prompts.DIGEST_HEADER.format(date=digest_period(day, 1))
+    return prompts.DIGEST_PERIOD_HEADER.format(period=digest_period(day, days))
+
+
 # ---- the daily_posts table: at most one post per chat, kind and local day ----
 
 async def claim(conn: asyncpg.Connection, chat_id: int, kind: str, day: date) -> int | None:
@@ -156,6 +196,14 @@ async def claim(conn: asyncpg.Connection, chat_id: int, kind: str, day: date) ->
                 OR (daily_posts.attempts < 6 AND daily_posts.status = 'waiting'
                     AND daily_posts.updated_at < now() - interval '10 minutes')
            RETURNING id""", chat_id, kind, day)
+
+
+async def digest_due(conn, chat_id: int, day: date, every: int) -> bool:
+    """The digest is due on `day` when the last one posted here is at least `every` days back, or
+    there was none yet. Skipped and failed days do not count: the next day tries again."""
+    last = await conn.fetchval(
+        "SELECT max(day) FROM daily_posts WHERE chat_id = $1 AND kind = 'digest' AND status = 'posted'", chat_id)
+    return last is None or (day - last).days >= every
 
 
 async def finish(conn, post_id: int, status: str, *, message_id: int | None = None, themes: list[str] | None = None,

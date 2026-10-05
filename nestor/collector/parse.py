@@ -101,11 +101,44 @@ def _reference(nested: dict) -> dict:
     return ref
 
 
+def _strip_nulls(value: Any) -> Any:
+    """Object fields that are null go, at any depth: PostgreSQL's jsonb_strip_nulls."""
+    if isinstance(value, dict):
+        return {k: _strip_nulls(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_strip_nulls(v) for v in value]
+    return value
+
+
+def _id_ref(obj: Any) -> dict | None:
+    return {"id": obj.get("id")} if isinstance(obj, dict) else None
+
+
+def _origin_ref(origin: dict) -> dict:
+    """Who wrote a message, as ids only: no names, no signatures."""
+    return _strip_nulls({"type": origin.get("type"), "sender_user": _id_ref(origin.get("sender_user")),
+                         "sender_chat": _id_ref(origin.get("sender_chat")), "chat": _id_ref(origin.get("chat"))})
+
+
+def _external_ref(ext: dict) -> dict:
+    """A reply to a message of another topic or chat, as ids only: its text, media and the names
+    of its author are not kept. Built the way migration 0008 reduces the stored ones."""
+    origin = ext.get("origin")
+    return _strip_nulls({"message_id": ext.get("message_id"), "chat": _id_ref(ext.get("chat")),
+                         "origin": _origin_ref(origin) if isinstance(origin, dict) else None})
+
+
 def reduce_raw(msg: dict) -> dict:
     raw = dict(msg)
     for key in _NESTED_MESSAGE_KEYS:
         if isinstance(raw.get(key), dict) and "message_id" in raw[key]:
             raw[key] = _reference(raw[key])
+    if isinstance(raw.get("external_reply"), dict):
+        raw["external_reply"] = _external_ref(raw["external_reply"])
+    # A quote is kept only beside the replied message, which tells whose words they are, so that
+    # /forget_me and the purge find it. Without it (another topic or chat, a deleted message) it goes.
+    if "reply_to_message" not in raw:
+        raw.pop("quote", None)
     return raw
 
 

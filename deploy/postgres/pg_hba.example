@@ -1,6 +1,7 @@
 # Lines to add to /etc/postgresql/16/main/pg_hba.conf on the database host.
-# Only the two application roles, only the nestor database, only from the Pi.
+# Only the three roles (nestor, hermes_reader, nestor_backup), only the nestor database, only from the Pi.
 # Replace 100.64.0.2 with the Pi's VPN (or public) address.
 # hostssl requires TLS; over a VPN you may use "host" instead.
 hostssl  nestor  nestor         100.64.0.2/32  scram-sha-256
 hostssl  nestor  hermes_reader  100.64.0.2/32  scram-sha-256
+hostssl  nestor  nestor_backup  100.64.0.2/32  scram-sha-256

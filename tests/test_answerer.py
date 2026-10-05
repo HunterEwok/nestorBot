@@ -1,7 +1,8 @@
 """Stage 3 through the real dispatcher with a fake Telegram and a fake LLM."""
 import asyncio
 import itertools
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 from aiogram import Dispatcher
@@ -9,6 +10,7 @@ from aiogram.enums import ChatMemberStatus
 from aiogram.exceptions import TelegramForbiddenError
 from aiogram.types import Message, Update
 
+from nestor import forget, retention
 from nestor.bot import prompts
 from nestor.bot.answerer import AnswerConfig, Answerer
 from nestor.bot.llm import Completion
@@ -16,6 +18,7 @@ from nestor.bot.triggers import BotIdentity
 from nestor.collector.app import Collector
 from nestor.config import Settings
 from nestor.mcp import tools
+from nestor.watchdog import alerts, checks
 
 from .factories import CHAT_ID, message, update
 from .test_collector import FakeBot as BaseFakeBot
@@ -340,6 +343,52 @@ async def test_forget_me(make_env, conn):
     assert bot.sent[-1]["text"].startswith("🧹 Готово: удалил из архива твои сообщения (2)")
 
 
+@pytest.mark.parametrize("sender, sender_chat", [
+    (1087968824, {"id": CHAT_ID, "type": "supergroup", "title": "Test group"}),    # an anonymous admin
+    (136817688, {"id": -1001000000777, "type": "channel", "title": "Канал Пети"}),  # someone posting as a channel
+    (777000, {"id": -1001000000777, "type": "channel", "title": "Канал"}),          # the linked channel's forward
+])
+async def test_forget_me_and_export_from_a_shared_sender_are_refused(make_env, conn, sender, sender_chat):
+    """One id stands for many people there: /forget_me would erase everybody's posts and stop storing them."""
+    bot, _, feed = make_env()
+
+    def post(mid, text):
+        msg = message(mid, text, uid=sender, sender_chat=sender_chat)
+        msg["from"]["is_bot"] = sender != 777000
+        return msg
+
+    await feed(update("message", post(1, "объявление Ани")))
+    await feed(update("message", message(2, "ответ", uid=111, reply_to_message=post(1, "объявление Ани"),
+                                         quote={"text": "объявление", "position": 0})))
+    await feed(update("message", post(3, "/forget_me")))
+    await feed(update("message", post(4, "/export")))
+    await feed(update("message", post(5, "объявление Бори")))
+    assert [s["text"] for s in bot.sent] == [prompts.PERSONAL_ONLY] * 2 and bot.documents == []
+    assert await conn.fetchval("SELECT opted_out FROM users WHERE user_id = $1", sender) is False
+    kept = {r["message_id"] for r in await conn.fetch("SELECT message_id FROM messages WHERE user_id = $1", sender)}
+    assert {1, 5} <= kept
+    assert (await conn.fetchval("SELECT raw FROM messages WHERE message_id = 2"))["quote"]["text"] == "объявление"
+
+
+async def test_forget_me_works_while_paused(make_env, conn):
+    bot, _, feed = make_env(admins={111})
+    await feed(update("message", message(1, "моё личное", uid=222)))
+    await feed(update("message", message(2, "/pause", uid=111)))
+    await feed(update("message", message(3, "/privacy", uid=222)))
+    await feed(update("message", message(4, "/forget_me", uid=222)))
+    paused, privacy, forgotten = bot.sent
+    assert paused["text"] == prompts.PAUSED and "<b>Сколько храню</b>" in privacy["text"]
+    assert forgotten["text"].startswith("🧹 Готово: удалил из архива твои сообщения (1)")
+    assert forgotten["reply_to"] == 4
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE user_id = 222") == 0
+    assert await conn.fetchval("SELECT opted_out FROM users WHERE user_id = 222") is True
+    # Neither the commands nor the answers were archived while paused, and nothing of 222's is after /resume.
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE message_id IN (3, 4) OR user_id = $1", BOT_ID) == 0
+    await feed(update("message", message(5, "/resume", uid=111)))
+    await feed(update("message", message(6, "снова пишу", uid=222)))
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE user_id = 222") == 0
+
+
 async def test_pause_requires_admin_and_stops_archiving(make_env, conn):
     bot, llm, feed = make_env(admins={111})
     await feed(update("message", message(1, "/pause", uid=222)))
@@ -446,9 +495,26 @@ async def test_forget_me_also_removes_answers_that_quote_them(make_env, conn):
     assert await conn.fetchval("SELECT count(*) FROM messages WHERE message_id = $1", answer_id) == 0
     assert "палатку" not in str(await conn.fetchval("SELECT raw FROM messages WHERE message_id = 3"))
     assert await conn.fetchval("SELECT answer FROM bot_requests WHERE scenario = 'other'") is None
+    # The answer is still in the group: Telegram sends its quote again with an edit of the reply, and with
+    # a new reply to it. Neither brings the words back.
+    await feed(update("edited_message", reply | {"text": "точно!", "edit_date": 1_790_000_060}))
+    await feed(update("message", message(6, "и я", uid=333, reply_to_message=reply["reply_to_message"],
+                                         quote={"text": "палатку", "position": 0})))
+    assert "палатк" not in str([r["raw"] for r in await conn.fetch("SELECT raw FROM messages")])
     # The next request does not carry their words to the model in any form.
     await feed(update("message", message(5, "нестор, а теперь?", uid=111)))
     assert "палатк" not in str(llm.calls[-1])
+
+
+async def test_forget_me_removes_answers_that_quote_a_forward_of_their_message(make_env, conn):
+    _, _, feed = make_env(FakeLLM("Вася переслал: [«палатку»](#1)"))
+    origin = {"type": "user", "date": 1_789_000_000, "sender_user": {"id": 222, "is_bot": False, "first_name": "Петя"}}
+    await feed(update("message", message(1, "беру палатку", uid=111, forward_origin=origin)))
+    await feed(update("message", message(2, "нестор, кто что берёт?", uid=333)))
+    # The link names Вася, who forwarded it; the words are Петя's.
+    assert await conn.fetchval("SELECT quoted_user_ids FROM bot_requests WHERE scenario = 'other'") == [111, 222]
+    await feed(update("message", message(3, "/forget_me", uid=222)))
+    assert await conn.fetchval("SELECT answer FROM bot_requests WHERE scenario = 'other'") is None
 
 
 async def test_ids_shared_by_a_migrated_chat_and_its_old_group_are_not_linked(make_env, conn):
@@ -499,6 +565,19 @@ async def test_forget_me_during_an_answer_in_flight_still_removes_it(make_env, c
     assert await conn.fetchval("SELECT count(*) FROM messages WHERE message_id = $1", answer["message_id"]) == 0
     await feed(update("message", message(4, "нестор, а теперь?", uid=111)))
     assert "котелок" not in str(llm.calls[-1])
+
+
+async def test_the_askers_forget_me_during_their_own_answer_keeps_no_question(make_env, conn):
+    bot, llm, feed = make_env(FakeLLM("Ответ", delay=0.4))
+    asking = asyncio.create_task(feed(update("message", message(1, "нестор, мой секретный вопрос про котелок",
+                                                                 uid=222))))
+    await asyncio.sleep(0.15)                       # the model is thinking
+    assert len(llm.calls) == 1
+    await feed(update("message", message(2, "/forget_me", uid=222)))
+    await asking
+    assert bot.sent[-1]["text"] == "Ответ"          # answered all the same
+    req = await conn.fetchrow("SELECT user_id, question, status FROM bot_requests")
+    assert tuple(req) == (222, None, "ok")
 
 
 async def test_answers_that_repeat_an_earlier_answer_go_with_it(make_env, conn):
@@ -582,3 +661,273 @@ async def test_thanks_for_an_answer_with_a_link_is_a_reaction_even_when_the_link
     telegram_view["text"] = "Ты про https://example.com/search?q=налоги?"
     await feed(update("message", message(3, "угу", uid=222, reply_to_message=telegram_view)))
     assert len(llm.calls) == 2
+
+
+# ---- retention: an answer leaves the archive with the oldest message it may carry ----
+
+async def test_an_answer_records_the_oldest_message_it_was_shown(make_env, pool, conn):
+    bot, llm, feed = make_env()
+    await feed(update("message", message(1, "старая мысль Пети", uid=222)))
+    await conn.execute("UPDATE messages SET stored_at = now() - interval '300 days' WHERE message_id = 1")
+    await feed(update("message", message(2, "нестор, что думаешь?", uid=111)))
+    assert "старая мысль Пети" in llm.calls[0][-1]["content"]
+    shown = await conn.fetchval("SELECT stored_at FROM messages WHERE message_id = 1")
+    assert await conn.fetchval("SELECT oldest_source_at FROM bot_requests") == shown
+
+    # The night message 1 leaves, the answer goes with it, though the answer itself is a day old.
+    answer_id = bot.sent[-1]["message_id"]
+    got = await retention.purge(pool, shown + timedelta(seconds=1), pause_s=0)
+    assert {k: got[k] for k in ("answers", "answer_messages", "messages")} == \
+        {"answers": 1, "answer_messages": 1, "messages": 1}
+    req = await conn.fetchrow("SELECT question, answer FROM bot_requests")
+    assert (req["question"], req["answer"]) == ("что думаешь?", None)
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE message_id = ANY($1::bigint[])",
+                               [1, answer_id]) == 0
+
+
+def _telegram_view(sent: dict) -> dict:
+    """The bot's answer as Telegram shows it in a reply."""
+    return {"message_id": sent["message_id"], "date": 1_790_000_000, "chat": {"id": CHAT_ID, "type": "supergroup"},
+            "from": {"id": BOT_ID, "is_bot": True, "first_name": "Нестор"}, "text": sent["text"]}
+
+
+async def test_a_follow_up_carries_the_oldest_source_of_its_conversation(make_env, conn):
+    bot, _, feed = make_env()
+    await feed(update("message", message(1, "нестор, кто прав?")))
+    await conn.execute("UPDATE bot_requests SET oldest_source_at = now() - interval '400 days'")
+    earlier = await conn.fetchval("SELECT oldest_source_at FROM bot_requests")
+    await feed(update("message", message(2, "а подробнее?", reply_to_message=_telegram_view(bot.sent[-1]))))
+    child = await conn.fetchrow("SELECT parent_id, oldest_source_at FROM bot_requests ORDER BY id DESC LIMIT 1")
+    assert child["parent_id"] is not None and child["oldest_source_at"] == earlier
+
+
+async def test_a_reference_to_the_bots_own_answer_carries_what_that_answer_did(make_env, conn):
+    bot, llm, feed = make_env()
+    await feed(update("message", message(1, "нестор, кто что берёт?")))
+    first = bot.sent[-1]
+    await conn.execute("UPDATE bot_requests SET oldest_source_at = now() - interval '400 days'")
+    earlier = await conn.fetchval("SELECT oldest_source_at FROM bot_requests")
+    llm.answer = f"Я уже отвечал: [«Ответ модели»](#{first['message_id']})"
+    await feed(update("message", message(2, "нестор, повтори", uid=333)))
+    assert await conn.fetchval("SELECT oldest_source_at FROM bot_requests ORDER BY id DESC LIMIT 1") == earlier
+
+
+async def test_an_id_two_chats_share_makes_the_answer_leave_with_the_older_message(make_env, conn):
+    old = -4242
+    _, llm, feed = make_env(FakeLLM("Про это писали: [«едем в Грецию»](#157)"))
+    await feed(update("message", message(157, "едем в Грецию", uid=111)))
+    await feed.answerer.save_outgoing(message(157, "едем в Грецию", chat_id=old, uid=222)
+                                      | {"chat": {"id": old, "type": "group", "title": "Old"}})
+    await conn.execute("UPDATE chats SET migrated_from_chat_id = $1 WHERE chat_id = $2", old, CHAT_ID)
+    older = await conn.fetchval("UPDATE messages SET stored_at = now() - interval '300 days' "
+                                "WHERE chat_id = $1 RETURNING stored_at", old)
+    # Asked in a topic, so the prompt holds neither copy: only the model's #157 may carry their words.
+    await feed(update("message", message(200, "нестор, что там было?", message_thread_id=9, is_topic_message=True)))
+    assert "едем в Грецию" not in llm.calls[0][-1]["content"]
+    # Which of the two it meant is not known: both authors are recorded, and the answer leaves with the older.
+    assert await conn.fetchval("SELECT quoted_user_ids FROM bot_requests") == [111, 222]
+    assert await conn.fetchval("SELECT oldest_source_at FROM bot_requests") == older
+
+
+async def insert_started(conn, table: str) -> bool:
+    """Whether a transaction is inserting into the table: its rows are invisible until it commits, its lock is not."""
+    return await conn.fetchval(
+        """SELECT count(*) > 0 FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+           WHERE c.relname = $1 AND l.mode = 'RowExclusiveLock'
+             AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())""", table)
+
+
+async def test_an_answer_that_may_erase_waits_for_a_purge_batch_in_flight(make_env, pool, conn):
+    _, _, feed = make_env(FakeLLM("Петя берёт: [«палатку»](#1)"))
+    await feed(update("message", message(1, "беру палатку", uid=222)))
+    async with pool.acquire() as batch:
+        purging = batch.transaction()
+        await purging.start()
+        await forget.erase_lock(batch)                  # a batch in flight
+        asking = asyncio.create_task(feed(update("message", message(2, "нестор, кто что берёт?", uid=111))))
+        await asyncio.sleep(0.5)
+        # The lock comes before the insert's row locks, not after them.
+        assert not asking.done() and not await insert_started(conn, "bot_requests")
+        await purging.commit()
+    await asking
+    assert await conn.fetchval("SELECT quoted_user_ids FROM bot_requests") == [222]
+
+
+async def test_a_reply_to_a_scrubbed_answer_continues_with_answer_removed(make_env, pool, conn):
+    bot, llm, feed = make_env()
+    await feed(update("message", message(1, "нестор, кто прав?")))
+    first = bot.sent[-1]
+    await conn.execute("UPDATE bot_requests SET oldest_source_at = now() - interval '400 days'")
+    _, cutoff = await retention.db_times(conn)
+    assert (await retention.purge(pool, cutoff, pause_s=0))["answers"] == 1
+    # Telegram still shows the answer; the archive no longer has its words.
+    await feed(update("message", message(2, "а подробнее?", reply_to_message=_telegram_view(first))))
+    assert [(m["role"], m["content"]) for m in llm.calls[1][1:3]] == [("user", "кто прав?"),
+                                                                      ("assistant", "(ответ удалён)")]
+    assert "Ответ модели" not in str(llm.calls[1][1:])
+
+
+class _PurgingLLM(FakeLLM):
+    """The retention purge deletes the parent request while the follow-up is being written."""
+
+    def __init__(self, pool, *, commit_after=None):
+        super().__init__()
+        self.pool, self.commit_after, self.batch = pool, commit_after, None
+
+    async def complete(self, messages):
+        if self.calls:                                    # the follow-up, not the first question
+            if self.commit_after is None:
+                async with self.pool.acquire() as c:
+                    _, cutoff = await retention.db_times(c)
+                await retention.purge(self.pool, cutoff, pause_s=0)
+            else:                                         # a batch in flight: deleted, not committed yet
+                self.batch = await self.pool.acquire()
+                self.tx = self.batch.transaction()
+                await self.tx.start()
+                await forget.erase_lock(self.batch)
+                await self.batch.execute("DELETE FROM bot_requests")
+                self.commit = asyncio.create_task(self._commit())
+        return await super().complete(messages)
+
+    async def _commit(self):
+        await asyncio.sleep(self.commit_after)
+        await self.tx.commit()
+        await self.pool.release(self.batch)
+
+
+@pytest.mark.parametrize("commit_after", [None, 0.3], ids=["purged", "purging"])
+async def test_a_follow_up_is_logged_when_the_purge_deletes_its_parent_meanwhile(make_env, pool, conn, commit_after):
+    llm = _PurgingLLM(pool, commit_after=commit_after)
+    bot, _, feed = make_env(llm)
+    await feed(update("message", message(1, "нестор, кто прав?")))
+    await conn.execute("UPDATE bot_requests SET created_at = now() - interval '13 months'")
+    await feed(update("message", message(2, "а подробнее?", reply_to_message=_telegram_view(bot.sent[-1]))))
+    if commit_after is not None:
+        await llm.commit
+    # The follow-up keeps its row, without the parent that left (as ON DELETE SET NULL would leave it).
+    rows = await conn.fetch("SELECT trigger_msg_id, parent_id, status FROM bot_requests")
+    assert [tuple(r) for r in rows] == [(2, None, "ok")]
+    assert bot.reactions[-1] == (2, [])
+
+
+async def test_privacy_says_from_when_and_backup_weeks(make_env):
+    bot, _, feed = make_env()
+    await feed(update("message", message(1, "/privacy")))
+    text = bot.sent[-1]["text"]
+    assert "12 месяцев с того дня" in text and "до 5 недель" in text and "{" not in text
+    assert "не дольше суток" not in text     # the model server's history is not pruned yet: no such promise
+
+
+async def test_forget_me_strips_imported_quotes_forwards_and_names(make_env, conn):
+    bot, _, feed = make_env()
+    petya = message(1, "моё личное", uid=222)
+    petya["from"] |= {"last_name": "Петров", "username": "petya"}
+    await feed(update("message", petya))
+    # Вася forwards Петя's message from elsewhere: the row is Вася's, the words are Петя's.
+    author = {"id": 222, "is_bot": False, "first_name": "User222", "last_name": "Петров", "username": "petya"}
+    forward = message(3, "секрет Пети", uid=111, entities=[{"type": "bold", "offset": 0, "length": 6}],
+                      forward_origin={"type": "user", "date": 1_789_000_000, "sender_user": author},
+                      forward_from=author, forward_date=1_789_000_000)    # the legacy fields Telegram still sends
+    await feed(update("message", forward))
+    # ... and his photo, the words in its caption.
+    await feed(update("message", message(6, None, uid=111, photo=[{"file_id": "p", "file_unique_id": "q", "width": 1,
+                                                                    "height": 1}],
+                                         caption="секрет Пети на фото", caption_entities=[{"type": "bold", "offset": 0,
+                                                                                           "length": 6}],
+                                         forward_origin={"type": "user", "date": 1_789_000_000, "sender_user": author})))
+    # An imported forward names its author by an id.
+    origin = {"type": "user", "date": 1_789_000_000, "sender_id": 222}
+    await conn.execute(
+        "INSERT INTO messages (chat_id, message_id, user_id, sent_at, text, forward_origin, raw) "
+        "VALUES ($1, 5, 111, now(), 'ещё секрет Пети', $2, $3)", CHAT_ID, origin,
+        {"message_id": 5, "text": "ещё секрет Пети", "forward_origin": origin, "import_source": "telegram_import"})
+    # An imported reply: Telegram's export does not say who wrote the replied message.
+    await conn.execute(
+        "INSERT INTO messages (chat_id, message_id, user_id, sent_at, reply_to_id, text, raw) "
+        "VALUES ($1, 2, 111, now(), 1, 'согласен', $2)", CHAT_ID,
+        {"message_id": 2, "text": "согласен", "reply_to_message": {"message_id": 1},
+         "quote": {"text": "моё личное"}, "import_source": "telegram_import"})
+    await feed(update("message", message(4, "/forget_me", uid=222)))
+    assert bot.sent[-1]["text"].startswith("🧹 Готово: удалил из архива твои сообщения (2)")
+
+    rows = {r["message_id"]: r for r in await conn.fetch("SELECT * FROM messages WHERE message_id IN (2, 3, 5, 6)")}
+    assert "quote" not in rows[2]["raw"] and "личное" not in str(rows[2]["raw"])
+    for fwd in (rows[3], rows[5], rows[6]):
+        assert (fwd["user_id"], fwd["text"], fwd["entities"]) == (111, None, None)
+        assert fwd["forward_origin"] == {"type": "user", "sender_user": {"id": 222}}
+        assert fwd["raw"]["forward_origin"] == {"type": "user", "sender_user": {"id": 222}}
+        assert not {"text", "entities", "caption", "caption_entities", "forward_from"} & set(fwd["raw"])
+        assert "Петров" not in str(fwd["raw"]) and "секрет" not in str(fwd["raw"])
+    names = await conn.fetchrow("SELECT username, first_name, last_name, opted_out FROM users WHERE user_id = 222")
+    assert tuple(names) == (None, None, None, True)
+
+
+# ---- /status: what the watchdog saw, for the admins of the alert group ----
+
+async def _watchdog_saw(conn, *, ago: str = "1 minute") -> dict:
+    """A snapshot as nestor.watchdog publishes it: the backups missing, Hermes not looked at."""
+    now = datetime.now(UTC)
+    state = alerts.AlertState()
+    alerts.evaluate(state, [checks.result("backup", [checks.Finding("backup.missing", "crit",
+                                                                    prompts.ALERT_BACKUP_MISSING)]),
+                            checks.unknown("hermes")], now, tz=ZoneInfo("Europe/Moscow"), quiet=None)
+    snap = alerts.snapshot(state, now)
+    await conn.execute("INSERT INTO ops_state (key, value, updated_at) VALUES ('watchdog', $1, now() - $2::text::interval)",
+                       snap, ago)
+    return snap
+
+
+async def test_status_for_admin_in_alert_chat_not_archived(make_env, conn):
+    bot, llm, feed = make_env(admins={111}, alert_chat_id=CHAT_ID)
+    snap = await _watchdog_saw(conn)
+    await feed(update("message", message(1, "/status", uid=111)))
+    (sent,) = bot.sent
+    # As the watchdog renders it (python -m nestor.watchdog --dry-run prints the same).
+    assert sent["text"] == alerts.render_status(snap, datetime.now(UTC), ZoneInfo("Europe/Moscow"))
+    assert "🔴 " + prompts.ALERT_BACKUP_MISSING in sent["text"]
+    assert prompts.STATUS_UNCHECKED.format(names="Hermes") in sent["text"] and "Сторож" not in sent["text"]
+    assert (sent["parse_mode"], sent["reply_to"]) == ("HTML", 1) and llm.calls == []
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE user_id = $1", BOT_ID) == 0
+    assert await conn.fetchval("SELECT count(*) FROM bot_requests") == 0
+
+
+async def test_status_non_admin_gets_admins_only(make_env, conn):
+    bot, _, feed = make_env(admins={111}, alert_chat_id=CHAT_ID)
+    await _watchdog_saw(conn)
+    await feed(update("message", message(1, "/status", uid=222)))
+    assert [s["text"] for s in bot.sent] == [prompts.ADMINS_ONLY]
+
+
+async def test_status_elsewhere_or_unset_is_silent(make_env, conn):
+    await _watchdog_saw(conn)
+    for first, alert_chat in ((1, None), (3, -1009999999999)):
+        bot, llm, feed = make_env(admins={111}, alert_chat_id=alert_chat)
+        await feed(update("message", message(first, "/status", uid=111)))
+        await feed(update("message", message(first + 1, "/status@ewok_nestor_bot", uid=222)))
+        assert bot.sent == [] and llm.calls == []
+    assert await conn.fetchval("SELECT count(*) FROM messages") == 4      # all four were new: each one was asked
+
+
+async def test_status_stale_or_missing_snapshot(make_env, conn):
+    bot, _, feed = make_env(admins={111}, alert_chat_id=CHAT_ID)
+    await feed(update("message", message(1, "/status", uid=111)))
+    assert bot.sent[-1]["text"] == prompts.STATUS_NEVER
+    snap = await _watchdog_saw(conn, ago="20 minutes")
+    updated = await conn.fetchval("SELECT updated_at FROM ops_state WHERE key = 'watchdog'")
+    await feed(update("message", message(2, "/status", uid=111)))
+    now, msk = datetime.now(UTC), ZoneInfo("Europe/Moscow")
+    assert bot.sent[-1]["text"] == (alerts.render_status(snap, now, msk) + "\n"
+                                    + prompts.STATUS_STALE.format(time=alerts.fmt_since(updated, now, msk)))
+
+
+async def test_status_works_while_paused(make_env, conn):
+    bot, _, feed = make_env(admins={111}, alert_chat_id=CHAT_ID)
+    await _watchdog_saw(conn)
+    await feed(update("message", message(1, "/pause", uid=111)))
+    await feed(update("message", message(2, "/help", uid=111)))
+    await feed(update("message", message(3, "/status", uid=111)))
+    paused, status = bot.sent                   # /help waits for /resume, /status does not
+    assert paused["text"] == prompts.PAUSED and prompts.ALERT_BACKUP_MISSING in status["text"]
+    assert status["reply_to"] == 3
+    # Not archived while paused, the question nor the answer.
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE message_id IN (2, 3)") == 0

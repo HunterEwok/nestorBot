@@ -1,8 +1,10 @@
 """Archive writes. Every function is idempotent: replaying an update changes nothing."""
 from __future__ import annotations
 
+import dataclasses
 import json
 from enum import Enum
+from typing import Any
 
 import asyncpg
 
@@ -58,13 +60,15 @@ async def upsert_users(conn: asyncpg.Connection, users: list[UserRow]) -> None:
                 u.user_id, u.is_bot,
             )
             continue
+        # Someone who used /forget_me keeps no name here, however often others mention them.
         await conn.execute(
             """INSERT INTO users (user_id, username, first_name, last_name, is_bot)
                VALUES ($1, $2, $3, $4, $5)
                ON CONFLICT (user_id) DO UPDATE
                  SET username = EXCLUDED.username, first_name = EXCLUDED.first_name,
                      last_name = EXCLUDED.last_name, is_bot = EXCLUDED.is_bot, updated_at = now()
-                 WHERE (users.username, users.first_name, users.last_name, users.is_bot)
+                 WHERE NOT users.opted_out
+                   AND (users.username, users.first_name, users.last_name, users.is_bot)
                        IS DISTINCT FROM
                        (EXCLUDED.username, EXCLUDED.first_name, EXCLUDED.last_name, EXCLUDED.is_bot)""",
             u.user_id, u.username, u.first_name, u.last_name, u.is_bot,
@@ -101,6 +105,7 @@ async def save_message(
             "SELECT opted_out FROM users WHERE user_id = $1", msg.user_id
         ):
             return Result.OPTED_OUT
+        msg = await _without_forgotten_words(conn, msg)
 
         if msg.event == "migrate_to_chat_id":
             await conn.execute(
@@ -141,6 +146,66 @@ async def save_message(
             msg.kind, msg.file_id, msg.file_unique_id,
         )
         return Result.EDITED
+
+
+# What a forward of someone who used /forget_me does not keep (nestor.forget and migration 0008 drop the same).
+_FORWARD_WORDS = ("text", "caption", "entities", "caption_entities",
+                  "forward_from", "forward_sender_name", "forward_signature")
+
+
+def _dig(value: Any, *keys: str) -> Any:
+    for key in keys:
+        value = value.get(key) if isinstance(value, dict) else None
+    return value
+
+
+def _forward_author(origin: Any) -> Any:
+    """Who wrote a forwarded message: live updates name a `sender_user`, the importer an id."""
+    author = _dig(origin, "sender_user", "id")
+    if author is None and _dig(origin, "type") == "user":
+        author = _dig(origin, "sender_id")
+    return author
+
+
+async def _quote_of_nobody(conn: asyncpg.Connection, msg: MessageRow) -> bool:
+    """A quote is kept only beside a replied message the archive holds: /forget_me and the purge find it
+    by that message. Without it (forgotten, purged, the bot's answer scrubbed, never stored) the quote
+    goes, also when Telegram sends it again with an edit or a new reply, as migration 0008 does to what
+    was stored."""
+    if "quote" not in msg.raw:
+        return False
+    return not await conn.fetchval("SELECT EXISTS (SELECT 1 FROM messages WHERE chat_id = $1 AND message_id = $2)",
+                                   msg.chat_id, msg.reply_to_id)
+
+
+async def _replied_forward_author(conn: asyncpg.Connection, msg: MessageRow) -> Any:
+    """Who wrote the words of the replied message when it is a forward in the archive: its author,
+    not the one who forwarded it, whom the reply names."""
+    if msg.reply_to_id is None:
+        return None
+    return _forward_author(await conn.fetchval("SELECT forward_origin FROM messages WHERE chat_id = $1 AND message_id = $2",
+                                               msg.chat_id, msg.reply_to_id))
+
+
+async def _without_forgotten_words(conn: asyncpg.Connection, msg: MessageRow) -> MessageRow:
+    """Someone else's message carrying the words of a person who used /forget_me: a reply quoting
+    their message (or somebody's forward of it), or their message forwarded. The message is the
+    sender's and stays, without those words (nestor.forget does the same to what was stored before
+    the opt-out)."""
+    raw = msg.raw
+    replied = ([_dig(raw, "reply_to_message", "from", "id"), _dig(raw, "external_reply", "origin", "sender_user", "id"),
+                await _replied_forward_author(conn, msg)] if "quote" in raw else [])
+    forwarded = _forward_author(msg.forward_origin)
+    wanted = [u for u in (*replied, forwarded) if isinstance(u, int)]
+    gone = set(await conn.fetchval("SELECT array_agg(user_id) FROM users WHERE opted_out AND user_id = ANY($1::bigint[])",
+                                   wanted) or []) if wanted else set()
+    if gone & set(replied) or await _quote_of_nobody(conn, msg):
+        raw = {k: v for k, v in raw.items() if k != "quote"}
+    if forwarded in gone:
+        origin = {"type": msg.forward_origin.get("type"), "sender_user": {"id": forwarded}}
+        raw = {k: v for k, v in raw.items() if k not in _FORWARD_WORDS}
+        return dataclasses.replace(msg, text=None, entities=None, forward_origin=origin, raw=raw | {"forward_origin": origin})
+    return msg if raw is msg.raw else dataclasses.replace(msg, raw=raw)
 
 
 async def allowed_by_migration(conn: asyncpg.Connection, chat_id: int, allowed: frozenset[int]) -> bool:

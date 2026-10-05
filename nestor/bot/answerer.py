@@ -2,20 +2,23 @@
 time (FR-14), conversation continuation (FR-15), scenarios SC-1..SC-6, audit log.
 
 Besides answers, the bot speaks on its own only when someone asked for it: reminders,
-the morning digest and the wisdom of the day (started by nestor.bot.scheduler), and the
-/export file in a private chat.
+the group digest and the wisdom of the day (started by nestor.bot.scheduler), and the
+/export file in a private chat. Scheduled posts wait in a queue of their own, so they never
+hold up a group's answers.
 """
 from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
 import html
+import itertools
 import logging
 import re
 import secrets
 import time
 from dataclasses import dataclass, field
-from datetime import date, datetime, time as dtime, timedelta, timezone
+from datetime import UTC, date, datetime, time as dtime, timedelta, timezone
 from typing import Awaitable, Callable, Collection
 from zoneinfo import ZoneInfo
 
@@ -26,7 +29,9 @@ from aiogram.exceptions import (TelegramAPIError, TelegramBadRequest, TelegramFo
 from aiogram.types import (BufferedInputFile, InlineKeyboardMarkup, LinkPreviewOptions, Message, ReactionTypeEmoji,
                            ReplyParameters)
 
+from .. import forget, promises
 from ..collector.app import dump
+from ..watchdog.alerts import fmt_since, render_status
 from . import context, daily, export, markup, music, prompts, reactions, reminders, routing
 from .llm import LLM, Completion
 from .markup import TELEGRAM_LIMIT, split_text
@@ -34,8 +39,44 @@ from .triggers import BotIdentity, Invocation, detect
 
 log = logging.getLogger("nestor.answerer")
 
-ANONYMOUS_ADMIN_ID = 1087968824  # GroupAnonymousBot: an admin posting as the group
+ANONYMOUS_ADMIN_ID = 1087968824  # GroupAnonymousBot: an admin posting as the group (one of forget.SHARED_IDS)
+STATUS_STALE_AFTER = timedelta(minutes=15)     # the watchdog runs every 5 minutes
 _OFF = ("off", "выкл", "0", "нет", "no")
+_ORDER = itertools.count()      # orders requests and /forget_me commands (Answerer._overtaken)
+_ON = ("on", "вкл", "да", "yes")
+_DIGEST_DAYS = re.compile(r"(\d+)(?:\s*(?:д|дн|день|дня|дней))?")       # /digest 30, /digest 7 дней
+
+# The group digest reads DIGEST_CHUNK messages per model call at most. The digest of one day reads
+# the latest DIGEST_CHUNK of yesterday in one call, as it always did. A longer period with more is
+# cut by time into consecutive parts of at most that many: the archive model writes short notes on
+# each part, keeping the numbers of its key messages, and the digest is written from the notes.
+# Every call is its own row of bot_requests, so the daily token limit counts them all. Beyond
+# DIGEST_MAX_MESSAGES the period is thinned evenly over time (context.period_sample): 4 calls of
+# notes and the final one. The digests of all groups together take half of the day's tokens at most
+# (answers keep the rest), every call of notes included (_digest_room). Before its first call a
+# digest is measured roughly, DIGEST_CHARS_PER_TOKEN characters of the rendered messages per token
+# and DIGEST_CALL_TOKENS for each call's own prompt, answer and the agent's overhead, and thinned
+# further to fit in what is left of that half and of the day. When not even one call's worth fits
+# (DIGEST_CHUNK messages, or all when fewer), it is skipped and comes the next morning. A digest once
+# started finishes, as an answer does (the limit is soft): the tokens never stop its measured notes
+# or its final call (only /pause or /digest off do). New notes on parts that changed meanwhile were
+# not measured, so each is made only while it fits in what is left; else the attempt fails and keeps
+# its notes for a retry.
+DIGEST_CHUNK = 500
+DIGEST_MAX_MESSAGES = 2000
+DIGEST_CHARS_PER_TOKEN = 2.5
+DIGEST_CALL_TOKENS = 5000
+DIGEST_ROUNDS = 3       # rounds of notes: the first, then twice at most on the parts that changed meanwhile
+# The digests of all groups wait in one queue of their own and go one at a time: a digest read in
+# parts takes several calls and must not hold up its group's answers, and two digests never measure
+# the day's tokens at the same time. The wisdom and the news go in a queue per group (_posts), apart
+# from its answers and from the digests.
+_DIGESTS = "digests"
+_QueueKey = int | str | tuple[str, int]     # a group's answers, _DIGESTS, or _posts(chat_id)
+
+
+def _posts(chat_id: int) -> tuple[str, int]:
+    return ("posts", chat_id)
 
 
 @dataclass(frozen=True)
@@ -45,7 +86,7 @@ class AnswerConfig:
     daily_token_limit: int = 250_000    # all chats together; soft: a started answer finishes
     timeout_s: float = 120
     progress_after_s: float = 60
-    retention_months: int = 12
+    retention_months: int = promises.RETENTION_MONTHS
     tz: ZoneInfo = ZoneInfo("Europe/Moscow")
     smart_timeout_s: float = 240        # songs and the wisdom: a bigger model and several web searches
     music_daily_limit: int = 10         # songs per day, all chats together
@@ -54,12 +95,14 @@ class AnswerConfig:
     allowed_chat_ids: frozenset[int] = frozenset()   # scheduled posts go only to these chats
     wisdom_chat_ids: frozenset[int] = frozenset()    # wisdom of the day on by default; /wisdom on|off overrides
     digest_time: dtime = dtime(9, 0)
+    digest_every_days: int = 30         # DIGEST_EVERY_DAYS; a group's /digest N overrides
     wisdom_time: dtime = dtime(21, 0)
     news_chat_ids: frozenset[int] = frozenset()      # news digest on by default; /news on|off overrides
     news_time: dtime = dtime(20, 0)
     news_max_topics: int = 10
     reaction_chat_ids: frozenset[int] = frozenset()  # reactions on by default; /reactions on|off overrides
     reactions: reactions.ReactionConfig = reactions.ReactionConfig()
+    alert_chat_id: int | None = None    # ALERT_CHAT_ID: /status answers there only, to its admins; None: nowhere
 
 
 @dataclass
@@ -72,6 +115,15 @@ class Job:
     think: bool = False                 # «нестор, подумай …»: the bigger model
     seen: dict[int, int | None] = field(default_factory=dict)   # messages shown to the model: id -> author
     quoted: set[int] = field(default_factory=set)   # people whose words the answer carries besides its refs
+    # When the oldest message whose words the answer may carry entered the archive: the answer
+    # leaves the archive with it (bot_requests.oldest_source_at, nestor.retention).
+    sources_at: datetime | None = None
+    order: int = field(default_factory=lambda: next(_ORDER))   # when it was asked
+
+    def saw(self, rows=(), *, at: datetime | None = None) -> None:
+        """The answer may carry the words of these archive rows, or of something that entered the
+        archive at `at` (an earlier turn's own oldest_source_at)."""
+        self.sources_at = _oldest([self.sources_at, at, *(r["stored_at"] for r in rows)])
 
 
 @dataclass
@@ -88,6 +140,16 @@ class Outgoing:
     log_text: str | None = None         # for bot_requests.answer when the text is not plain
     markdown: bool = False
     refs: dict[int, markup.Ref] | None = None   # archive messages the answer refers to
+
+
+@dataclass
+class _DigestParts:
+    """A digest read in parts, until it is posted: daily.claim retries a failed post of the same day,
+    and the retry reads these parts again and pays only for notes on the ones that changed meanwhile."""
+    day: date
+    days: int
+    parts: list[list]           # the rows of each part, as last read
+    notes: dict[str, str] = field(default_factory=dict)     # sha256 of a rendered part -> the notes on it
 
 
 SaveOutgoing = Callable[[dict], Awaitable[object]]
@@ -110,8 +172,13 @@ class Answerer:
         self.reactor = reactions.Reactor(bot, pool, lambda: self.router.llm("react"), wanted=self._reactions_wanted,
                                          calls_today=self._reaction_calls_today, may_spend=self._may_spend_on_reactions,
                                          log_call=self._log_reaction, cfg=cfg.reactions)
-        self._queues: dict[int, asyncio.Queue[Callable[[], Awaitable[None]]]] = {}
-        self._workers: dict[int, asyncio.Task] = {}
+        # A queue per group for its answers and one for its other scheduled posts, and _DIGESTS for the
+        # digests of all groups.
+        self._queues: dict[_QueueKey, asyncio.Queue[Callable[[], Awaitable[None]]]] = {}
+        self._workers: dict[_QueueKey, asyncio.Task] = {}
+        self._posting: set[tuple[int, str]] = set()     # (chat_id, kind) of the posts queued or running
+        self._digest_parts: dict[int, _DigestParts] = {}    # by chat_id: a digest not posted yet
+        self._forgotten: dict[int, int] = {}   # user_id -> when their last /forget_me came, as Job.order
 
     # ---- entry points, called by the collector ----
 
@@ -126,7 +193,7 @@ class Answerer:
             if not paused and self._reactions_on(msg["chat"]["id"], settings):
                 self.reactor.consider(msg)
             return
-        if paused and inv.command != "resume":
+        if paused and inv.command not in ("resume", "status", "forget_me", "privacy"):   # /forget_me never waits
             return
         if inv.kind == "command":
             await self._command(msg, inv)
@@ -152,26 +219,30 @@ class Answerer:
     def submit(self, job: Job) -> None:
         self._enqueue(job.msg["chat"]["id"], functools.partial(self._answer, job))
 
-    def _enqueue(self, chat_id: int, run: Callable[[], Awaitable[None]]) -> None:
-        queue = self._queues.setdefault(chat_id, asyncio.Queue())
+    def _enqueue(self, key: _QueueKey, run: Callable[[], Awaitable[None]]) -> None:
+        """key: the chat_id of the group whose answer it is, _DIGESTS, or _posts(chat_id)."""
+        queue = self._queues.setdefault(key, asyncio.Queue())
         queue.put_nowait(run)
-        if chat_id not in self._workers or self._workers[chat_id].done():
-            self._workers[chat_id] = asyncio.create_task(self._worker(chat_id))
+        if key not in self._workers or self._workers[key].done():
+            self._workers[key] = asyncio.create_task(self._worker(key))
 
     async def drain(self) -> None:
-        """Wait until all queued jobs are done (tests, shutdown)."""
-        for queue in list(self._queues.values()):
-            await queue.join()
+        """Wait until all queued jobs are done (tests, shutdown), in queues made meanwhile too."""
+        joined = 0
+        while joined < len(self._queues):
+            joined = len(self._queues)
+            for queue in list(self._queues.values()):
+                await queue.join()
         await self.reactor.drain()
 
-    async def _worker(self, chat_id: int) -> None:
-        queue = self._queues[chat_id]
+    async def _worker(self, key: _QueueKey) -> None:
+        queue = self._queues[key]
         while not queue.empty():
             run = await queue.get()
             try:
                 await run()
-            except Exception:  # noqa: BLE001 - one failed job must not stop the chat's queue
-                log.exception("job failed", extra={"chat_id": chat_id})
+            except Exception:  # noqa: BLE001 - one failed job must not stop the queue
+                log.exception("job failed", extra={"queue": key})
             finally:
                 queue.task_done()
 
@@ -183,10 +254,13 @@ class Answerer:
         if cmd in ("help", "start"):
             await self._say(msg, prompts.HELP.format(username=self.me.username))
         elif cmd == "privacy":
-            await self._say(msg, prompts.PRIVACY.format(retention=self.cfg.retention_months))
+            await self._say(msg, prompts.PRIVACY.format(retention=promises.RETENTION_MONTHS,
+                                                        backup_weeks=promises.BACKUP_WEEKS))
+        elif cmd in ("forget_me", "export") and _shared_sender(msg):
+            await self._say(msg, prompts.PERSONAL_ONLY, save=False)
         elif cmd == "forget_me":
             count = await self.forget_user(user_id)
-            await self._say(msg, prompts.FORGOTTEN.format(count=count), save=False)
+            await self._say(msg, prompts.FORGOTTEN.format(count=count, backup_weeks=promises.BACKUP_WEEKS), save=False)
         elif cmd == "stats":
             self.submit(Job(msg, inv, "stats", "/stats"))
         elif cmd == "summary":
@@ -201,6 +275,8 @@ class Answerer:
             await self._list_reminders(msg)
         elif cmd == "unremind":
             await self._unremind(msg, inv.args)
+        elif cmd == "status":
+            await self._status(msg)
         elif cmd in ("pause", "resume", "bot_word", "digest", "wisdom", "news", "reactions"):
             if not await self._is_admin(msg):
                 await self._say(msg, prompts.ADMINS_ONLY)
@@ -222,19 +298,47 @@ class Answerer:
                 await conn.execute("UPDATE chats SET enabled = $2 WHERE chat_id = $1", chat_id, cmd == "resume")
             await self._say(msg, prompts.RESUMED if cmd == "resume" else prompts.PAUSED)
 
-    async def _toggle(self, msg: dict, key: str, args: str) -> None:
-        """/digest, /wisdom, /news, /reactions on|off; without an argument shows the current state."""
-        chat_id, arg = msg["chat"]["id"], args.strip().lower()
+    async def _status(self, msg: dict) -> None:
+        """/status: what nestor.watchdog found on its last run (its snapshot in ops_state), rendered as the
+        watchdog renders it. Only in the alert group and only for its admins; elsewhere the bot keeps quiet,
+        as if it had no such command. The answer is not archived."""
+        if self.cfg.alert_chat_id is None or msg["chat"]["id"] != self.cfg.alert_chat_id:
+            return
+        if not await self._is_admin(msg):
+            await self._say(msg, prompts.ADMINS_ONLY)
+            return
         async with self.pool.acquire() as conn:
-            if arg:
-                await conn.execute(
-                    "UPDATE chats SET settings = settings || jsonb_build_object($2::text, $3::bool) WHERE chat_id = $1",
-                    chat_id, key, arg not in _OFF)
+            row = await conn.fetchrow("SELECT value, updated_at, now() - updated_at > $1 AS stale FROM ops_state "
+                                      "WHERE key = 'watchdog'", STATUS_STALE_AFTER)
+        now = datetime.now(UTC)
+        if row is None:
+            text = prompts.STATUS_NEVER
+        else:
+            text = render_status(row["value"], now, self.cfg.tz)
+            if row["stale"]:
+                text += "\n" + prompts.STATUS_STALE.format(time=fmt_since(row["updated_at"], now, self.cfg.tz))
+        await self._say(msg, text, save=False)
+
+    async def _toggle(self, msg: dict, key: str, args: str) -> None:
+        """/digest, /wisdom, /news, /reactions on|off; without an argument shows the current state.
+        /digest N also sets the group's digest period, in days, and switches the digest on."""
+        chat_id, arg = msg["chat"]["id"], args.strip().lower()
+        change = {key: arg not in _OFF} if arg else {}
+        if key == "digest" and arg:
+            change = _digest_change(arg)
+            if change is None:      # /digest 0, /digest 91, /digest abc: nothing changes
+                await self._say(msg, prompts.DIGEST_USAGE.format(max=daily.DIGEST_MAX_DAYS))
+                return
+        async with self.pool.acquire() as conn:
+            if change:
+                await conn.execute("UPDATE chats SET settings = settings || $2::jsonb WHERE chat_id = $1",
+                                   chat_id, change)
             settings = await conn.fetchval("SELECT settings FROM chats WHERE chat_id = $1", chat_id) or {}
         if key == "digest":
-            on = bool(settings.get("digest", False))
-            text = prompts.DIGEST_STATE.format(state="включён" if on else "выключен",
-                                               time=self.cfg.digest_time.strftime("%H:%M"))
+            on, days = bool(settings.get("digest", False)), self._digest_days(settings)
+            state, when = "включён" if on else "выключен", self.cfg.digest_time.strftime("%H:%M")
+            text = (prompts.DIGEST_STATE.format(state=state, time=when) if days == 1
+                    else prompts.DIGEST_STATE_EVERY.format(state=state, every=daily.days_name(days), time=when))
         elif key == "news":
             on = self._news_on(chat_id, settings)
             text = prompts.NEWS_STATE.format(state="включена" if on else "выключена",
@@ -249,6 +353,11 @@ class Answerer:
                                                time=self.cfg.wisdom_time.strftime("%H:%M"))
         await self._say(msg, text)
 
+    def _digest_days(self, settings: dict) -> int:
+        """The group's digest period (/digest N), else DIGEST_EVERY_DAYS."""
+        value = (settings or {}).get("digest_days")
+        return value if type(value) is int and 1 <= value <= daily.DIGEST_MAX_DAYS else self.cfg.digest_every_days
+
     def _wisdom_on(self, chat_id: int, settings: dict) -> bool:
         value = (settings or {}).get("wisdom")
         return bool(value) if value is not None else chat_id in self.cfg.wisdom_chat_ids
@@ -260,6 +369,22 @@ class Answerer:
     def _reactions_on(self, chat_id: int, settings: dict) -> bool:
         value = (settings or {}).get("reactions")
         return bool(value) if value is not None else chat_id in self.cfg.reaction_chat_ids
+
+    def _post_on(self, chat_id: int, kind: str, settings: dict) -> bool:
+        """Whether the group has this scheduled post on."""
+        if kind == "digest":
+            return bool((settings or {}).get("digest"))
+        if kind == "wisdom":
+            return self._wisdom_on(chat_id, settings)
+        return self.news is not None and self._news_on(chat_id, settings)
+
+    async def _still_wanted(self, conn, chat_id: int, kind: str) -> bool:
+        """Checked when a queued post starts and before each of a digest's calls: /pause, /<kind> off or
+        a move to a supergroup since it was queued stop it."""
+        row = await conn.fetchrow("SELECT enabled, migrated_to_chat_id, settings FROM chats WHERE chat_id = $1",
+                                  chat_id)
+        return (row is not None and row["enabled"] and row["migrated_to_chat_id"] is None
+                and self._post_on(chat_id, kind, row["settings"] or {}))
 
     # ---- reactions (nestor.bot.reactions) ----
 
@@ -317,49 +442,24 @@ class Answerer:
         return member.status in ("creator", "administrator")
 
     async def forget_user(self, user_id: int) -> int:
-        """/forget_me: delete the user's messages and reminders everywhere and stop storing new ones."""
+        """/forget_me: delete the user's messages and reminders everywhere and stop storing new ones.
+        Their requests still queued or being answered store nothing of theirs either (_overtaken)."""
+        self._forgotten[user_id] = next(_ORDER)
         async with self.pool.acquire() as conn, conn.transaction():
-            await conn.execute(
-                """INSERT INTO users (user_id, opted_out) VALUES ($1, TRUE)
-                   ON CONFLICT (user_id) DO UPDATE SET opted_out = TRUE, updated_at = now()""", user_id)
-            status = await conn.execute("DELETE FROM messages WHERE user_id = $1", user_id)
-            # Quotes of their words inside other people's replies.
-            await conn.execute(
-                """UPDATE messages SET raw = raw - 'quote'
-                   WHERE raw ? 'quote' AND raw->'reply_to_message'->'from'->>'id' = $1::text""", str(user_id))
-            await conn.execute("UPDATE bot_requests SET question = NULL WHERE user_id = $1", user_id)
-            await conn.execute("DELETE FROM reminders WHERE user_id = $1", user_id)
-            await self._scrub_answers(conn, user_id)
-        return int(status.split()[-1])
+            count = await forget.forget(conn, user_id, self.me.user_id)
+        self._digest_parts.clear()      # notes kept for a retry of a digest may quote them
+        return count
+
+    def _overtaken(self, job: Job) -> bool:
+        """The asker used /forget_me after asking. forget() erased what was stored of theirs when it ran;
+        this request must not store their question or a reminder after it."""
+        return self._forgotten.get(job.msg["from"]["id"], -1) > job.order
 
     async def _scrub_answers(self, conn, user_id: int, request_id: int | None = None) -> None:
-        """The bot's answers that carried the user's words (quote-links and the rest that
-        bot_requests.quoted_user_ids records): out of the archive, and out of the conversation
-        history that goes back to the model. All of them, or one request's."""
-        for r in await conn.fetch(
-                """SELECT chat_id, answer_msg_ids FROM bot_requests
-                   WHERE $1 = ANY(quoted_user_ids) AND answer_msg_ids IS NOT NULL
-                     AND ($2::bigint IS NULL OR id = $2)""", user_id, request_id):
-            await conn.execute("DELETE FROM messages WHERE chat_id = $1 AND message_id = ANY($2::bigint[]) "
-                               "AND user_id = $3", r["chat_id"], r["answer_msg_ids"], self.me.user_id)
-            await conn.execute(
-                """UPDATE messages SET raw = raw - 'quote'
-                   WHERE chat_id = $1 AND raw ? 'quote'
-                     AND raw->'reply_to_message'->>'message_id' = ANY($2::text[])""",
-                r["chat_id"], [str(i) for i in r["answer_msg_ids"]])
-        await conn.execute("UPDATE bot_requests SET answer = NULL WHERE $1 = ANY(quoted_user_ids) "
-                           "AND ($2::bigint IS NULL OR id = $2)", user_id, request_id)
+        await forget.scrub_answers(conn, user_id, self.me.user_id, request_id)
 
     async def _scrub_if_opted_out(self, conn, request_id: int, quoted: list[int] | None) -> None:
-        """A /forget_me that came while the answer was being written: scrub the row at once.
-        The lock waits for a /forget_me in flight to finish, so neither side misses the other."""
-        if not quoted:
-            return
-        rows = await conn.fetch("SELECT user_id, opted_out FROM users WHERE user_id = ANY($1::bigint[]) FOR SHARE",
-                                quoted)
-        for r in rows:
-            if r["opted_out"]:
-                await self._scrub_answers(conn, r["user_id"], request_id)
+        await forget.scrub_if_opted_out(conn, request_id, quoted, self.me.user_id)
 
     # ---- reminders ----
 
@@ -518,25 +618,45 @@ class Answerer:
             "SELECT coalesce(sum(coalesce(input_tokens, 0) + coalesce(output_tokens, 0)), 0) "
             "FROM bot_requests WHERE created_at >= $1", self._day_start())
 
+    async def _digest_room(self, conn) -> tuple[int, int]:
+        """Today's tokens, and how many of them the digests may still spend: the digests of all groups
+        together, every call of notes and every attempt included, take half of the daily limit at most
+        (answers keep the rest), and never more than the day has left."""
+        spent, digests = await conn.fetchrow(
+            "SELECT coalesce(sum(t), 0), coalesce(sum(t) FILTER (WHERE scenario IN ('digest', 'digest_notes')), 0) "
+            "FROM (SELECT scenario, coalesce(input_tokens, 0) + coalesce(output_tokens, 0) AS t "
+            "      FROM bot_requests WHERE created_at >= $1) r", self._day_start())
+        limit = self.cfg.daily_token_limit
+        return spent, min(limit // 2 - digests, limit - spent)
+
     async def _log(self, conn, job: Job, status: str, **fields) -> int:
+        """Queued requests log holding forget.ERASE_LOCK: a /forget_me of the asker then waits for
+        this row, or this row sees that it came."""
         msg = job.msg
         return await conn.fetchval(
             """INSERT INTO bot_requests (chat_id, trigger_msg_id, user_id, thread_id, scenario, question,
                                          answer, model, input_tokens, output_tokens, latency_ms, status,
-                                         answer_msg_ids, parent_id, profile, quoted_user_ids)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING id""",
+                                         answer_msg_ids, parent_id, profile, quoted_user_ids, oldest_source_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                       (SELECT id FROM bot_requests WHERE id = $14),    -- the retention purge may have deleted it
+                       $15, $16, least(now(), coalesce($17::timestamptz, now()))) RETURNING id""",
             msg["chat"]["id"], msg["message_id"], msg["from"]["id"], msg.get("message_thread_id"),
-            job.scenario, job.question, fields.get("answer"), fields.get("model"),
+            job.scenario, None if self._overtaken(job) else job.question, fields.get("answer"), fields.get("model"),
             fields.get("input_tokens"), fields.get("output_tokens"), fields.get("latency_ms"), status,
             fields.get("answer_msg_ids"), fields.get("parent_id"), fields.get("profile"), fields.get("quoted_user_ids"),
+            fields.get("oldest_source_at"),
         )
 
     async def _answer(self, job: Job) -> None:
         msg = job.msg
+        if self._overtaken(job):        # asked, then /forget_me while it waited in the queue: dropped
+            return
         async with self.pool.acquire() as conn:
             reason = await self._limit_reason(conn, msg["from"]["id"])
             if reason:
-                await self._log(conn, job, "rate_limited")
+                async with conn.transaction():
+                    await forget.erase_lock(conn)
+                    await self._log(conn, job, "rate_limited")
         if reason:
             await self._say(msg, reason)
             return
@@ -548,6 +668,10 @@ class Answerer:
         try:
             async with self.pool.acquire() as conn:
                 parent = await self._parent(conn, job)
+                # The asker's own words may come back in the answer (a reminder repeats them).
+                job.saw(at=await context.stored_at(conn, msg["chat"]["id"], msg["message_id"]))
+            if parent is not None:      # a follow-up may repeat what the earlier turns carried
+                job.saw(at=parent["oldest_source_at"])
             fields["parent_id"] = parent["id"] if parent else None
             out = await self._produce(job, parent, ticket)
             status = out.status
@@ -568,11 +692,19 @@ class Answerer:
             await self._say(msg, prompts.ERROR)
         finally:
             fields["latency_ms"] = int((time.monotonic() - started) * 1000)
+            fields["oldest_source_at"] = job.sources_at
             async with self.pool.acquire() as conn:
                 await conn.execute("DELETE FROM request_tickets WHERE ticket = $1 OR expires_at < now()", ticket)
                 async with conn.transaction():
+                    # It may erase, and the purge may delete the parent request meanwhile: the lock
+                    # comes before the insert's row locks, and waits for a purge batch to commit. A
+                    # /forget_me of the asker or of someone quoted waits for it, or has come before it.
+                    await forget.erase_lock(conn)
                     rid = await self._log(conn, job, status, **fields)
                     await self._scrub_if_opted_out(conn, rid, fields.get("quoted_user_ids"))
+                    if self._overtaken(job):    # a reminder set while their /forget_me ran
+                        await conn.execute("DELETE FROM reminders WHERE chat_id = $1 AND request_msg_id = $2 "
+                                           "AND user_id = $3", msg["chat"]["id"], msg["message_id"], msg["from"]["id"])
             await self._react(msg, None)
         log.info("answered", extra={"chat_id": msg["chat"]["id"], "scenario": job.scenario, "status": status,
                                     "latency_ms": fields["latency_ms"], "input_tokens": fields.get("input_tokens"),
@@ -612,8 +744,9 @@ class Answerer:
                                                         timeout=self._timeout(task))
         if prompts.WEB_MARKER in completion.text:
             return _out(await self._answer_from_web(job, completion))
-        refs, authors = await self._refs(job.msg["chat"]["id"], completion.text, job.seen)
+        refs, authors, oldest = await self._refs(job.msg["chat"]["id"], completion.text, job.seen)
         job.quoted |= authors
+        job.saw(at=oldest)
         return _out(completion, refs)
 
     async def _deliver(self, msg: dict, out: Outgoing) -> list[Message | None]:
@@ -631,8 +764,8 @@ class Answerer:
             return [await self._reply(msg, part, html=True, plain=markup.to_plain(part)) for part in parts]
         return [await self._reply(msg, part) for part in split_text(out.text)]
 
-    async def _refs(self, chat_id: int, text: str,
-                    seen: dict[int, int | None] | None = None) -> tuple[dict[int, markup.Ref], set[int]]:
+    async def _refs(self, chat_id: int, text: str, seen: dict[int, int | None] | None = None
+                    ) -> tuple[dict[int, markup.Ref], set[int], datetime | None]:
         """The archive messages an answer refers to ([«…»](#id), t.me/c links, a bare #id), with
         their links, a piece of their text and their author. Deleted messages and authors who used
         /forget_me are not found, so their references stay without a link or quote. In a group
@@ -644,14 +777,18 @@ class Answerer:
 
         Also returns the authors whose words the answer carries without a usable reference, so
         that /forget_me still removes it: of such ambiguous ids, of messages gone since the prompt
-        was built (a /forget_me in flight), and of the people quoted in the bot's own answers it
-        refers to."""
+        was built (a /forget_me in flight), of the forwards it refers to (the link names who
+        forwarded them), and of the people quoted in the bot's own answers it refers to.
+
+        And when the oldest of the messages it refers to entered the archive, ambiguous ones
+        included (and for the bot's own answers, their own oldest_source_at): the answer leaves the
+        archive with them."""
         ids = markup.ref_ids(text, chat_id)
         if not ids:
-            return {}, set()
+            return {}, set(), None
         linked = markup.linked_ids(text, chat_id)
         found: dict[int, list] = {}
-        refs, authors = {}, set()
+        refs, authors, times = {}, set(), []
         async with self.pool.acquire() as conn:
             for cid in await context.chat_lineage(conn, chat_id):
                 wanted = ids if cid == chat_id else [i for i in ids if i not in linked]
@@ -659,6 +796,18 @@ class Answerer:
                     found.setdefault(r["message_id"], []).append(r)
             for mid in ids:
                 rows = found.get(mid, [])
+                for r in rows:
+                    times.append(r["stored_at"])
+                    if r["forwarded_from"] is not None:     # a forward: the words are its author's
+                        authors.add(r["forwarded_from"])
+                    # The bot's answer: whoever it quoted is quoted again, and it carries what that one did.
+                    if r["user_id"] == self.me.user_id:
+                        req = await conn.fetchrow(
+                            "SELECT quoted_user_ids, oldest_source_at FROM bot_requests "
+                            "WHERE chat_id = $1 AND $2 = ANY(answer_msg_ids)", r["chat_id"], mid)
+                        if req is not None:
+                            authors |= set(req["quoted_user_ids"] or [])
+                            times.append(req["oldest_source_at"])
                 if len(rows) == 1:
                     r = rows[0]
                     own = r["user_id"] == self.me.user_id
@@ -666,23 +815,18 @@ class Answerer:
                         context.message_link(r["chat_id"], r["message_id"], r["thread_id"], r["is_topic_message"]),
                         markup.quote(r["text"]), None if own else r["user_id"],
                         bare=seen is None or mid in seen)       # None: no prompt was built (tests, imports)
-                    if own:     # the bot's answer: whoever it quoted is quoted again
-                        authors |= set(await conn.fetchval(
-                            "SELECT quoted_user_ids FROM bot_requests WHERE chat_id = $1 AND $2 = ANY(answer_msg_ids)",
-                            r["chat_id"], mid) or [])
                 elif rows:
                     authors |= {r["user_id"] for r in rows if r["user_id"] is not None}
                 elif (seen or {}).get(mid) is not None:
                     authors.add(seen[mid])
-        return refs, authors - {self.me.user_id}
+        return refs, authors - {self.me.user_id}, _oldest(times)
 
     async def _parent(self, conn, job: Job):
         """The earlier request whose answer this message replies to, if any."""
         if job.inv.replied_to_bot is None:
             return None
         return await conn.fetchrow(
-            "SELECT id, chat_id, trigger_msg_id, question, answer, scenario, parent_id, quoted_user_ids "
-            "FROM bot_requests WHERE chat_id = $1 AND $2 = ANY(answer_msg_ids)",
+            f"SELECT {_TURN} FROM bot_requests WHERE chat_id = $1 AND $2 = ANY(answer_msg_ids)",
             job.msg["chat"]["id"], job.inv.replied_to_bot)
 
     async def _start_catchup(self, job: Job) -> str | None:
@@ -741,6 +885,8 @@ class Answerer:
             return Outgoing(prompts.FACTCHECK_HOW, html=True)
         async with self.pool.acquire() as conn:
             claim, opted_out = await self._replied_text(conn, job.msg)
+            if claim is not None:
+                job.saw(at=await context.stored_at(conn, job.msg["chat"]["id"], _reply_target(job.msg)["message_id"]))
         if claim is None:
             return Outgoing(prompts.REPLIED_OPTED_OUT if opted_out else prompts.FACTCHECK_NO_TEXT, html=True)
         job.quoted.add(_replied_author(job.msg))    # the verdict restates their claim
@@ -769,6 +915,7 @@ class Answerer:
                 if extra is None:
                     return Outgoing(prompts.REPLIED_OPTED_OUT if opted_out else prompts.MUSIC_NO_TEXT, html=True)
                 job.quoted.add(_replied_author(job.msg))
+                job.saw(at=await context.stored_at(conn, job.msg["chat"]["id"], _reply_target(job.msg)["message_id"]))
             history = await self._history(conn, job, ("music",))
         user = f"Запрос: {job.question}"
         if extra:
@@ -806,6 +953,7 @@ class Answerer:
                 rows = await context.messages_by_id(conn, b["chat_id"], [b["root"]] + members[:6] + members[-3:])
                 if rows:
                     branches.append((b, rows))
+                    job.saw(rows)       # the model names the branch from these, its name may be their words
         lines = [f"<b>{html.escape(prompts.STATS_ACTIVITY)}</b>"] + [
             f"{i}. {html.escape(context.author(r))} — {r['n']}" for i, r in enumerate(activity, 1)]
         if not branches:
@@ -877,9 +1025,9 @@ class Answerer:
             history[:0] = [{"role": "user", "content": question},
                            {"role": "assistant", "content": parent["answer"] or "(ответ удалён)"}]
             job.quoted |= set(parent["quoted_user_ids"] or [])     # a follow-up may repeat the quotes
-            parent = await conn.fetchrow(
-                "SELECT id, chat_id, trigger_msg_id, question, answer, scenario, parent_id, quoted_user_ids "
-                "FROM bot_requests WHERE id = $1", parent["parent_id"]) if parent["parent_id"] else None
+            job.saw(at=parent["oldest_source_at"])
+            parent = await conn.fetchrow(f"SELECT {_TURN} FROM bot_requests WHERE id = $1",
+                                         parent["parent_id"]) if parent["parent_id"] else None
         return history
 
     async def _complete_with_progress(self, msg: dict, prompt: list[dict], llm: LLM | None = None,
@@ -922,8 +1070,10 @@ class Answerer:
                               "username": msg["from"].get("username")})
 
         def show(rows, title: str) -> str:
-            """Rendered for the model, and remembered: these ids may be referred to."""
+            """Rendered for the model, and remembered: these ids may be referred to, these words
+            may be repeated."""
             job.seen.update({r["message_id"]: r["user_id"] for r in rows})
+            job.saw(rows)
             return context.render(rows, tz, title=title)
 
         reply = msg.get("reply_to_message") or {}
@@ -959,8 +1109,8 @@ class Answerer:
             history[:0] = [{"role": "user", "content": parent["question"] or "(вопрос удалён)"},
                            {"role": "assistant", "content": parent["answer"] or "(ответ удалён)"}]
             job.quoted |= set(parent["quoted_user_ids"] or [])     # a follow-up may repeat the quotes
-            parent = await conn.fetchrow("SELECT id, question, answer, scenario, parent_id, quoted_user_ids "
-                                         "FROM bot_requests WHERE id = $1",
+            job.saw(at=parent["oldest_source_at"])
+            parent = await conn.fetchrow(f"SELECT {_TURN} FROM bot_requests WHERE id = $1",
                                          parent["parent_id"]) if parent["parent_id"] else None
             depth += 1
 
@@ -973,7 +1123,7 @@ class Answerer:
         system = prompts.SYSTEM.format(ticket=ticket, web_marker=prompts.WEB_MARKER)
         return [{"role": "system", "content": system}, *history, {"role": "user", "content": user}]
 
-    # ---- scheduled posts: the morning digest, the wisdom of the day, the evening news ----
+    # ---- scheduled posts: the group digest, the wisdom of the day, the evening news ----
 
     async def run_daily_posts(self, now: datetime | None = None) -> None:
         """Called by the scheduler every tick: queue today's posts that are due and not made yet."""
@@ -984,27 +1134,39 @@ class Answerer:
                 "AND chat_id = ANY($1::bigint[])", list(self.cfg.allowed_chat_ids))
             for chat in chats:
                 chat_id, settings = chat["chat_id"], chat["settings"] or {}
-                due = []
-                if settings.get("digest") and local.time() >= self.cfg.digest_time:
-                    due.append("digest")
-                if self._wisdom_on(chat_id, settings) and local.time() >= self.cfg.wisdom_time:
-                    due.append("wisdom")
-                if self.news is not None and self._news_on(chat_id, settings) and local.time() >= self.cfg.news_time:
-                    due.append("news")
-                for kind in due:
+                for kind, when in (("digest", self.cfg.digest_time), ("wisdom", self.cfg.wisdom_time),
+                                   ("news", self.cfg.news_time)):
+                    if not self._post_on(chat_id, kind, settings) or local.time() < when:
+                        continue
+                    if kind == "digest" and not await daily.digest_due(conn, chat_id, local.date(),
+                                                                       self._digest_days(settings)):
+                        continue
+                    # Still queued or running here: daily.claim would take it for one that died mid-way.
+                    if (chat_id, kind) in self._posting:
+                        continue
                     post_id = await daily.claim(conn, chat_id, kind, local.date())
                     if post_id is not None:
-                        self._enqueue(chat_id, functools.partial(self._daily_post, chat_id, kind, local.date(), post_id))
+                        self._posting.add((chat_id, kind))
+                        self._enqueue(_DIGESTS if kind == "digest" else _posts(chat_id),
+                                      functools.partial(self._daily_post, chat_id, kind, local.date(), post_id))
 
     async def _daily_post(self, chat_id: int, kind: str, day: date, post_id: int) -> None:
         make = {"digest": self._digest, "wisdom": self._wisdom, "news": self._news}[kind]
         try:
-            status, fields = await make(chat_id, day)
-        except Exception as e:  # noqa: BLE001 - retried by a later tick, see daily.claim
-            log.warning("scheduled post failed", extra={"chat_id": chat_id, "kind": kind, "error": type(e).__name__})
-            status, fields = "failed", {}
-        async with self.pool.acquire() as conn:
-            await daily.finish(conn, post_id, status, **fields)
+            try:
+                async with self.pool.acquire() as conn:
+                    wanted = await self._still_wanted(conn, chat_id, kind)
+                status, fields = await make(chat_id, day) if wanted else ("skipped", {})
+            except Exception as e:  # noqa: BLE001 - retried by a later tick, see daily.claim
+                log.warning("scheduled post failed",
+                            extra={"chat_id": chat_id, "kind": kind, "error": type(e).__name__})
+                status, fields = "failed", {}
+            if kind == "digest" and status != "failed":     # notes are kept only for a retry of today's post
+                self._digest_parts.pop(chat_id, None)
+            async with self.pool.acquire() as conn:
+                await daily.finish(conn, post_id, status, **fields)
+        finally:
+            self._posting.discard((chat_id, kind))
         log.info("scheduled post", extra={"chat_id": chat_id, "kind": kind, "status": status})
 
     async def _bot_is_member(self, chat_id: int) -> bool:
@@ -1015,40 +1177,142 @@ class Answerer:
         return member.status not in ("left", "kicked")
 
     async def _digest(self, chat_id: int, day: date) -> tuple[str, dict]:
-        """Morning summary of the previous local day, by the archive model."""
+        """The group digest posted on `day`: what the chat talked about in the N local days before it
+        (/digest N, else DIGEST_EVERY_DAYS; with 1 the morning digest of yesterday), by the archive
+        model. One call when the messages fit in it, else notes on parts first (DIGEST_CHUNK). The notes
+        stay in _digest_parts while a retry of today's post may come (_daily_post drops them)."""
         if not await self._bot_is_member(chat_id):
             return "skipped", {}
-        tz = self.cfg.tz
-        yesterday = day - timedelta(days=1)
+        tz, limit = self.cfg.tz, self.cfg.daily_token_limit
         async with self.pool.acquire() as conn:
-            if await self._tokens_today(conn) >= self.cfg.daily_token_limit:
+            spent, room = await self._digest_room(conn)
+            if spent >= limit:
                 return "skipped", {}
+            chat = await conn.fetchrow("SELECT title, settings FROM chats WHERE chat_id = $1", chat_id) or {}
+            days = self._digest_days(chat.get("settings"))
+            since, until = daily.digest_bounds(day, days, tz)
             ids = await context.chat_lineage(conn, chat_id)
-            rows = await context.period_messages(conn, ids, None, datetime.combine(yesterday, dtime(0), tz), limit=500,
-                                                 until=datetime.combine(day, dtime(0), tz), humans_only=True)
-            title = await conn.fetchval("SELECT title FROM chats WHERE chat_id = $1", chat_id) or ""
+            kept = self._digest_parts.get(chat_id)      # left by a failed attempt
+            if kept is not None and (kept.day, kept.days) != (day, days):     # another day's, or another period's
+                del self._digest_parts[chat_id]
+                kept = None
+            if kept is not None:        # a retry of today's post reads the parts its first attempt read
+                rows = [r for part in kept.parts for r in part]
+            else:
+                if days == 1:           # the morning digest of yesterday as it always was: its latest messages
+                    rows = await context.period_messages(conn, ids, None, since, limit=DIGEST_CHUNK, until=until,
+                                                         humans_only=True)
+                else:
+                    rows = await context.period_sample(conn, ids, since, until, DIGEST_MAX_MESSAGES, humans_only=True)
+                fit = _digest_fit(rows, tz, room)
+                if fit == 0:            # not even one call's worth left of the digests' half: the next morning
+                    return "skipped", {}
+                if fit < len(rows):
+                    rows = await context.period_sample(conn, ids, since, until, fit, humans_only=True)
         if len(rows) < 5:
             return "skipped", {}
+        request = f"Чат «{chat.get('title') or ''}», дайджест за {daily.digest_period(day, days)}."
+        if kept is None and len(rows) <= DIGEST_CHUNK:
+            data = context.render(rows, tz, title="сообщения за вчера" if days == 1 else "сообщения за эти дни")
+        else:
+            planned = kept is None      # this attempt measured the parts: their first notes fit
+            if kept is None:
+                n = len(rows)
+                count = -(-n // DIGEST_CHUNK)
+                kept = _DigestParts(day, days, [rows[i * n // count:(i + 1) * n // count] for i in range(count)])
+                self._digest_parts[chat_id] = kept
+            noted = await self._digest_notes(chat_id, request, kept, planned)
+            if isinstance(noted, str):  # parts kept changing or did not fit: "failed"; switched off: "skipped"
+                return noted, {}
+            rows, notes = noted     # the messages as read last: a /forget_me meanwhile took some out
+            if not rows:
+                return "skipped", {}
+            data = prompts.DIGEST_NOTES_INTRO + "\n\n" + notes
+        async with self.pool.acquire() as conn:
+            if not await self._still_wanted(conn, chat_id, "digest"):
+                return "skipped", {}
         started = time.monotonic()
-        prompt = [{"role": "system", "content": prompts.DIGEST_SYSTEM},
-                  {"role": "user", "content": f"Чат «{title}», дайджест за {daily.day_name(yesterday)}.\n\n"
-                                              + context.render(rows, tz, title="сообщения за вчера")}]
+        prompt = [{"role": "system", "content": prompts.DIGEST_SYSTEM if days == 1 else prompts.DIGEST_PERIOD_SYSTEM},
+                  {"role": "user", "content": f"{request}\n\n{data}"}]
         completion = await asyncio.wait_for(self.router.llm("digest").complete(prompt), self._timeout("digest"))
-        text = prompts.DIGEST_HEADER.format(date=daily.day_name(yesterday)) + "\n\n" + completion.text
+        text = daily.digest_header(day, days) + "\n\n" + completion.text
         # Always one message, cut if the model overran its length limit: a post is then either
         # delivered whole or retried whole, never left half-sent.
-        refs, authors = await self._refs(chat_id, completion.text, {r["message_id"]: r["user_id"] for r in rows})
+        refs, authors, oldest = await self._refs(chat_id, completion.text,
+                                                 {r["message_id"]: r["user_id"] for r in rows})
         parts = markup.render(text, refs, chat_id, TELEGRAM_LIMIT - 1)
         first = parts[0] + ("…" if len(parts) > 1 else "")
         sent = await self._post(chat_id, first, html=True, plain=markup.to_plain(first))
         async with self.pool.acquire() as conn, conn.transaction():
             quoted = _quoted(refs, authors)
+            if quoted:      # it may erase: the lock comes before the insert's row locks
+                await forget.erase_lock(conn)
             rid = await self._log_scheduled(conn, chat_id, "digest", completion, [sent], started,
-                                            status="ok" if sent else "error", quoted_user_ids=quoted)
+                                            status="ok" if sent else "error", quoted_user_ids=quoted,
+                                            oldest_source_at=_oldest([oldest, *(r["stored_at"] for r in rows)]))
             await self._scrub_if_opted_out(conn, rid, quoted)
         if sent is None:
             return "failed", {}
         return "posted", {"message_id": sent.message_id}
+
+    async def _digest_notes(self, chat_id: int, request: str, kept: _DigestParts,
+                            planned: bool) -> tuple[list, str] | str:
+        """Notes by the archive model on the parts of the period (kept.parts, at most DIGEST_CHUNK
+        messages each): the messages they were written from and the notes, a block per part.
+
+        Notes carry exact quotes and names, so the digest is written from them only while they match
+        what the archive holds: each part is read again right before its call, and all of them once
+        more after the last call; a part that changed meanwhile (someone used /forget_me, a message
+        was edited, an author changed their name) gets new notes. The notes are kept by the text they
+        were written from (kept.notes), so a retry of a failed post pays only for the parts that changed
+        since. planned: this attempt measured the parts, so their first notes fit in the digests' half
+        of the day; any other notes are made only while they fit in what is left of it (_digest_room).
+        "failed" when parts still change after DIGEST_ROUNDS rounds or new notes do not fit, "skipped"
+        when the group paused or switched the digest off meanwhile."""
+        tz, count = self.cfg.tz, len(kept.parts)
+
+        def span(part: list) -> str:
+            return daily.span_name(part[0]["sent_at"].astimezone(tz).date(), part[-1]["sent_at"].astimezone(tz).date())
+
+        keys: list[str | None] = [None] * count
+        for round_ in range(DIGEST_ROUNDS):
+            wrote = False
+            for i in range(count):
+                async with self.pool.acquire() as conn:
+                    part = kept.parts[i] = await context.reread(conn, kept.parts[i])
+                    if not part:
+                        keys[i] = None
+                        continue
+                    shown = context.render(part, tz, title="сообщения")
+                    keys[i] = hashlib.sha256(shown.encode()).hexdigest()
+                    if keys[i] in kept.notes:
+                        continue
+                    if not await self._still_wanted(conn, chat_id, "digest"):
+                        return "skipped"
+                    if not (planned and round_ == 0):       # not measured: this call and the final one must fit
+                        _, room = await self._digest_room(conn)
+                        if len(shown) / DIGEST_CHARS_PER_TOKEN + 2 * DIGEST_CALL_TOKENS > room:
+                            return "failed"
+                started = time.monotonic()
+                user = f"{request} Часть {i + 1} из {count}, {span(part)}.\n\n{shown}"
+                prompt = [{"role": "system", "content": prompts.DIGEST_NOTES_SYSTEM}, {"role": "user", "content": user}]
+                notes = await asyncio.wait_for(self.router.llm("digest").complete(prompt), self._timeout("digest"))
+                async with self.pool.acquire() as conn:     # without the text: the digest made of it is what stays
+                    await self._log_scheduled(conn, chat_id, "digest_notes", notes, [], started, keep_text=False,
+                                              oldest_source_at=_oldest(r["stored_at"] for r in part))
+                kept.notes[keys[i]] = notes.text
+                wrote = True
+            if not wrote:
+                break
+        else:
+            return "failed"
+        kept.notes = {key: kept.notes[key] for key in keys if key is not None}    # not those of older texts
+        blocks = []
+        for i, part in enumerate(kept.parts):
+            if part:
+                title = f"заметки, часть {i + 1} из {count}, {span(part)}"
+                blocks.append(f"<{title}>\n{kept.notes[keys[i]] or '(заметок нет)'}\n</{title}>")
+        return [r for part in kept.parts for r in part], "\n\n".join(blocks)
 
     async def _wisdom(self, chat_id: int, day: date) -> tuple[str, dict]:
         """A real quote for today's themes. The archive model picks themes from a fixed list;
@@ -1075,8 +1339,9 @@ class Answerer:
                 log.warning("theme extraction failed", extra={"chat_id": chat_id, "error": type(e).__name__})
             else:
                 themes = daily.parse_themes(found.text)
-                async with self.pool.acquire() as conn:
-                    await self._log_scheduled(conn, chat_id, "wisdom_themes", found, [], started)
+                async with self.pool.acquire() as conn:     # the model's reply read the day's messages
+                    await self._log_scheduled(conn, chat_id, "wisdom_themes", found, [], started,
+                                              oldest_source_at=_oldest(r["stored_at"] for r in rows))
         started = time.monotonic()
         prompt = [{"role": "system", "content": prompts.WISDOM_SYSTEM},
                   {"role": "user", "content": daily.wisdom_request(themes, recent, day)}]
@@ -1153,15 +1418,19 @@ class Answerer:
 
     async def _log_scheduled(self, conn, chat_id: int, scenario: str, completion: Completion,
                              sent: list[Message | None], started: float, status: str = "ok",
-                             quoted_user_ids: list[int] | None = None) -> int:
-        """Scheduled posts have no asker; their tokens still count toward the daily limit."""
+                             quoted_user_ids: list[int] | None = None,
+                             oldest_source_at: datetime | None = None, keep_text: bool = True) -> int:
+        """Scheduled posts have no asker; their tokens still count toward the daily limit.
+        keep_text=False logs a call without its text (the digest's notes)."""
         return await conn.fetchval(
             """INSERT INTO bot_requests (chat_id, scenario, answer, model, input_tokens, output_tokens,
-                                         latency_ms, status, answer_msg_ids, profile, quoted_user_ids)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id""",
-            chat_id, scenario, completion.text, completion.model, completion.input_tokens, completion.output_tokens,
-            int((time.monotonic() - started) * 1000), status, [m.message_id for m in sent if m is not None],
-            completion.profile, quoted_user_ids)
+                                         latency_ms, status, answer_msg_ids, profile, quoted_user_ids,
+                                         oldest_source_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                       least(now(), coalesce($12::timestamptz, now()))) RETURNING id""",
+            chat_id, scenario, completion.text if keep_text else None, completion.model, completion.input_tokens,
+            completion.output_tokens, int((time.monotonic() - started) * 1000), status,
+            [m.message_id for m in sent if m is not None], completion.profile, quoted_user_ids, oldest_source_at)
 
     # ---- Telegram side ----
 
@@ -1237,6 +1506,15 @@ class Answerer:
                     pass
 
 
+# An earlier turn of a conversation, as the follow-ups read it.
+_TURN = "id, chat_id, trigger_msg_id, question, answer, scenario, parent_id, quoted_user_ids, oldest_source_at"
+
+
+def _oldest(times) -> datetime | None:
+    """The earliest of the times that are known."""
+    return min((t for t in times if t is not None), default=None)
+
+
 def _out(completion: Completion, refs: dict[int, markup.Ref] | None = None) -> Outgoing:
     """A model answer: its Markdown becomes Telegram formatting."""
     return Outgoing(completion.text or "Мне нечего ответить по этим данным.", completion, markdown=True, refs=refs)
@@ -1253,6 +1531,32 @@ def _quoted(refs: dict[int, markup.Ref] | None, more: Collection[int] = ()) -> l
     return users or None
 
 
+def _digest_fit(rows: list, tz: ZoneInfo, budget: int) -> int:
+    """How many of these messages (the digest's period, or an even sample of it) a digest may read for
+    `budget` tokens, measured roughly (DIGEST_CHARS_PER_TOKEN, DIGEST_CALL_TOKENS): one call's worth at least
+    (DIGEST_CHUNK, or all when fewer), and 0 when not even that fits."""
+    if not rows:
+        return 0
+    per_message = len(context.render(rows, tz, title="сообщения")) / len(rows) / DIGEST_CHARS_PER_TOKEN
+    if min(len(rows), DIGEST_CHUNK) * per_message + DIGEST_CALL_TOKENS > budget:
+        return 0
+    if len(rows) <= DIGEST_CHUNK:
+        return len(rows)
+    # m messages take ceil(m / DIGEST_CHUNK) calls of notes and the final one: at most m / DIGEST_CHUNK + 2.
+    fit = (budget - 2 * DIGEST_CALL_TOKENS) / (per_message + DIGEST_CALL_TOKENS / DIGEST_CHUNK)
+    return max(DIGEST_CHUNK, min(len(rows), int(fit)))
+
+
+def _digest_change(arg: str) -> dict | None:
+    """What /digest's argument changes in the chat's settings; None if it is not one."""
+    if m := _DIGEST_DAYS.fullmatch(arg):
+        days = int(m.group(1))
+        return {"digest": True, "digest_days": days} if 1 <= days <= daily.DIGEST_MAX_DAYS else None
+    if arg in _OFF or arg in _ON:
+        return {"digest": arg in _ON}
+    return None
+
+
 def _numbered(text: str, n: int) -> list[str | None]:
     """«1. тема» lines -> [тема, ...] in order; missing numbers stay None."""
     names: list[str | None] = [None] * n
@@ -1266,6 +1570,12 @@ def _numbered(text: str, n: int) -> list[str | None]:
 def _snippet(text: str | None, limit: int = 60) -> str:
     text = re.sub(r"\s+", " ", text or "").strip() or "без текста"
     return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+def _shared_sender(msg: dict) -> bool:
+    """Whether the sender is not one person: an anonymous admin, someone posting as a channel, Telegram's
+    forwards from a linked channel. Their messages share one id, so /forget_me would forget everybody's."""
+    return "sender_chat" in msg or msg["from"]["id"] in forget.SHARED_IDS or bool(msg["from"].get("is_bot"))
 
 
 def _replied_author(msg: dict) -> int | None:

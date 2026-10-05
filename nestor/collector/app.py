@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import logging
 from typing import Any, Awaitable, Callable, TypeVar
+from zoneinfo import ZoneInfo
 
 import asyncpg
 from aiogram import Bot, Dispatcher, Router
@@ -18,9 +19,11 @@ from aiogram.client.default import Default
 from aiogram.exceptions import TelegramAPIError, TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from aiogram.types import ChatMemberUpdated, Message
 
-from ..config import Settings
+from ..config import Settings, check_alert_chat
+from ..retention import Retention
 from . import store
 from .parse import parse_chat, parse_message
+from .telemetry import TelegramProbe, Telemetry
 
 log = logging.getLogger("nestor.collector")
 
@@ -196,7 +199,17 @@ async def leave(bot: Bot, chat_id: int, *, attempts: int = 6) -> None:
     log.error("leave_chat kept failing; will retry on the next update from this chat", extra={"chat_id": chat_id})
 
 
-async def make_answerer(settings: Settings, bot: Bot, pool: asyncpg.Pool, collector: Collector):
+def alert_chat(settings: Settings) -> int | None:
+    """ALERT_CHAT_ID for /status and the watch on the watchdog; None while it cannot work (a warning says why)."""
+    problem = check_alert_chat(settings)
+    if problem:
+        log.warning("/status and the watch on the watchdog are off", extra={"problem": problem})
+        return None
+    return settings.alert_chat_id
+
+
+async def make_answerer(settings: Settings, bot: Bot, pool: asyncpg.Pool, collector: Collector, *,
+                        alert_chat_id: int | None = None):
     from zoneinfo import ZoneInfo
 
     from ..bot.answerer import AnswerConfig, Answerer
@@ -211,9 +224,10 @@ async def make_answerer(settings: Settings, bot: Bot, pool: asyncpg.Pool, collec
                        music_daily_limit=settings.music_daily_limit,
                        music_player_app=settings.music_player_app, allowed_chat_ids=settings.allowed_chat_ids,
                        wisdom_chat_ids=settings.wisdom_chat_ids, digest_time=settings.digest_time,
+                       digest_every_days=settings.digest_every_days,
                        wisdom_time=settings.wisdom_time, news_chat_ids=settings.news_chat_ids,
                        news_time=settings.news_time, news_max_topics=settings.news_max_topics,
-                       reaction_chat_ids=settings.reaction_chat_ids)
+                       reaction_chat_ids=settings.reaction_chat_ids, alert_chat_id=alert_chat_id)
 
     def client(name: str, url: str | None, key: str, timeout: float, missing: str) -> HermesClient | None:
         if not url:
@@ -249,21 +263,29 @@ async def run(settings: Settings) -> None:
         log.warning("ALLOWED_CHAT_IDS is empty: the bot will leave every group it is added to")
     pool = await store.create_pool(settings.database_url)
     bot = Bot(settings.bot_token)
+    # Every call to Telegram is counted for the heartbeat the watchdog reads (nestor.collector.telemetry).
+    telemetry = Telemetry()
+    bot.session.middleware(TelegramProbe(telemetry))
     dp = Dispatcher()
     collector = Collector(settings, pool)
-    if settings.hermes_url:
-        collector.answerer = await make_answerer(settings, bot, pool, collector)
-    else:
-        log.warning("HERMES_URL is not set: archiving only, the bot will not answer")
-    dp.include_router(collector.router())
-    background: list[asyncio.Task] = []
-    if collector.answerer is not None:
-        from ..bot.scheduler import Scheduler
-
-        background.append(asyncio.create_task(Scheduler(collector.answerer).run()))
-        if collector.answerer.news is not None:
-            background.append(asyncio.create_task(collector.answerer.news.run()))
+    tz, alerts_to = ZoneInfo(settings.timezone), alert_chat(settings)
+    # The nightly purge keeps the promise of /privacy whether or not the bot answers; the heartbeat too.
+    background: list[asyncio.Task] = [
+        asyncio.create_task(Retention(pool, tz=tz, at=settings.retention_time).run()),
+        asyncio.create_task(telemetry.run(pool, bot=bot, alert_chat_id=alerts_to, tz=tz, quiet=settings.alert_quiet)),
+    ]
     try:
+        if settings.hermes_url:
+            collector.answerer = await make_answerer(settings, bot, pool, collector, alert_chat_id=alerts_to)
+        else:
+            log.warning("HERMES_URL is not set: archiving only, the bot will not answer")
+        dp.include_router(collector.router())
+        if collector.answerer is not None:
+            from ..bot.scheduler import Scheduler
+
+            background.append(asyncio.create_task(Scheduler(collector.answerer).run()))
+            if collector.answerer.news is not None:
+                background.append(asyncio.create_task(collector.answerer.news.run()))
         await dp.start_polling(bot, handle_as_tasks=False, allowed_updates=ALLOWED_UPDATES)
     finally:
         for task in background:

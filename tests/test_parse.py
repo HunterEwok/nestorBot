@@ -61,3 +61,22 @@ def test_edit_date_and_forward():
     m = parse_message(message(40, "переслано", forward_origin=origin, edit_date=1_790_000_100))
     assert m.forward_origin["sender_user"]["id"] == 555
     assert m.edited_at == datetime.fromtimestamp(1_790_000_100, timezone.utc)
+
+
+def test_external_reply_keeps_only_ids_and_drops_quote():
+    external = {"origin": {"type": "user", "date": 1_700_000_000, "sender_user": user(222, username="petya")},
+                "chat": chat(-1001000000099, title="Другая группа"), "message_id": 77,
+                "text": "секретный текст", "photo": [{"file_id": "x", "file_unique_id": "y", "width": 1, "height": 1}]}
+    m = parse_message(message(2, "ответ", external_reply=external, quote={"text": "секретный", "position": 0}))
+    assert m.raw["external_reply"] == {"message_id": 77, "chat": {"id": -1001000000099},
+                                       "origin": {"type": "user", "sender_user": {"id": 222}}}
+    assert "quote" not in m.raw and "секрет" not in str(m.raw) and "petya" not in str(m.raw)
+
+    hidden = parse_message(message(3, "ответ", external_reply={"origin": {"type": "hidden_user", "date": 1,
+                                                                          "sender_user_name": "Аноним"}}))
+    assert hidden.raw["external_reply"] == {"origin": {"type": "hidden_user"}}
+
+    # A reply in the same chat keeps its quote: the replied message tells whose words they are.
+    same = parse_message(message(4, "ответ", reply_to_message=message(1, "мой текст", uid=222),
+                                 quote={"text": "мой текст", "position": 0}))
+    assert same.raw["quote"] == {"text": "мой текст", "position": 0}

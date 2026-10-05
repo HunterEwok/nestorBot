@@ -10,15 +10,16 @@ from aiogram.enums import ChatMemberStatus
 from aiogram.exceptions import TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter
 from aiogram.methods import SendMessage
 
-from nestor.bot import markup, prompts
+from nestor import forget
+from nestor.bot import markup, prompts, reminders
 from nestor.bot.context import classify
 from nestor.bot.scheduler import Scheduler
 from nestor.mcp import tools
 
 from .factories import CHAT_ID, message, update
-from .test_answerer import BOT_ID, FakeChecker, FakeLLM, make_env_fixture  # noqa: F401 - fixture make_env
+from .test_answerer import BOT_ID, FakeChecker, FakeLLM, insert_started, make_env_fixture  # noqa: F401 - make_env
 
-TZ = ZoneInfo("Europe/Tallinn")
+TZ = ZoneInfo("Europe/Moscow")     # the answerer's default zone: local times here are its times
 SPOTIFY = "4" * 22
 SONG = json.dumps({"artist": "Кино", "title": "Группа крови",
                    "youtube": ["https://www.youtube.com/watch?v=AAAAAAAAAAA", "https://youtu.be/BBBBBBBBBBB"],
@@ -95,6 +96,34 @@ async def test_reminder_set_listed_and_sent_once(make_env, conn):
     assert await conn.fetchval("SELECT count(*) FROM messages WHERE user_id = $1 AND text LIKE '✅ Напомню%'",
                                BOT_ID) == 0
     assert llm.calls == []
+
+
+async def test_a_reminder_queued_before_forget_me_is_not_set(make_env, conn):
+    bot, _, feed = make_env(FakeLLM(delay=0.4))
+    busy = asyncio.create_task(feed(update("message", message(1, "нестор, что нового?", uid=111, date=ago()))))
+    await asyncio.sleep(0.1)                        # someone else's question is being answered
+    remind = asyncio.create_task(feed(update("message", message(2, "нестор, напомни через 2 часа позвонить маме",
+                                                                 uid=222, date=ago()))))
+    await asyncio.sleep(0.05)
+    await feed(update("message", message(3, "/forget_me", uid=222, date=ago())))
+    await asyncio.gather(busy, remind)
+    assert await conn.fetchval("SELECT count(*) FROM reminders") == 0
+    assert await conn.fetchval("SELECT count(*) FROM bot_requests WHERE user_id = 222") == 0
+    assert not any(m["text"].startswith("✅ Напомню") for m in bot.sent)
+
+
+async def test_a_reminder_written_while_forget_me_ran_goes_with_the_request(make_env, conn, monkeypatch):
+    _, _, feed = make_env()
+    create = reminders.create
+
+    async def forgotten_meanwhile(conn, **kw):      # their /forget_me commits just before the insert
+        await feed.answerer.forget_user(kw["user_id"])
+        return await create(conn, **kw)
+    monkeypatch.setattr(reminders, "create", forgotten_meanwhile)
+    await feed(update("message", message(1, "нестор, напомни через 2 часа позвонить маме", uid=222, date=ago())))
+    assert await conn.fetchval("SELECT count(*) FROM reminders") == 0
+    req = await conn.fetchrow("SELECT user_id, question, answer FROM bot_requests")
+    assert tuple(req) == (222, None, None)
 
 
 async def test_a_long_list_of_reminders_comes_in_several_messages(make_env, conn):
@@ -435,9 +464,10 @@ async def test_song_without_internet(make_env):
 
 
 # ---- the digest and the wisdom of the day ----
+# These are the digest of one day (DIGEST_EVERY_DAYS=1), as it always was; longer periods: test_digest.py.
 
 async def test_digest_is_switched_on_by_an_admin_and_posted_once(make_env, conn):
-    bot, llm, feed = make_env(FakeLLM("• отпуск: решили ехать в Грецию"), admins={111})
+    bot, llm, feed = make_env(FakeLLM("• отпуск: решили ехать в Грецию"), admins={111}, digest_every_days=1)
     await feed(update("message", message(1, "/digest on", uid=222)))
     assert bot.sent[-1]["text"] == prompts.ADMINS_ONLY
     await feed(update("message", message(2, "/digest on")))
@@ -467,7 +497,7 @@ async def test_digest_is_switched_on_by_an_admin_and_posted_once(make_env, conn)
 
 
 async def test_long_digest_is_one_message_and_a_failed_send_is_retried(make_env, conn):
-    bot, llm, feed = make_env(FakeLLM("• тема: " + "очень длинно " * 600))
+    bot, llm, feed = make_env(FakeLLM("• тема: " + "очень длинно " * 600), digest_every_days=1)
     yesterday = int(local(-1, 12).timestamp())
     for i in range(10, 16):
         await feed(update("message", message(i, f"обсуждаем отпуск {i}", uid=200 + i, date=yesterday + i)))
@@ -598,3 +628,79 @@ async def test_follow_ups_to_a_verdict_or_a_song_go_with_the_quoted_author(make_
     await feed(update("message", message(15, "/forget_me", uid=333)))
     assert await conn.fetchval("SELECT count(*) FROM messages WHERE user_id = $1 AND text LIKE '%Группа крови%'",
                                BOT_ID) == 0
+
+
+# ---- retention: what an answer carries decides when it leaves ----
+
+async def _aged(conn, message_id: int, days: int):
+    """The message entered the archive `days` ago; returns that time."""
+    return await conn.fetchval(
+        "UPDATE messages SET stored_at = now() - make_interval(days => $3) WHERE chat_id = $1 AND message_id = $2 "
+        "RETURNING stored_at", CHAT_ID, message_id, days)
+
+
+async def test_the_digest_leaves_with_the_oldest_of_yesterdays_messages(make_env, conn):
+    bot, _, feed = make_env(FakeLLM("• отпуск: решили ехать в Грецию"), digest_every_days=1)
+    yesterday = int(local(-1, 12).timestamp())
+    for i in range(10, 16):
+        await feed(update("message", message(i, f"обсуждаем отпуск {i}", uid=200 + i, date=yesterday + i)))
+    oldest = await _aged(conn, 12, 200)         # imported late: its archive time is not its Telegram date
+    await conn.execute("UPDATE chats SET settings = settings || jsonb_build_object('digest', true) WHERE chat_id = $1",
+                       CHAT_ID)
+    await feed.answerer.run_daily_posts(local(0, 9, 30))
+    await feed.answerer.drain()
+    assert bot.sent[-1]["text"].startswith("☀️ <b>Дайджест за вчера, ")
+    assert await conn.fetchval("SELECT oldest_source_at FROM bot_requests WHERE scenario = 'digest'") == oldest
+
+
+async def test_stats_leaves_with_the_oldest_message_of_the_branches_it_showed_the_model(make_env, conn):
+    bot, _, feed = make_env(FakeLLM("1. Налоги и бюджет"))
+    root = message(1, "Налоги надо снизить", uid=222, date=ago(hours=5))
+    await feed(update("message", root))
+    second = message(2, "Нет, повысить", uid=333, date=ago(hours=4), reply_to_message=root)
+    await feed(update("message", second))
+    await feed(update("message", message(3, "Почему?", uid=222, date=ago(hours=3), reply_to_message=second)))
+    oldest = await _aged(conn, 3, 5)            # it entered the archive 5 days ago; the others just now
+    await feed(update("message", message(4, "/stats", date=ago())))
+    assert "Налоги и бюджет" in bot.sent[-1]["text"]
+    assert await conn.fetchval("SELECT oldest_source_at FROM bot_requests WHERE scenario = 'stats'") == oldest
+
+
+async def test_the_digest_that_may_erase_waits_for_a_purge_batch_in_flight(make_env, pool, conn):
+    bot, _, feed = make_env(FakeLLM("• отпуск: [«обсуждаем отпуск 10»](#10)"), digest_every_days=1)
+    yesterday = int(local(-1, 12).timestamp())
+    for i in range(10, 16):
+        await feed(update("message", message(i, f"обсуждаем отпуск {i}", uid=200 + i, date=yesterday + i)))
+    await conn.execute("UPDATE chats SET settings = settings || jsonb_build_object('digest', true) WHERE chat_id = $1",
+                       CHAT_ID)
+    async with pool.acquire() as batch:
+        purging = batch.transaction()
+        await purging.start()
+        await forget.erase_lock(batch)                  # a batch in flight
+        await feed.answerer.run_daily_posts(local(0, 9, 30))
+        posting = asyncio.create_task(feed.answerer.drain())
+        await asyncio.sleep(0.5)
+        assert bot.sent[-1]["text"].startswith("☀️ <b>Дайджест за вчера, ")      # posted, not yet logged
+        assert not posting.done() and not await insert_started(conn, "bot_requests")
+        await purging.commit()
+    await posting
+    assert await conn.fetchval("SELECT quoted_user_ids FROM bot_requests WHERE scenario = 'digest'") == [210]
+
+
+async def test_a_verdict_and_a_song_leave_with_the_replied_message(make_env, conn):
+    web = FakeLLM("Неверно: https://nasa.example")
+    bot, _, feed = make_env(web=web)
+    claim = message(1, "Земля плоская, это доказано", uid=222)
+    await feed(update("message", claim))
+    claimed = await _aged(conn, 1, 300)
+    await feed(update("message", message(2, "нестор, проверь", reply_to_message=claim)))
+    assert await conn.fetchval("SELECT oldest_source_at FROM bot_requests WHERE scenario = 'factcheck'") == claimed
+
+    smart = FakeLLM('{"question": "Какую версию: студийную или концертную?"}')
+    bot, _, feed = make_env(smart=smart)
+    favourite = message(3, "обожаю «Хочешь» Земфиры", uid=333)
+    await feed(update("message", favourite))
+    loved = await _aged(conn, 3, 250)
+    await feed(update("message", message(4, "нестор, включи эту песню", reply_to_message=favourite)))
+    assert bot.sent[-1]["text"] == "Какую версию: студийную или концертную?"
+    assert await conn.fetchval("SELECT oldest_source_at FROM bot_requests WHERE scenario = 'music'") == loved

@@ -1,8 +1,9 @@
+from nestor import forget, retention
 from nestor.collector import store
 from nestor.collector.parse import parse_chat, parse_message
 from nestor.collector.store import Result
 
-from .factories import chat, message, user
+from .factories import CHAT_ID, chat, message, user
 
 
 async def save(conn, msg, *, is_edit=False):
@@ -67,3 +68,141 @@ async def test_group_to_supergroup_migration(conn):
     assert await conn.fetchval("SELECT migrated_to_chat_id FROM chats WHERE chat_id = $1", old_id) == new_id
     assert await store.allowed_by_migration(conn, new_id, allowed)
     assert not await store.allowed_by_migration(conn, -100999, allowed)
+
+
+async def test_upsert_keeps_opted_out_names_empty(conn):
+    await save(conn, message(1))
+    await conn.execute("UPDATE users SET opted_out = TRUE, username = NULL, first_name = NULL WHERE user_id = 111")
+    # Their own next message, and someone adding them back to the group, carry their name again.
+    again = message(2, "снова я") | {"from": user(111, username="petya")}
+    assert await save(conn, again) is Result.OPTED_OUT
+    added = message(3, None, uid=222, new_chat_members=[user(111, username="petya", last_name="Петров")])
+    assert await save(conn, added) is Result.INSERTED
+    row = await conn.fetchrow("SELECT username, first_name, last_name, opted_out FROM users WHERE user_id = 111")
+    assert tuple(row) == (None, None, None, True)
+
+
+async def test_new_reply_quoting_an_opted_out_author_is_stored_without_quote(conn):
+    await save(conn, message(1, "моё личное", uid=222))
+    await conn.execute("UPDATE users SET opted_out = TRUE WHERE user_id = 222")
+    reply = message(2, "согласен", uid=111, reply_to_message=message(1, "моё личное", uid=222),
+                    quote={"text": "моё личное", "position": 0})
+    assert await save(conn, reply) is Result.INSERTED
+    raw = await conn.fetchval("SELECT raw FROM messages WHERE message_id = 2")
+    assert "quote" not in raw and "личное" not in str(raw) and raw["text"] == "согласен"
+    # A quote of someone who did not opt out stays.
+    await save(conn, message(3, "мой текст", uid=333))
+    await save(conn, message(4, "да", uid=111, reply_to_message=message(3, "мой текст", uid=333),
+                             quote={"text": "мой текст", "position": 0}))
+    assert (await conn.fetchval("SELECT raw FROM messages WHERE message_id = 4"))["quote"]["text"] == "мой текст"
+
+
+async def test_forward_of_an_opted_out_author_is_stored_without_text(conn):
+    await save(conn, message(1, "до", uid=222))
+    await conn.execute("UPDATE users SET opted_out = TRUE WHERE user_id = 222")
+    origin = {"type": "user", "date": 1_700_000_000, "sender_user": user(222, last_name="Петров")}
+    # Telegram still sends the legacy fields beside forward_origin.
+    forward = message(2, "секрет Пети", uid=111, forward_origin=origin, forward_from=user(222, last_name="Петров"),
+                      entities=[{"type": "bold", "offset": 0, "length": 6}])
+    assert await save(conn, forward) is Result.INSERTED
+    row = await conn.fetchrow("SELECT user_id, text, entities, forward_origin, raw FROM messages WHERE message_id = 2")
+    assert (row["user_id"], row["text"], row["entities"]) == (111, None, None)
+    assert row["forward_origin"] == row["raw"]["forward_origin"] == {"type": "user", "sender_user": {"id": 222}}
+    assert "секрет" not in str(row["raw"]) and "Петров" not in str(row["raw"]) and "forward_from" not in row["raw"]
+
+
+async def test_imported_forward_names_its_author_by_an_id(conn):
+    await save(conn, message(1, "до", uid=222))
+    await conn.execute("UPDATE users SET opted_out = TRUE WHERE user_id = 222")
+    imported = {"type": "user", "date": 1_700_000_000, "sender_id": 222}
+    assert await save(conn, message(2, "секрет Пети", uid=111, forward_origin=imported)) is Result.INSERTED
+    # The id of a chat is not a person's, and somebody who did not opt out keeps their words.
+    await save(conn, message(3, "из канала", uid=111, forward_origin=imported | {"type": "chat"}))
+    await save(conn, message(4, "мысль Васи", uid=111, forward_origin=imported | {"sender_id": 333}))
+    rows = {r["message_id"]: r for r in await conn.fetch("SELECT message_id, text, forward_origin, raw FROM messages")}
+    assert (rows[2]["text"], rows[2]["forward_origin"]) == (None, {"type": "user", "sender_user": {"id": 222}})
+    assert "секрет" not in str(rows[2]["raw"]) and "sender_id" not in str(rows[2]["raw"])
+    assert rows[3]["text"] == "из канала" and rows[4]["text"] == "мысль Васи"
+
+
+async def test_imported_reply_keeps_its_quote_only_beside_the_message_in_the_archive(conn):
+    # Imported replies do not name the author of the replied message: the archive tells.
+    imported = {"reply_to_message": {"message_id": 10}, "import_source": "telegram_import"}
+    await save(conn, message(10, "тайна Пети", uid=222))
+    assert await save(conn, message(11, "согласен", uid=111, quote={"text": "тайна Пети"}, **imported)) is Result.INSERTED
+    assert (await conn.fetchval("SELECT raw FROM messages WHERE message_id = 11"))["quote"]["text"] == "тайна Пети"
+    # After /forget_me the replied message is not there (and its author's own are not stored again).
+    async with conn.transaction():
+        await forget.forget(conn, 222, 42)
+    assert await save(conn, message(10, "тайна Пети", uid=222)) is Result.OPTED_OUT
+    await save(conn, message(12, "согласен", uid=111, quote={"text": "тайна Пети"}, **imported))
+    # A message that was never stored (deleted in Telegram, or purged) cannot say whose words these are.
+    await save(conn, message(13, "согласен", uid=111, quote={"text": "чьё-то"},
+                             reply_to_message={"message_id": 900}, import_source="telegram_import"))
+    raws = {r["message_id"]: r["raw"] for r in await conn.fetch("SELECT message_id, raw FROM messages")}
+    assert "quote" not in raws[11] and "quote" not in raws[12] and "quote" not in raws[13]
+    assert "тайна" not in str(raws[12]) and raws[12]["text"] == "согласен"
+
+
+async def test_a_quote_of_a_forward_holds_the_words_of_its_author_not_of_the_one_who_forwarded_it(conn):
+    # Вася forwards Петя's message; Коля replies to the forward, quoting it. The reply names Вася.
+    origin = {"type": "user", "date": 1_700_000_000, "sender_user": user(222)}
+    forward = message(1, "секрет Пети целиком", uid=111, forward_origin=origin)
+    await save(conn, forward)
+    quoting = {"reply_to_message": forward, "quote": {"text": "секрет Пети", "position": 0}}
+    await save(conn, message(2, "ого", uid=333, **quoting))
+    assert (await conn.fetchval("SELECT raw FROM messages WHERE message_id = 2"))["quote"]["text"] == "секрет Пети"
+    async with conn.transaction():
+        await forget.forget(conn, 222, 42)
+    # After /forget_me neither the stored reply nor the ones that come later keep it, live or imported.
+    await save(conn, message(3, "ого", uid=333, **quoting))
+    await save(conn, message(4, "ого", uid=333, quote={"text": "секрет Пети"}, reply_to_message={"message_id": 1},
+                             import_source="telegram_import"))
+    # A forward of somebody who did not opt out keeps its quotes.
+    vasya = message(5, "мысль Васи", uid=111, forward_origin=origin | {"sender_user": user(444)})
+    await save(conn, vasya)
+    await save(conn, message(6, "да", uid=333, reply_to_message=vasya, quote={"text": "мысль", "position": 0}))
+    raws = {r["message_id"]: r["raw"] for r in await conn.fetch("SELECT message_id, raw FROM messages")}
+    for mid in (2, 3, 4):
+        assert "quote" not in raws[mid] and "секрет" not in str(raws[mid]) and raws[mid]["text"] == "ого"
+    assert raws[6]["quote"]["text"] == "мысль"
+
+
+async def test_a_quote_of_a_message_that_left_does_not_come_back(pool, conn):
+    """A quote stays only beside a replied message the archive holds: Telegram sends it again with every
+    edit of the reply, and with replies to a message the archive never had."""
+    await save(conn, message(1, "старая тайна Пети", uid=222))
+    reply = message(2, "помню", uid=111, reply_to_message=message(1, "старая тайна Пети", uid=222),
+                    quote={"text": "старая тайна", "position": 0})
+    await save(conn, reply)
+    await conn.execute("UPDATE messages SET stored_at = now() - interval '13 months' WHERE message_id = 1")
+    _, cutoff = await retention.db_times(conn)
+    await retention.purge(pool, cutoff, pause_s=0)
+    assert "quote" not in await conn.fetchval("SELECT raw FROM messages WHERE message_id = 2")
+    assert await save(conn, reply | {"text": "помню!", "edit_date": 1_790_000_060}, is_edit=True) is Result.EDITED
+    await save(conn, message(3, "и я", uid=333, reply_to_message=message(900, "чьё-то", uid=444),
+                             quote={"text": "чьё-то", "position": 0}))
+    raws = {r["message_id"]: r["raw"] for r in await conn.fetch("SELECT message_id, raw FROM messages")}
+    assert raws[2]["text"] == "помню!" and "quote" not in raws[3]
+    assert "тайна" not in str(raws) and "чьё-то" not in str(raws)
+
+
+async def test_forget_takes_the_quotes_telegram_attributes_to_them_and_their_questions(conn):
+    """Replies an older collector stored with a quote of a message the archive does not have (the author
+    named by Telegram), and what they asked the bot: /forget_me takes both, and nobody else's."""
+    await save(conn, message(100, "привет"))
+    for uid in (222, 333, 444):
+        await conn.execute("INSERT INTO users (user_id) VALUES ($1)", uid)
+    for mid, uid, replied, author in ((1, 111, 5, 222), (2, 444, 6, 333)):
+        row = parse_message(message(mid, "да", uid=uid, reply_to_message=message(replied, "тайна", uid=author),
+                                    quote={"text": "тайна", "position": 0}))
+        await conn.execute(store._INSERT_MESSAGE, *store._message_args(row))
+    for uid in (222, 333):
+        await conn.execute("INSERT INTO bot_requests (chat_id, user_id, scenario, question, status) "
+                           "VALUES ($1, $2, 'archive', $3, 'ok')", CHAT_ID, uid, f"что спросил {uid}?")
+    async with conn.transaction():
+        await forget.forget(conn, 222, 42)
+    raws = {r["message_id"]: r["raw"] for r in await conn.fetch("SELECT message_id, raw FROM messages")}
+    assert "quote" not in raws[1] and raws[2]["quote"]["text"] == "тайна"
+    questions = {r["user_id"]: r["question"] for r in await conn.fetch("SELECT user_id, question FROM bot_requests")}
+    assert questions == {222: None, 333: "что спросил 333?"}

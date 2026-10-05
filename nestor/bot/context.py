@@ -10,8 +10,9 @@ import asyncpg
 
 from . import reminders
 
+# stored_at: when the message entered the archive. An answer built on it leaves with it (nestor.retention).
 _COLUMNS = """m.chat_id, m.message_id, m.thread_id, m.is_topic_message, m.user_id, m.sent_at,
-              m.reply_to_id, m.kind, m.text, m.edited_at,
+              m.reply_to_id, m.kind, m.text, m.edited_at, m.stored_at,
               u.first_name, u.last_name, u.username, u.is_bot"""
 _FROM = "FROM messages m LEFT JOIN users u ON u.user_id = m.user_id"
 _VISIBLE = "m.kind <> 'service' AND (u.user_id IS NULL OR NOT u.opted_out)"
@@ -101,6 +102,40 @@ async def period_messages(conn, chat_ids: list[int], thread_id: int | None, sinc
     return rows[::-1]
 
 
+async def period_sample(conn, chat_ids: list[int], since: datetime, until: datetime, limit: int, *,
+                        humans_only: bool = False) -> list[asyncpg.Record]:
+    """The messages of [since, until), oldest first: all of them, or `limit` of them spread evenly
+    when there are more. Of n messages in time order the i-th is kept when i * limit / n reaches a
+    new whole number, so every stretch of the period keeps the same share of its messages: a busy
+    week keeps more than a quiet one, as it was. humans_only: without bots."""
+    return list(await conn.fetch(
+        f"""WITH period AS (
+                SELECT m.chat_id, m.message_id, (row_number() OVER (ORDER BY m.sent_at, m.message_id)) - 1 AS i,
+                       count(*) OVER () AS n
+                {_FROM}
+                WHERE m.chat_id = ANY($1::bigint[]) AND {_VISIBLE} AND m.sent_at >= $2 AND m.sent_at < $3
+                  AND (NOT $5::bool OR u.user_id IS NULL OR NOT u.is_bot)),
+            kept AS (
+                SELECT chat_id, message_id, i FROM period
+                WHERE n <= $4 OR i = 0 OR i * $4 / n > (i - 1) * $4 / n)
+            SELECT {_COLUMNS} {_FROM} JOIN kept k ON m.chat_id = k.chat_id AND m.message_id = k.message_id
+            ORDER BY k.i""",
+        chat_ids, since, until, limit, humans_only,
+    ))
+
+
+async def reread(conn, rows) -> list[asyncpg.Record]:
+    """The same messages read again, oldest first: those deleted since, or whose author used
+    /forget_me since, are gone, and forwards of their words come back blank."""
+    return list(await conn.fetch(
+        f"""SELECT {_COLUMNS} {_FROM}
+            JOIN unnest($1::bigint[], $2::bigint[]) AS k(chat_id, message_id)
+              ON m.chat_id = k.chat_id AND m.message_id = k.message_id
+            WHERE {_VISIBLE} ORDER BY m.sent_at, m.message_id""",
+        [r["chat_id"] for r in rows], [r["message_id"] for r in rows],
+    ))
+
+
 async def last_message_at(conn, chat_ids: list[int], thread_id: int | None, user_id: int, *,
                           before: datetime, exclude_id: int) -> datetime | None:
     """When the user last wrote here before the current message (for «что я пропустил»)."""
@@ -166,10 +201,22 @@ async def top_branches(conn, chat_ids: list[int], thread_id: int | None, since: 
 
 
 async def messages_by_id(conn, chat_id: int, message_ids: list[int]) -> list[asyncpg.Record]:
+    """With forwarded_from: who wrote a forwarded message's words (live forwards name a sender_user,
+    imported ones an id), whoever forwarded it."""
     return list(await conn.fetch(
-        f"""SELECT {_COLUMNS} {_FROM}
+        f"""SELECT {_COLUMNS},
+                   coalesce(m.forward_origin->'sender_user'->>'id',
+                            CASE WHEN m.forward_origin->>'type' = 'user' THEN m.forward_origin->>'sender_id' END
+                           )::bigint AS forwarded_from
+            {_FROM}
             WHERE m.chat_id = $1 AND m.message_id = ANY($2::bigint[]) AND {_VISIBLE}
             ORDER BY m.sent_at, m.message_id""", chat_id, message_ids))
+
+
+async def stored_at(conn, chat_id: int, message_id: int) -> datetime | None:
+    """When the message entered the archive; None if it is not there."""
+    return await conn.fetchval("SELECT stored_at FROM messages WHERE chat_id = $1 AND message_id = $2",
+                               chat_id, message_id)
 
 
 async def typical_length(conn, chat_ids: list[int], user_id: int, limit: int = 30) -> int | None:

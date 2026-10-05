@@ -1,12 +1,17 @@
+import asyncio
 from datetime import datetime, timezone
 
 import pytest
 
 t = pytest.importorskip("telethon.tl.types")
 
+from nestor import forget, retention
 from nestor.collector.parse import parse_message  # noqa: E402
+from nestor.collector.store import Result
+from nestor.importer.__main__ import bot_id_from, import_history, import_ranges
 from nestor.importer.convert import chat_dict, to_bot_api  # noqa: E402
 
+from .test_answerer import BOT_ID
 from .test_store import save  # noqa: E402
 
 CHANNEL = t.Channel(id=1000000001, title="Друзья", photo=t.ChatPhotoEmpty(), date=None, megagroup=True, forum=True)
@@ -17,6 +22,49 @@ WHEN = datetime(2025, 5, 1, 12, 0, tzinfo=timezone.utc)
 
 def msg(i, text="", **kw):
     return t.Message(id=i, peer_id=t.PeerChannel(1000000001), date=WHEN, message=text, **kw)
+
+
+def test_the_bot_is_told_by_its_id_and_its_token_is_not_needed():
+    assert bot_id_from({"BOT_ID": "987654321"}) == 987654321
+    assert bot_id_from({"BOT_ID": "987654321", "BOT_TOKEN": "123456:ABC..."}) == 987654321
+    assert bot_id_from({"BOT_TOKEN": "987654321:AAH-secret"}) == 987654321         # an .env from before BOT_ID
+    for env in ({}, {"BOT_TOKEN": "123456:ABC..."}, {"BOT_ID": "", "BOT_TOKEN": "123456:ABC..."}, {"BOT_ID": "x"}):
+        with pytest.raises(SystemExit, match="missing BOT_ID"):         # .env.example's placeholder is no bot
+            bot_id_from(env)
+
+
+def test_the_list_of_groups_needs_no_bot_id(monkeypatch):
+    from nestor.importer import __main__ as importer
+    listed = []
+
+    class Client:
+        def __init__(self, *args):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    async def list_groups(client, allowed):
+        listed.append(allowed)
+
+    monkeypatch.setattr(importer, "load_dotenv", lambda: None)
+    monkeypatch.setattr(importer, "setup_logging", lambda level: None)      # would take over the loggers of later tests
+    monkeypatch.setattr(importer, "TelegramClient", Client)
+    monkeypatch.setattr(importer, "list_groups", list_groups)
+    for name in ("BOT_ID", "BOT_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("TG_API_ID", "1")
+    monkeypatch.setenv("TG_API_HASH", "x")
+    monkeypatch.setenv("ALLOWED_CHAT_IDS", "-1001")
+    monkeypatch.setattr("sys.argv", ["nestor.importer", "--list"])
+    asyncio.run(importer.main())
+    assert listed == [{-1001}]
+    monkeypatch.setattr("sys.argv", ["nestor.importer"])
+    with pytest.raises(SystemExit, match="missing BOT_ID"):        # an import still needs it, before connecting
+        asyncio.run(importer.main())
 
 
 def test_chat_dict_uses_bot_api_ids():
@@ -107,3 +155,144 @@ async def test_imported_rows_respect_live_data(conn):
     rows = await conn.fetch("SELECT message_id, text FROM messages ORDER BY message_id")
     assert [(r["message_id"], r["text"]) for r in rows] == [(4, "старое"), (5, "живое")]
     assert await conn.fetchval("SELECT first_name FROM users WHERE user_id = 222") == "Петр"
+
+
+async def test_importer_resumes_after_purged_history(conn):
+    await save(conn, to_bot_api(msg(4, "старое", from_id=t.PeerUser(222)), CHAT, None))
+    assert await import_ranges(conn, CHAT["id"]) == [(4, None)]
+    # The nightly purge took everything up to #70, the imported messages with it: a new import
+    # does not bring that history back with a fresh archive date.
+    await conn.execute("DELETE FROM messages")
+    await conn.execute("INSERT INTO retention_marks (chat_id, first_message_id, message_id) VALUES ($1, 1, 70)",
+                       CHAT["id"])
+    assert await import_ranges(conn, CHAT["id"]) == [(70, None)]
+    await save(conn, to_bot_api(msg(90, "новое", from_id=t.PeerUser(222)), CHAT, None))
+    assert await import_ranges(conn, CHAT["id"]) == [(90, None)]
+
+
+async def test_importer_leaves_out_only_the_span_the_purge_took(conn):
+    await conn.execute("INSERT INTO retention_marks (chat_id, first_message_id, message_id) VALUES ($1, 100, 150)",
+                       CHAT["id"])
+    assert await import_ranges(conn, CHAT["id"]) == [(0, 100), (150, None)]      # older history was never here
+    for imported, expected in ((50, [(50, 100), (150, None)]), (99, [(150, None)]), (120, [(150, None)]),
+                               (200, [(200, None)])):
+        await conn.execute("DELETE FROM messages")
+        await save(conn, to_bot_api(msg(imported, "из истории", from_id=t.PeerUser(222)), CHAT, None))
+        assert await import_ranges(conn, CHAT["id"]) == expected
+
+
+class _History:
+    """A Telethon client for a chat that holds messages 1..last: min_id excludes the ids up to it,
+    reverse=True is oldest first."""
+
+    def __init__(self, last):
+        self.last, self.asked = last, []
+
+    async def iter_messages(self, entity, reverse, min_id):
+        self.asked.append(min_id)
+        for i in range(min_id + 1, self.last + 1):
+            yield msg(i, f"сообщение {i}", from_id=t.PeerUser(222))
+
+
+async def test_import_after_a_purge_of_live_rows_loads_the_history_before_them_not_the_purged_span(pool, conn):
+    await conn.execute("INSERT INTO chats (chat_id, type) VALUES ($1, 'supergroup')", CHAT["id"])
+    await conn.execute("INSERT INTO users (user_id, first_name) VALUES (222, 'Петя')")
+    # The bot collected this chat from #100 on and nothing was ever imported; its first 13 months have left.
+    await conn.execute(
+        """INSERT INTO messages (chat_id, message_id, user_id, sent_at, text, raw, stored_at)
+           SELECT $1, g, 222, now(), 'x', '{}', now() - CASE WHEN g <= 150 THEN interval '13 months'
+                                                                ELSE interval '1 month' END
+           FROM generate_series(100, 160) g""", CHAT["id"])
+    _, cutoff = await retention.db_times(conn)
+    assert (await retention.purge(pool, cutoff, pause_s=0))["messages"] == 51
+    client = _History(170)
+    assert await import_history(client, pool, None, CHAT, bot_id=BOT_ID) == 99 + 10
+    assert client.asked == [0, 150]
+    ids = {r["message_id"] for r in await conn.fetch("SELECT message_id FROM messages")}
+    assert ids == set(range(1, 100)) | set(range(151, 171))
+    assert await import_history(_History(170), pool, None, CHAT, bot_id=BOT_ID) == 0       # and a second run finds nothing new
+
+
+async def test_import_after_a_purge_by_archive_time_leaves_out_the_whole_span_of_ids(pool, conn):
+    await conn.execute("INSERT INTO chats (chat_id, type) VALUES ($1, 'supergroup')", CHAT["id"])
+    await conn.execute("INSERT INTO users (user_id, first_name) VALUES (222, 'Петя')")
+    # Live #9 entered the archive a month before history up to #3 was imported: the purge goes by that
+    # time, so #9 leaves first and #3 after it, one batch each. The mark must keep #9.
+    await conn.execute(
+        """INSERT INTO messages (chat_id, message_id, user_id, sent_at, text, raw, stored_at)
+           VALUES ($1, 9, 222, now(), 'x', '{}', now() - interval '14 months'),
+                  ($1, 3, 222, now(), 'x', '{}', now() - interval '13 months')""", CHAT["id"])
+    _, cutoff = await retention.db_times(conn)
+    assert (await retention.purge(pool, cutoff, batch=1, pause_s=0))["messages"] == 2
+    assert await import_ranges(conn, CHAT["id"]) == [(0, 3), (9, None)]
+    client = _History(12)
+    assert await import_history(client, pool, None, CHAT, bot_id=BOT_ID) == 2 + 3
+    assert client.asked == [0, 9]
+    ids = {r["message_id"] for r in await conn.fetch("SELECT message_id FROM messages")}
+    assert ids == {1, 2, 10, 11, 12}
+
+
+class _Chat:
+    """A Telethon client for a chat that holds these messages: min_id excludes the ids up to it, oldest first."""
+
+    def __init__(self, *messages):
+        self.messages = sorted(messages, key=lambda m: m.id)
+
+    async def iter_messages(self, entity, reverse, min_id):
+        for m in self.messages:
+            if m.id > min_id:
+                yield m
+
+
+async def test_the_bots_own_messages_are_not_imported_so_what_left_the_archive_stays_out(pool, conn):
+    # An importer that took everything stored the bot's answers: #11 quoted Петя, #20 was built on messages
+    # that entered the archive 13 months ago. /forget_me and the nightly purge take them out.
+    await conn.execute("INSERT INTO users (user_id, first_name, is_bot) VALUES ($1, 'Нестор', TRUE)", BOT_ID)
+    for m in (msg(10, "секрет Пети", from_id=t.PeerUser(222)), msg(11, "Петя писал: секрет", from_id=t.PeerUser(BOT_ID)),
+              msg(20, "по старым сообщениям", from_id=t.PeerUser(BOT_ID))):
+        await save(conn, to_bot_api(m, CHAT, None))
+    await conn.execute("UPDATE messages SET stored_at = now() - interval '1 month'")
+    await conn.execute(
+        """INSERT INTO bot_requests (chat_id, user_id, scenario, answer, status, answer_msg_ids, quoted_user_ids,
+                                     oldest_source_at)
+           VALUES ($1, 111, 'other', 'Петя писал', 'ok', '{11}', '{222}', now() - interval '1 month'),
+                  ($1, 111, 'other', 'по старым', 'ok', '{20}', NULL, now() - interval '13 months')""", CHAT["id"])
+    async with conn.transaction():
+        await forget.forget(conn, 222, BOT_ID)
+    _, cutoff = await retention.db_times(conn)
+    assert (await retention.purge(pool, cutoff, pause_s=0))["answer_messages"] == 1
+    assert await conn.fetchval("SELECT count(*) FROM messages") == 0
+    # An import after them (README: after every restore) reads those answers in Telegram again: they stay out.
+    bot = t.PeerUser(BOT_ID)
+    client = _Chat(msg(10, "секрет Пети", from_id=t.PeerUser(222)), msg(11, "Петя писал: секрет", from_id=bot),
+                   msg(12, "спасибо", from_id=t.PeerUser(111)), msg(20, "по старым сообщениям", from_id=bot),
+                   msg(21, "ещё вопрос", from_id=t.PeerUser(111)))
+    assert await import_history(client, pool, None, CHAT, bot_id=BOT_ID) == 2
+    assert {r["message_id"] for r in await conn.fetch("SELECT message_id FROM messages")} == {12, 21}
+
+
+async def test_imported_forward_of_an_opted_out_author_is_stored_without_text(conn):
+    async with conn.transaction():
+        await forget.forget(conn, 222, 42)
+    forward = msg(2, "секрет Пети", from_id=t.PeerUser(111), entities=[t.MessageEntityBold(0, 6)],
+                  fwd_from=t.MessageFwdHeader(date=WHEN, from_id=t.PeerUser(222)))
+    assert await save(conn, to_bot_api(forward, CHAT, None)) is Result.INSERTED
+    other = msg(3, "мысль Васи", from_id=t.PeerUser(111), fwd_from=t.MessageFwdHeader(date=WHEN, from_id=t.PeerUser(333)))
+    await save(conn, to_bot_api(other, CHAT, None))
+    rows = {r["message_id"]: r for r in await conn.fetch("SELECT message_id, user_id, text, entities, forward_origin, raw "
+                                                         "FROM messages")}
+    assert (rows[2]["user_id"], rows[2]["text"], rows[2]["entities"]) == (111, None, None)
+    assert rows[2]["forward_origin"] == rows[2]["raw"]["forward_origin"] == {"type": "user", "sender_user": {"id": 222}}
+    assert "секрет" not in str(rows[2]["raw"])
+    assert rows[3]["text"] == "мысль Васи"
+
+
+async def test_imported_reply_quoting_a_forgotten_message_is_stored_without_quote(conn):
+    # Петя's #10 comes later in the history than his /forget_me: it is not stored, nor is the quote of it.
+    async with conn.transaction():
+        await forget.forget(conn, 222, 42)
+    assert await save(conn, to_bot_api(msg(10, "моё личное", from_id=t.PeerUser(222)), CHAT, None)) is Result.OPTED_OUT
+    quoting = t.MessageReplyHeader(reply_to_msg_id=10, quote_text="моё личное")
+    await save(conn, to_bot_api(msg(11, "согласен", from_id=t.PeerUser(111), reply_to=quoting), CHAT, None))
+    raw = await conn.fetchval("SELECT raw FROM messages WHERE message_id = 11")
+    assert "quote" not in raw and "личное" not in str(raw) and raw["text"] == "согласен"

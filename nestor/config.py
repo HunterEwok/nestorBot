@@ -4,6 +4,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import time
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 
@@ -40,6 +41,8 @@ class Settings:
     wisdom_chat_ids: frozenset[int] = frozenset()
     wisdom_time: time = time(21, 0)
     digest_time: time = time(9, 0)      # the digest itself is switched on by group admins: /digest on
+    # The digest comes once every this many days and retells them; /digest N sets a group's own period.
+    digest_every_days: int = 30
     # Groups with the evening news digest; group admins can switch it with /news on|off.
     news_chat_ids: frozenset[int] = frozenset()
     news_time: time = time(20, 0)
@@ -53,6 +56,15 @@ class Settings:
     rate_window_min: int = 10
     daily_token_limit: int = 250_000
     timezone: str = "Europe/Moscow"
+    # The nightly purge of what entered the archive more than 12 months ago (nestor.retention), local time.
+    retention_time: time = time(3, 30)
+    # Alerts of nestor.watchdog go to this group (it must be in ALLOWED_CHAT_IDS); None: no alerts.
+    alert_chat_id: int | None = None
+    alert_daily_at: time | None = time(9, 30)           # the silent daily summary, local time; None: off
+    alert_quiet: tuple[time, time] | None = (time(23), time(8))   # alerts arrive without sound; None: never quiet
+    alert_disk_min_gb: int = 5          # free space on the Pi's card below this is a warning
+    alert_max_members: int = 2          # the alert group with more members (the bot counts) gets no summary
+    backup_status_file: str = ""        # nestor.backup's status.json; empty: backups are not watched
 
 
 _COMMENT = re.compile(r"(?:^|\s)#.*\Z", re.S)
@@ -84,6 +96,56 @@ def _parse_time(name: str, default: str) -> time:
         raise SystemExit(f"{name} must look like 21:00, got {value!r}") from None
 
 
+_OFF = ("off", "выкл", "0", "нет", "no")      # as the group commands take it
+
+
+def _parse_id(name: str) -> int | None:
+    value = _env(name)
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        raise SystemExit(f"{name} must be a chat id like -1001234567890, got {value!r}") from None
+
+
+def _parse_optional_time(name: str, default: str) -> time | None:
+    """A local time, or None for off (off, выкл, 0, нет, no)."""
+    if _env(name, default).lower() in _OFF:
+        return None
+    return _parse_time(name, default)
+
+
+def _parse_quiet(name: str, default: str) -> tuple[time, time] | None:
+    """HH:MM-HH:MM (it may cross midnight), or None for off."""
+    value = _env(name, default)
+    if value.lower() in _OFF:
+        return None
+    try:
+        start, end = (time.fromisoformat(part.strip()) for part in value.split("-"))
+    except ValueError:
+        raise SystemExit(f"{name} must look like 23:00-08:00 or off, got {value!r}") from None
+    if start == end:
+        raise SystemExit(f"{name} must look like 23:00-08:00 or off, got {value!r}")
+    return start, end
+
+
+def check_alert_chat(settings: Settings) -> str | None:
+    """Why ALERT_CHAT_ID cannot work, or None. The bot leaves every group not in ALLOWED_CHAT_IDS."""
+    if settings.alert_chat_id is not None and settings.alert_chat_id not in settings.allowed_chat_ids:
+        return "ALERT_CHAT_ID must be one of ALLOWED_CHAT_IDS: the bot leaves every other group"
+    return None
+
+
+def _timezone() -> str:
+    value = _env("TIMEZONE", "Europe/Moscow")
+    try:
+        ZoneInfo(value)
+    except (ZoneInfoNotFoundError, ValueError, OSError):   # unknown name, a path, a directory
+        raise SystemExit(f"TIMEZONE must be an IANA name like Europe/Moscow, got {value!r}") from None
+    return value
+
+
 def _routes() -> dict[str, str]:
     from .bot.routing import parse_routes
 
@@ -100,6 +162,15 @@ def _channels() -> tuple[str, ...]:
         return parse_channels(_env("NEWS_TELEGRAM_CHANNELS", "psychedelicsocietyvienna"))
     except ValueError as e:
         raise SystemExit(f"NEWS_TELEGRAM_CHANNELS: {e}") from None
+
+
+def _digest_every_days() -> int:
+    from .bot.daily import DIGEST_MAX_DAYS
+
+    value = _int("DIGEST_EVERY_DAYS", 30)
+    if not 1 <= value <= DIGEST_MAX_DAYS:
+        raise SystemExit(f"DIGEST_EVERY_DAYS must be a number of days from 1 to {DIGEST_MAX_DAYS}, got {value}")
+    return value
 
 
 def _player_app() -> str:
@@ -134,6 +205,7 @@ def load_settings() -> Settings:
             wisdom_chat_ids=_parse_ids(_env("WISDOM_CHAT_IDS")),
             wisdom_time=_parse_time("WISDOM_TIME", "21:00"),
             digest_time=_parse_time("DIGEST_TIME", "09:00"),
+            digest_every_days=_digest_every_days(),
             news_chat_ids=_parse_ids(_env("NEWS_CHAT_IDS")),
             news_time=_parse_time("NEWS_TIME", "20:00"),
             news_max_topics=_int("NEWS_MAX_TOPICS", 10),
@@ -145,7 +217,14 @@ def load_settings() -> Settings:
             rate_limit=_int("RATE_LIMIT_PER_USER", 5),
             rate_window_min=_int("RATE_LIMIT_WINDOW_MIN", 10),
             daily_token_limit=_int("DAILY_TOKEN_LIMIT", 250_000),
-            timezone=_env("TIMEZONE", "Europe/Moscow"),
+            timezone=_timezone(),
+            retention_time=_parse_time("RETENTION_TIME", "03:30"),
+            alert_chat_id=_parse_id("ALERT_CHAT_ID"),
+            alert_daily_at=_parse_optional_time("ALERT_DAILY_AT", "09:30"),
+            alert_quiet=_parse_quiet("ALERT_QUIET", "23:00-08:00"),
+            alert_disk_min_gb=_int("ALERT_DISK_MIN_GB", 5),
+            alert_max_members=_int("ALERT_MAX_MEMBERS", 2),
+            backup_status_file=_env("BACKUP_STATUS_FILE"),
         )
     except KeyError as e:
         raise SystemExit(f"missing required environment variable {e.args[0]}") from None

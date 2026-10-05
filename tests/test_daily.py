@@ -1,6 +1,8 @@
-"""Themes and the wisdom of the day: what may leave for the web model, and what may be posted."""
+"""Themes and the wisdom of the day: what may leave for the web model, and what may be posted.
+The digest's period: its bounds and its name."""
 import json
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -59,3 +61,35 @@ def test_wisdom_request_carries_only_themes_and_recent_quotes():
     assert text.splitlines() == ["Дата: 3 октября 2026.", "Темы сегодняшних разговоров: деньги, работа.",
                                  "Недавние цитаты, их не повторять:", "- Франклин: «Время — деньги.»"]
     assert "выбери тему сам" in daily.wisdom_request([], [], date(2026, 10, 3))
+
+
+def test_the_digest_names_its_period():
+    day = date(2026, 10, 5)
+    assert daily.digest_period(day, 1) == "4 октября"
+    assert daily.digest_header(day, 1) == "☀️ **Дайджест за вчера, 4 октября**"     # as it always was
+    assert daily.digest_period(day, 30) == "30 дней, 5 сентября — 4 октября"
+    assert daily.digest_header(day, 30) == "☀️ **Дайджест за 30 дней, 5 сентября — 4 октября**"
+    assert daily.digest_period(day, 21) == "21 день, 14 сентября — 4 октября"
+    assert daily.digest_period(day, 2) == "2 дня, 3 октября — 4 октября"
+    assert daily.digest_period(date(2027, 1, 3), 7) == "7 дней, 27 декабря — 2 января"
+    assert daily.digest_period(date(2027, 3, 1), 90) == "90 дней, 1 декабря — 28 февраля"
+
+
+def test_the_digest_period_runs_from_local_midnight_to_local_midnight():
+    moscow, berlin = ZoneInfo("Europe/Moscow"), ZoneInfo("Europe/Berlin")
+
+    def utc(bounds):
+        return tuple(t.astimezone(UTC) for t in bounds)
+
+    assert utc(daily.digest_bounds(date(2026, 10, 5), 30, moscow)) == (
+        datetime(2026, 9, 4, 21, tzinfo=UTC), datetime(2026, 10, 4, 21, tzinfo=UTC))
+    # A zone with clock changes: the day the clocks go back has 25 hours, the one they go forward 23.
+    since, until = daily.digest_bounds(date(2026, 10, 26), 1, berlin)
+    assert (since.utcoffset(), until.utcoffset()) == (timedelta(hours=2), timedelta(hours=1))
+    assert utc((since, until)) == (datetime(2026, 10, 24, 22, tzinfo=UTC),
+                                   datetime(2026, 10, 25, 23, tzinfo=UTC))
+    since, until = utc(daily.digest_bounds(date(2026, 3, 30), 1, berlin))
+    assert until - since == timedelta(hours=23)
+    since, until = utc(daily.digest_bounds(date(2026, 11, 10), 30, berlin))
+    assert (since.astimezone(berlin).hour, until.astimezone(berlin).hour) == (0, 0)
+    assert until - since == timedelta(days=30, hours=1)

@@ -16,6 +16,9 @@ ExecStartPre=/opt/nestor/.venv/bin/python -m nestor.migrate
 ExecStart=/opt/nestor/.venv/bin/python -m nestor.collector
 Restart=always
 RestartSec=10
+# Migrations run before the start: a long backfill, or 30 s waiting for a table lock (nestor.migrate),
+# must not be cut by the default 90 s.
+TimeoutStartSec=5min
 # Logs go to journald (JSON, no message text); retention: deploy/journald/nestor.conf.
 NoNewPrivileges=yes
 ProtectSystem=strict

@@ -12,7 +12,7 @@ from .factories import CHAT_ID, message, update
 from .test_answerer import BOT_ID, FakeLLM, make_env_fixture  # noqa: F401 - fixture make_env
 from .test_news_pipeline import FakeAdapter, ScriptedLLM, item, keep_all, make_service
 
-TZ = ZoneInfo("Europe/Tallinn")
+TZ = ZoneInfo("Europe/Moscow")     # the answerer's default zone: local times here are its times
 
 
 def ago(**delta) -> int:
