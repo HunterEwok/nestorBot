@@ -95,6 +95,13 @@ UPDATE messages r SET raw = r.raw - 'quote'
 FROM users u
 WHERE u.opted_out AND r.raw ? 'quote' AND r.raw->'reply_to_message'->'from'->>'id' = u.user_id::text;
 
+-- Quotes in replies to forwards of opted-out authors: the forward is somebody else's row, the words are theirs.
+UPDATE messages r SET raw = r.raw - 'quote'
+FROM messages f, users u
+WHERE u.opted_out AND r.raw ? 'quote' AND f.chat_id = r.chat_id AND f.message_id = r.reply_to_id
+  AND coalesce(f.forward_origin->'sender_user'->>'id',
+               CASE WHEN f.forward_origin->>'type' = 'user' THEN f.forward_origin->>'sender_id' END) = u.user_id::text;
+
 -- Imported replies carry no author of the replied message: when that message is not in the
 -- archive (possibly forgotten), its quote cannot be attributed and goes.
 UPDATE messages r SET raw = r.raw - 'quote'

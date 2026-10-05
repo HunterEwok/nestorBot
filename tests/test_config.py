@@ -2,9 +2,8 @@
 import asyncio
 import json
 import logging
-import re
 from dataclasses import fields
-from datetime import time
+from datetime import UTC, datetime, time
 from pathlib import Path
 
 import pytest
@@ -214,8 +213,18 @@ def test_the_watchdog_test_and_dry_run_say_what_they_did(env, tmp_path, capsys):
     assert sent == "🚨 Нестор: проблема\n🟠 Мало места\n" and len(bot.sent) == 1
 
 
+class _LateEvening(datetime):
+    """23:30 in Moscow: an hour's mute ends tomorrow."""
+
+    @classmethod
+    def now(cls, tz=None):
+        return datetime(2026, 10, 5, 20, 30, tzinfo=UTC).astimezone(tz)
+
+
 def test_the_watchdog_mute_from_the_command_line(env, tmp_path, capsys):
     env.setattr(watchdog_main, "setup_logging", lambda level: None)
+    for module in (watchdog_main, run):
+        env.setattr(module, "datetime", _LateEvening)
     env.setenv("STATE_DIRECTORY", str(tmp_path))
     env.setenv("RUNTIME_DIRECTORY", str(tmp_path / "run"))
     env.setenv("ALLOWED_CHAT_IDS", "-1001111111111")
@@ -228,8 +237,8 @@ def test_the_watchdog_mute_from_the_command_line(env, tmp_path, capsys):
     path, in_memory = tmp_path / run.STATE_FILE, tmp_path / "run" / run.STATE_FILE
     in_memory.parent.mkdir()
     assert watchdog_main.main(["--mute", "60"]) == 0
-    assert re.fullmatch(r"muted until \d\d:\d\d\n", capsys.readouterr().out)
-    assert alerts.load_state(path).mute_until is not None
+    assert capsys.readouterr().out == "muted until 6 октября 00:30\n"
+    assert alerts.load_state(path).mute_until == datetime(2026, 10, 5, 21, 30, tzinfo=UTC)
     assert alerts.load_state(in_memory).mute_until == alerts.load_state(path).mute_until
     # 0 ends it: it unmutes, and runs nothing.
     assert watchdog_main.main(["--mute", "0"]) == 0 and capsys.readouterr().out == "unmuted\n"
@@ -240,6 +249,22 @@ def test_the_watchdog_mute_from_the_command_line(env, tmp_path, capsys):
         watchdog_main.main(["--mute", "60"])
     assert str(refused.value) == f"cannot write the watchdog state in {tmp_path}: IsADirectoryError"
     assert alerts.load_state(path).mute_until is None and alerts.load_state(in_memory).mute_until is None
+
+
+def test_a_watchdog_run_while_another_holds_the_state_is_not_a_failure(env, tmp_path, caplog):
+    env.setattr(watchdog_main, "setup_logging", lambda level: None)
+    env.setenv("STATE_DIRECTORY", str(tmp_path))
+    env.setenv("ALLOWED_CHAT_IDS", "-1001111111111")
+    env.setenv("ALERT_CHAT_ID", "-1001111111111")
+    env.setattr(watchdog_main, "Bot", lambda token: AlertBot())
+
+    async def busy(settings, **kw):
+        raise run.Busy
+
+    env.setattr(watchdog_main, "run_once", busy)
+    with caplog.at_level(logging.INFO, logger="nestor.watchdog"):
+        assert watchdog_main.main([]) == 0
+    assert "watchdog already running" in caplog.text
 
 
 def test_the_watchdog_unit_keeps_its_state_where_the_code_looks():

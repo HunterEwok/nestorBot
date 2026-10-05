@@ -167,8 +167,14 @@ async def top_branches(conn, chat_ids: list[int], thread_id: int | None, since: 
 
 
 async def messages_by_id(conn, chat_id: int, message_ids: list[int]) -> list[asyncpg.Record]:
+    """With forwarded_from: who wrote a forwarded message's words (live forwards name a sender_user,
+    imported ones an id), whoever forwarded it."""
     return list(await conn.fetch(
-        f"""SELECT {_COLUMNS} {_FROM}
+        f"""SELECT {_COLUMNS},
+                   coalesce(m.forward_origin->'sender_user'->>'id',
+                            CASE WHEN m.forward_origin->>'type' = 'user' THEN m.forward_origin->>'sender_id' END
+                           )::bigint AS forwarded_from
+            {_FROM}
             WHERE m.chat_id = $1 AND m.message_id = ANY($2::bigint[]) AND {_VISIBLE}
             ORDER BY m.sent_at, m.message_id""", chat_id, message_ids))
 

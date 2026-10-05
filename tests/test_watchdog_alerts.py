@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 from nestor.bot import prompts
 from nestor.watchdog import alerts
 from nestor.watchdog import run as run_mod
-from nestor.watchdog.checks import Event, Finding, result, unknown
+from nestor.watchdog.checks import Event, Finding, broken, result, unknown
 
 MSK = ZoneInfo("Europe/Moscow")
 QUIET = (time(23), time(8))
@@ -209,6 +209,70 @@ def test_a_warning_that_turns_critical_at_night_rings_an_hour_later():
     adopted = alerts.adopt(alerts.AlertState(), snap)
     assert adopted.problems["disk.low:/"].rung and adopted.problems["disk.low:/"].crit_since == at(120, evening)
     assert run(adopted, disk("crit"), when=at(605, evening)) is None
+
+
+def test_a_crit_said_without_sound_at_the_end_of_the_night_rings_in_the_morning():
+    dawn = datetime(2026, 10, 5, 7, 30, tzinfo=MSK)                     # the database goes down at 07:30
+    state = alerts.AlertState()
+    minutes = range(0, 24 * 60, 5)
+    outs = [run(state, db(True), when=at(m, dawn)) for m in minutes]
+    said = [(at(m, dawn).strftime("%H:%M"), o.silent) for m, o in zip(minutes, outs, strict=True) if o is not None]
+    assert said == [("07:35", True), ("08:00", False)]                  # once by day, not again at 23:00
+    # The same when a mute ends before the quiet hours do.
+    state = alerts.AlertState(mute_until=at(10, dawn))
+    minutes = range(-10, 120, 5)
+    outs = [run(state, db(True), when=at(m, dawn)) for m in minutes]
+    said = [(at(m, dawn).strftime("%H:%M"), o.silent) for m, o in zip(minutes, outs, strict=True) if o is not None]
+    assert said == [("07:40", True), ("08:00", False)]
+
+
+def test_a_problem_that_is_over_when_telegram_is_back_is_not_announced():
+    # The router is down 02:30-04:30: the database with it, and every message the watchdog sends.
+    night = datetime(2026, 10, 6, 2, 30, tzinfo=MSK)
+    state = alerts.AlertState()
+    for m in range(0, 120, 5):
+        alerts.evaluate(state, [db(True)], at(m, night), tz=MSK, quiet=QUIET)    # nothing is delivered
+    assert [i.get("force") for i in state.outbox] == [True]                     # it would have rung at 03:30
+    assert run(state, db(False), when=at(120, night)) is None                    # back: not «проблема», loud
+    out = run(state, db(False), when=at(125, night))
+    assert out.text == f"{prompts.ALERT_RESOLVED}\n• Было: База недоступна (02:30–04:35)" and out.silent
+    # By day the same: a revoked token is fixed, its alert never went out.
+    state = alerts.AlertState()
+    token = result("heartbeat", [Finding("telegram.polling", "crit", "Токен бота отозван", clear=2)])
+    for m in (0, 5, 10):
+        alerts.evaluate(state, [token], at(m), tz=MSK, quiet=QUIET)
+    assert run(state, result("heartbeat"), when=at(15)) is None
+    assert "Было: Токен бота отозван" in run(state, result("heartbeat"), when=at(20)).text
+    # One that fails again after a good run is said.
+    state = alerts.AlertState()
+    alerts.evaluate(state, [token], at(0), tz=MSK, quiet=QUIET)
+    assert run(state, result("heartbeat"), when=at(5)) is None
+    assert run(state, token, when=at(10)).text == f"{prompts.ALERT_NEW}\n🔴 Токен бота отозван"
+
+
+def test_an_event_that_goes_on_while_nothing_can_be_sent_is_one_line():
+    line = prompts.ALERT_COLLECTOR_RESTARTS.format(count="{count}", reason="код выхода")
+    state = alerts.AlertState()
+    for m in range(0, 12 * 60, 5):                                      # 12 hours, 25 restarts every run
+        alerts.evaluate(state, [result("collector", events=[Event("collector.restarts", line, count=25)])], at(m),
+                        tz=MSK, quiet=QUIET)
+    assert len(state.outbox) == 1
+    out = run(state, result("collector"), when=at(12 * 60))
+    assert out.text == f"{prompts.ALERT_EVENTS}\n• " + line.replace("{count}", str(25 * 144))
+    assert state.outbox == []
+
+
+def test_a_check_that_breaks_keeps_its_problems_as_they_were():
+    state = alerts.AlertState()
+    down = result("collector", [Finding("collector.down", "crit", "Сборщик не работает")])
+    assert run(state, down, when=at(0)) is not None
+    # systemctl times out: the collector may still be down, nothing says it is fine.
+    out = run(state, broken("collector", "ProbeError"), when=at(5))
+    assert out.text == f"{prompts.ALERT_NEW}\n🟠 " + prompts.ALERT_CHECK_BROKEN.format(name="collector", error="ProbeError")
+    assert run(state, broken("collector", "ProbeError"), when=at(10)) is None
+    assert set(state.problems) == {"collector.down", "watchdog.check:collector"}
+    out = run(state, result("collector"), when=at(15))
+    assert out.text.count("снова в порядке") == 2 and "Сборщик: снова в порядке" in out.text and state.problems == {}
 
 
 def test_muted_events_and_old_crits_make_no_sound(tmp_path):

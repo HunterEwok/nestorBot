@@ -347,7 +347,7 @@ ALERT_BACKUP_OLD = "Самой старой копии {days} дн.: больш�
 ALERT_BACKUP_EXPOSED = ("Папка с копиями открыта для пользователя nestor: "
                         "<code>sudo chmod 700 /var/lib/nestor-backup/dumps</code>")
 ALERT_BACKUP_SHRANK = "Копия меньше прошлой на {pct}%{why}"
-ALERT_BACKUP_SHRANK_WHY = ", а ночная чистка удалила сообщений: {count}"
+ALERT_BACKUP_SHRANK_WHY = ", а чистка с прошлой копии удалила сообщений: {count}"
 ALERT_BACKUP_WARNING = "Резервная копия сделана, но {warning}"
 ALERT_BACKUP_NOTE = "Резервные копии: {warning}"      # of a run that made no copy (ALERT_BACKUP_FAILED says so)
 ALERT_RETENTION_FAILED = "Ночная чистка архива не прошла: {reason}"

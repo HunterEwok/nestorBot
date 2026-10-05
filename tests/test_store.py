@@ -142,3 +142,27 @@ async def test_imported_reply_keeps_its_quote_only_beside_the_message_in_the_arc
     raws = {r["message_id"]: r["raw"] for r in await conn.fetch("SELECT message_id, raw FROM messages")}
     assert "quote" not in raws[11] and "quote" not in raws[12] and "quote" not in raws[13]
     assert "тайна" not in str(raws[12]) and raws[12]["text"] == "согласен"
+
+
+async def test_a_quote_of_a_forward_holds_the_words_of_its_author_not_of_the_one_who_forwarded_it(conn):
+    # Вася forwards Петя's message; Коля replies to the forward, quoting it. The reply names Вася.
+    origin = {"type": "user", "date": 1_700_000_000, "sender_user": user(222)}
+    forward = message(1, "секрет Пети целиком", uid=111, forward_origin=origin)
+    await save(conn, forward)
+    quoting = {"reply_to_message": forward, "quote": {"text": "секрет Пети", "position": 0}}
+    await save(conn, message(2, "ого", uid=333, **quoting))
+    assert (await conn.fetchval("SELECT raw FROM messages WHERE message_id = 2"))["quote"]["text"] == "секрет Пети"
+    async with conn.transaction():
+        await forget.forget(conn, 222, 42)
+    # After /forget_me neither the stored reply nor the ones that come later keep it, live or imported.
+    await save(conn, message(3, "ого", uid=333, **quoting))
+    await save(conn, message(4, "ого", uid=333, quote={"text": "секрет Пети"}, reply_to_message={"message_id": 1},
+                             import_source="telegram_import"))
+    # A forward of somebody who did not opt out keeps its quotes.
+    vasya = message(5, "мысль Васи", uid=111, forward_origin=origin | {"sender_user": user(444)})
+    await save(conn, vasya)
+    await save(conn, message(6, "да", uid=333, reply_to_message=vasya, quote={"text": "мысль", "position": 0}))
+    raws = {r["message_id"]: r["raw"] for r in await conn.fetch("SELECT message_id, raw FROM messages")}
+    for mid in (2, 3, 4):
+        assert "quote" not in raws[mid] and "секрет" not in str(raws[mid]) and raws[mid]["text"] == "ого"
+    assert raws[6]["quote"]["text"] == "мысль"

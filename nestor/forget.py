@@ -42,6 +42,14 @@ async def forget(conn: asyncpg.Connection, user_id: int, bot_id: int) -> int:
     await conn.execute(
         """UPDATE messages SET raw = raw - 'quote'
            WHERE raw ? 'quote' AND raw->'reply_to_message'->'from'->>'id' = $1::bigint::text""", user_id)
+    # ... and in replies to their messages that somebody forwarded: the replied row is the forwarder's.
+    await conn.execute(
+        """UPDATE messages r SET raw = r.raw - 'quote'
+           FROM messages f
+           WHERE r.chat_id = f.chat_id AND r.reply_to_id = f.message_id AND r.raw ? 'quote'
+             AND coalesce(f.forward_origin->'sender_user'->>'id',
+                          CASE WHEN f.forward_origin->>'type' = 'user' THEN f.forward_origin->>'sender_id' END)
+                 = $1::bigint::text""", user_id)
     # Their messages forwarded by others: the row is the forwarder's, the words and names are theirs.
     # Live updates name the author in sender_user, imported forwards by an id (the importer's {type, sender_id}).
     await conn.execute(

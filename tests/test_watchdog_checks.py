@@ -2,6 +2,8 @@
 collector's heartbeat, maintenance_runs, nestor.backup's status.json, systemctl), what it says, and that
 it only reads. systemctl, the clock's sync, the card and Telegram are stood in for."""
 import json
+import os
+import threading
 from collections import namedtuple
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta
@@ -59,6 +61,7 @@ class AlertBot(Bot):
         self.sent: list[dict] = []
         self.members = members
         self.errors: list[Exception] = []
+        self.count_errors: list[Exception] = []
 
     async def send_message(self, chat_id, text, **kw):
         if self.errors:
@@ -67,6 +70,8 @@ class AlertBot(Bot):
         return True
 
     async def get_chat_member_count(self, chat_id, **kw):
+        if self.count_errors:
+            raise self.count_errors.pop(0)
         return self.members
 
 
@@ -259,6 +264,30 @@ async def test_retention_check_reads_maintenance_runs(conn):
         prompts.ALERT_RETENTION_BLOCKED.format(count=6000, total=9000)]
 
 
+async def test_a_failed_night_stays_open_while_the_next_one_is_tried_again(conn):
+    today, state = (await conn.fetchval("SELECT clock_timestamp()")).astimezone(MSK).date(), AlertState()
+
+    async def night(day, status, attempts):
+        await conn.execute(
+            """INSERT INTO maintenance_runs (job, day, status, attempts, error, updated_at, finished_at)
+               VALUES ('retention', $1, $2, $3, $4, now() - interval '1 minute', now() - interval '1 minute')
+               ON CONFLICT (job, day) DO UPDATE SET status = EXCLUDED.status, attempts = EXCLUDED.attempts,
+                                                    error = EXCLUDED.error""",
+            day, status, attempts, "clock_skew" if status == "failed" else None)
+        ctx = await make_ctx(conn, state=state)
+        _, out = alerts.evaluate(state, [await check(ctx, "retention")], ctx.now, tz=MSK, quiet=None)
+        if out is not None:
+            alerts.delivered(state, out, ctx.now)
+        return out and out.text
+
+    said = prompts.ALERT_RETENTION_FAILED.format(reason=prompts.RETENTION_REASONS["clock_skew"])
+    assert said in await night(today - timedelta(days=1), "failed", 6)
+    # The next night fails at first and is tried again: nothing is resolved before its verdict is in.
+    assert await night(today, "failed", 1) is None
+    assert await night(today, "running", 2) is None and "retention.failed" in state.problems
+    assert "снова в порядке" in await night(today, "ok", 2) and state.problems == {}
+
+
 async def test_retention_overdue_every_kind(pool, conn):
     await conn.execute("INSERT INTO chats (chat_id, type) VALUES ($1, 'supergroup')", CHAT_ID)
     for uid in (111, 222):
@@ -268,6 +297,9 @@ async def test_retention_overdue_every_kind(pool, conn):
                           VALUES ($1, 1, 111, now(), 'старое', '{}', now() - interval '13 months')""", CHAT_ID)
     await conn.execute("""INSERT INTO bot_requests (chat_id, status, created_at, oldest_source_at)
                           VALUES ($1, 'ok', now() - interval '13 months', now() - interval '13 months')""", CHAT_ID)
+    await conn.execute("""INSERT INTO bot_requests (chat_id, status, answer, created_at, oldest_source_at)
+                          VALUES ($1, 'ok', 'ответ', now() - interval '3 days', now() - interval '13 months')""", CHAT_ID)
+    # A follow-up to an old answer inherits its sources: logged just now, it is the next night's to take.
     await conn.execute("""INSERT INTO bot_requests (chat_id, status, answer, oldest_source_at)
                           VALUES ($1, 'ok', 'ответ', now() - interval '13 months')""", CHAT_ID)
     await conn.execute("""INSERT INTO reminders (chat_id, user_id, request_msg_id, text, due_at, created_at, sent_at)
@@ -336,17 +368,20 @@ async def test_backup_contract_from_backup_write_status(conn, tmp_path, monkeypa
     res = await look(now=after + timedelta(days=4))
     assert sorted(keys(res)) == ["backup.old_copies", "backup.warning:clock_unsynced"]
     assert prompts.ALERT_BACKUP_OLD.format(days=44, max_days=35) in [f.line for f in res.findings]
-    # Shrank: relayed with what the last purge removed.
+    # Shrank: relayed with what the purges removed since the copy it is compared with. At the cliff that is
+    # the large purge confirmed by day and the next night's, not only the last one.
     for path in cfg.dumps_dir.iterdir():
         path.unlink()
     bk.backup(cfg, NIGHT + timedelta(days=5), run=Tools(size=1000), force=True)
     small = bk.backup(cfg, NIGHT + timedelta(days=6), run=Tools(size=100), force=True)
-    await conn.execute("""INSERT INTO maintenance_runs (job, day, status, counts)
-                          VALUES ('retention', '2026-10-11', 'ok', '{"messages": 4100}')""")
+    await conn.execute("""INSERT INTO maintenance_runs (job, day, status, counts, finished_at)
+                          VALUES ('retention', '2026-10-09', 'ok', '{"messages": 99}', '2026-10-10 03:31+03'),
+                                 ('retention', '2026-10-10', 'ok', '{"messages": 6000}', '2026-10-10 12:00+03'),
+                                 ('retention', '2026-10-11', 'ok', '{"messages": 150}', '2026-10-11 03:31+03')""")
     res = await look(now=after + timedelta(days=6))
     assert [(f.key, f.line, f.repeat_token) for f in res.findings] == [
         ("backup.warning:shrank", prompts.ALERT_BACKUP_SHRANK.format(
-            pct=90, why=prompts.ALERT_BACKUP_SHRANK_WHY.format(count=4100)), small["file"])]
+            pct=90, why=prompts.ALERT_BACKUP_SHRANK_WHY.format(count=6150)), small["file"])]
 
 
 async def test_a_night_without_a_copy_never_says_one_was_made(conn, tmp_path, monkeypatch):
@@ -700,6 +735,45 @@ async def test_daily_summary_waits_while_the_hours_messages_are_used(database, c
         date=day_name(morning.date())))]
     assert prompts.DAILY_COLLECTOR.format(memory="150 МБ", restarts=2) in summary_text.split("\n")
     assert alerts.load_state(tmp_path / run.STATE_FILE).baselines["summary_restarts"] == 6
+
+
+async def test_no_summary_while_the_members_of_the_alert_group_cannot_be_counted(database, conn, tmp_path):
+    morning = (await conn.fetchval("SELECT clock_timestamp()")).astimezone(MSK).replace(hour=9, minute=31)
+    bot, cfg = AlertBot(members=3), settings(database["collector"], alert_quiet=None)
+    bot.count_errors = [TelegramNetworkError(method=None, message="down")]
+    no_clock = tuple(c for c in CHECKS if c.name != "clock")
+
+    async def look(minutes):
+        return await run.run_once(cfg, now=morning + timedelta(minutes=minutes), bot=bot, systemctl=Systemd(),
+                                  host=host(), state_dir=tmp_path, checks=no_clock)
+
+    # A stranger may have joined: what cannot be counted is not taken for few. Tried again on the next run.
+    report = await look(0)
+    assert report.summary is None and bot.sent == [] and alerts.load_state(tmp_path / run.STATE_FILE).last_daily is None
+    report = await look(5)
+    assert [m["text"] for m in bot.sent] == [prompts.ALERT_STRANGERS.format(count=3)]
+    assert alerts.load_state(tmp_path / run.STATE_FILE).last_daily == morning.date()
+
+
+async def test_a_run_and_a_mute_take_turns_on_the_state(tmp_path):
+    bot, noon = AlertBot(), datetime(2026, 10, 5, 12, 0, tzinfo=MSK)
+    held = run.lock(tmp_path)                                           # a run in progress
+    try:
+        # Another run says nothing and saves nothing: the one in progress does.
+        with pytest.raises(run.Busy):
+            await run.run_once(settings("postgresql://nestor:x@127.0.0.1:1/nestor"), now=noon, bot=bot,
+                               systemctl=Systemd(), host=host(), state_dir=tmp_path, checks=())
+        assert bot.sent == [] and not (tmp_path / run.STATE_FILE).exists()
+        # --mute waits for it: the run saves the state it loaded before, then the mute goes on top.
+        muting = threading.Thread(target=run.mute, args=(tmp_path, 60, noon))
+        muting.start()
+        muting.join(0.3)
+        assert muting.is_alive()
+        alerts.save_state(tmp_path / run.STATE_FILE, AlertState(), noon)
+    finally:
+        os.close(held)
+    muting.join(5)
+    assert alerts.load_state(tmp_path / run.STATE_FILE).mute_until == noon + timedelta(minutes=60)
 
 
 async def test_a_message_telegram_refuses_as_html_goes_as_plain_text(tmp_path):

@@ -156,10 +156,13 @@ SELECT (SELECT count(*) FROM bot_requests WHERE oldest_source_at < $1 AND answer
                           WHERE r.user_id = u.user_id AND r.sent_at IS NULL AND r.cancelled_at IS NULL)) AS users,
        (SELECT count(*) FROM messages) AS total_messages"""
 
-# What should have gone by now, with some grace: $1 = cutoff - grace, $2 = now - grace.
+# What should have gone by now, with some grace: $1 = cutoff - grace, $2 = now - grace. An answer gets
+# the grace from when it was logged too: a follow-up takes its parent's sources, so it can be logged
+# already past the cutoff, and the next night takes it.
 OVERDUE = """
 SELECT (SELECT count(*) FROM messages WHERE stored_at < $1) AS messages,
-       (SELECT count(*) FROM bot_requests WHERE oldest_source_at < $1 AND answer IS NOT NULL) AS answers,
+       (SELECT count(*) FROM bot_requests WHERE oldest_source_at < $1 AND created_at < $2 AND answer IS NOT NULL)
+         AS answers,
        (SELECT count(*) FROM bot_requests WHERE created_at < $1) AS requests,
        (SELECT count(*) FROM reminders WHERE created_at < $1
           AND (sent_at < $2 OR cancelled_at < $2 OR due_at < $2::timestamptz - interval '1 day')) AS reminders,

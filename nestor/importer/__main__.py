@@ -5,11 +5,13 @@
     python -m nestor.importer --chat -100123    # import one chat
 
 Needs TG_API_ID / TG_API_HASH (https://my.telegram.org → API development tools),
-DATABASE_URL (collector role) and ALLOWED_CHAT_IDS in the environment or .env.
+DATABASE_URL (collector role), BOT_TOKEN and ALLOWED_CHAT_IDS in the environment or .env.
 The first run asks for your phone number and login code and stores the session in
 nestor-import.session next to it; keep that file private, it is a logged-in account.
 Re-running is safe: already stored messages are skipped, and an interrupted run
-resumes after the last imported message.
+resumes after the last imported message. The bot's own messages are not imported: its
+answers are kept in bot_requests with what they were built from, and an answer that
+/forget_me or the nightly purge took out of the archive must not come back.
 """
 from __future__ import annotations
 
@@ -47,8 +49,9 @@ async def import_ranges(conn: asyncpg.Connection, chat_id: int) -> list[tuple[in
     return [*older, (max(imported, purged["message_id"]), None)]
 
 
-async def import_history(client: TelegramClient, pool: asyncpg.Pool, entity, chat: dict) -> int:
-    """Imports one chat's history oldest-first; returns the number of new rows."""
+async def import_history(client: TelegramClient, pool: asyncpg.Pool, entity, chat: dict, *, bot_id: int) -> int:
+    """Imports one chat's history oldest-first, without the messages of the bot `bot_id`; returns the
+    number of new rows."""
     async with pool.acquire() as conn:
         ranges = await import_ranges(conn, chat["id"])
     log.info("import started", extra={"chat_id": chat["id"], "after_message_id": ranges[0][0]})
@@ -71,6 +74,8 @@ async def import_history(client: TelegramClient, pool: asyncpg.Pool, entity, cha
                 break
             if not isinstance(msg, (t.Message, t.MessageService)):
                 continue
+            if isinstance(msg.from_id, t.PeerUser) and msg.from_id.user_id == bot_id:
+                continue
             batch.append(to_bot_api(msg, chat, msg.sender))
             seen += 1
             if len(batch) >= BATCH:
@@ -84,7 +89,7 @@ async def import_history(client: TelegramClient, pool: asyncpg.Pool, entity, cha
     return inserted
 
 
-async def import_chat(client: TelegramClient, pool: asyncpg.Pool, chat_id: int) -> None:
+async def import_chat(client: TelegramClient, pool: asyncpg.Pool, chat_id: int, *, bot_id: int) -> None:
     entity = await client.get_entity(chat_id)
     chat = chat_dict(entity)
     if chat["type"] == "group":
@@ -103,8 +108,8 @@ async def import_chat(client: TelegramClient, pool: asyncpg.Pool, chat_id: int) 
     old_id = full.full_chat.migrated_from_chat_id
     if old_id:
         old_entity = await client.get_entity(t.PeerChat(old_id))
-        await import_history(client, pool, old_entity, chat_dict(old_entity))
-    await import_history(client, pool, entity, chat)
+        await import_history(client, pool, old_entity, chat_dict(old_entity), bot_id=bot_id)
+    await import_history(client, pool, entity, chat, bot_id=bot_id)
 
 
 async def list_groups(client: TelegramClient, allowed: frozenset[int]) -> None:
@@ -130,6 +135,10 @@ async def main() -> None:
         api_id, api_hash = int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"]
     except KeyError as e:
         raise SystemExit(f"missing {e.args[0]}: get it at https://my.telegram.org → API development tools") from None
+    try:
+        bot_id = int(os.environ.get("BOT_TOKEN", "").split(":", 1)[0])
+    except ValueError:
+        raise SystemExit("missing BOT_TOKEN: the bot's own messages are told by its id and not imported") from None
     allowed = _parse_ids(os.environ.get("ALLOWED_CHAT_IDS", ""))
 
     async with TelegramClient(args.session, api_id, api_hash) as client:
@@ -146,7 +155,7 @@ async def main() -> None:
         pool = await store.create_pool(os.environ["DATABASE_URL"])
         try:
             for chat_id in chats:
-                await import_chat(client, pool, chat_id)
+                await import_chat(client, pool, chat_id, bot_id=bot_id)
         finally:
             await pool.close()
 

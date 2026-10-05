@@ -10,6 +10,7 @@ from nestor.collector.store import Result
 from nestor.importer.__main__ import import_history, import_ranges
 from nestor.importer.convert import chat_dict, to_bot_api  # noqa: E402
 
+from .test_answerer import BOT_ID
 from .test_store import save  # noqa: E402
 
 CHANNEL = t.Channel(id=1000000001, title="Друзья", photo=t.ChatPhotoEmpty(), date=None, megagroup=True, forum=True)
@@ -161,11 +162,11 @@ async def test_import_after_a_purge_of_live_rows_loads_the_history_before_them_n
     _, cutoff = await retention.db_times(conn)
     assert (await retention.purge(pool, cutoff, pause_s=0))["messages"] == 51
     client = _History(170)
-    assert await import_history(client, pool, None, CHAT) == 99 + 10
+    assert await import_history(client, pool, None, CHAT, bot_id=BOT_ID) == 99 + 10
     assert client.asked == [0, 150]
     ids = {r["message_id"] for r in await conn.fetch("SELECT message_id FROM messages")}
     assert ids == set(range(1, 100)) | set(range(151, 171))
-    assert await import_history(_History(170), pool, None, CHAT) == 0       # and a second run finds nothing new
+    assert await import_history(_History(170), pool, None, CHAT, bot_id=BOT_ID) == 0       # and a second run finds nothing new
 
 
 async def test_import_after_a_purge_by_archive_time_leaves_out_the_whole_span_of_ids(pool, conn):
@@ -181,10 +182,49 @@ async def test_import_after_a_purge_by_archive_time_leaves_out_the_whole_span_of
     assert (await retention.purge(pool, cutoff, batch=1, pause_s=0))["messages"] == 2
     assert await import_ranges(conn, CHAT["id"]) == [(0, 3), (9, None)]
     client = _History(12)
-    assert await import_history(client, pool, None, CHAT) == 2 + 3
+    assert await import_history(client, pool, None, CHAT, bot_id=BOT_ID) == 2 + 3
     assert client.asked == [0, 9]
     ids = {r["message_id"] for r in await conn.fetch("SELECT message_id FROM messages")}
     assert ids == {1, 2, 10, 11, 12}
+
+
+class _Chat:
+    """A Telethon client for a chat that holds these messages: min_id excludes the ids up to it, oldest first."""
+
+    def __init__(self, *messages):
+        self.messages = sorted(messages, key=lambda m: m.id)
+
+    async def iter_messages(self, entity, reverse, min_id):
+        for m in self.messages:
+            if m.id > min_id:
+                yield m
+
+
+async def test_the_bots_own_messages_are_not_imported_so_what_left_the_archive_stays_out(pool, conn):
+    # An importer that took everything stored the bot's answers: #11 quoted Петя, #20 was built on messages
+    # that entered the archive 13 months ago. /forget_me and the nightly purge take them out.
+    await conn.execute("INSERT INTO users (user_id, first_name, is_bot) VALUES ($1, 'Нестор', TRUE)", BOT_ID)
+    for m in (msg(10, "секрет Пети", from_id=t.PeerUser(222)), msg(11, "Петя писал: секрет", from_id=t.PeerUser(BOT_ID)),
+              msg(20, "по старым сообщениям", from_id=t.PeerUser(BOT_ID))):
+        await save(conn, to_bot_api(m, CHAT, None))
+    await conn.execute("UPDATE messages SET stored_at = now() - interval '1 month'")
+    await conn.execute(
+        """INSERT INTO bot_requests (chat_id, user_id, scenario, answer, status, answer_msg_ids, quoted_user_ids,
+                                     oldest_source_at)
+           VALUES ($1, 111, 'other', 'Петя писал', 'ok', '{11}', '{222}', now() - interval '1 month'),
+                  ($1, 111, 'other', 'по старым', 'ok', '{20}', NULL, now() - interval '13 months')""", CHAT["id"])
+    async with conn.transaction():
+        await forget.forget(conn, 222, BOT_ID)
+    _, cutoff = await retention.db_times(conn)
+    assert (await retention.purge(pool, cutoff, pause_s=0))["answer_messages"] == 1
+    assert await conn.fetchval("SELECT count(*) FROM messages") == 0
+    # An import after them (README: after every restore) reads those answers in Telegram again: they stay out.
+    bot = t.PeerUser(BOT_ID)
+    client = _Chat(msg(10, "секрет Пети", from_id=t.PeerUser(222)), msg(11, "Петя писал: секрет", from_id=bot),
+                   msg(12, "спасибо", from_id=t.PeerUser(111)), msg(20, "по старым сообщениям", from_id=bot),
+                   msg(21, "ещё вопрос", from_id=t.PeerUser(111)))
+    assert await import_history(client, pool, None, CHAT, bot_id=BOT_ID) == 2
+    assert {r["message_id"] for r in await conn.fetch("SELECT message_id FROM messages")} == {12, 21}
 
 
 async def test_imported_forward_of_an_opted_out_author_is_stored_without_text(conn):

@@ -55,6 +55,7 @@ DUMP_RE = re.compile(r"^nestor-(\d{8}T\d{6}Z)\.dump$")
 REQUIRED_DATA = ("public chats", "public users", "public messages", "public bot_requests", "public schema_migrations")
 RETRY_CODES = frozenset({"unreachable", "lock_timeout", "too_many_connections", "starting_up", "timeout"})
 EX_TEMPFAIL = 75                    # another run holds the lock
+EX_IOERR = 74                       # the card takes nothing, not even the status: the unit fails, the copies' age speaks
 MIB = 1024 * 1024
 ERROR_TAIL = 4096                   # bytes of stderr kept in last-error.txt
 VERIFY_TIMEOUT_S = 900              # reading a dump back, from the card
@@ -80,10 +81,12 @@ ERRORS = (
 )
 
 # The keys of status.json, which only the watchdog reads. `ok` and `error` are the verdict of the last finished
-# run, `last_ok_*` the last good dump; `shrank_pct` is added beside the warning "shrank" and nowhere else.
+# run, `last_ok_*` the last good dump; `shrank_pct` and `shrank_since` (when the dump it is compared with was
+# made) are added beside the warning "shrank" and nowhere else.
 STATUS_KEYS = ("version", "running", "ok", "error", "attempts", "started_at", "finished_at", "file", "size",
                "duration_s", "server_version", "client_version", "free_mb", "kept", "deleted", "oldest_dump_at",
                "rotated", "warnings", "failed_nights", "last_ok_at", "last_ok_file", "last_ok_size")
+SHRANK_KEYS = ("shrank_pct", "shrank_since")
 
 
 class BackupError(Exception):
@@ -417,15 +420,19 @@ def _backup(cfg: BackupConfig, now: datetime, previous: dict, run, sleep) -> dic
               "client_version": None, "free_mb": None, "kept": None, "deleted": None, "oldest_dump_at": None,
               "rotated": False, "warnings": [], "failed_nights": 0, "last_ok_at": None, "last_ok_file": None,
               "last_ok_size": None}
-    status.update({k: previous[k] for k in (*STATUS_KEYS, "shrank_pct") if k in previous})
+    status.update({k: previous[k] for k in (*STATUS_KEYS, *SHRANK_KEYS) if k in previous})
     # While it runs, the watchdog sees the last verdict and its warnings, so a retry of a failed night does
     # not flap; only `running` and `started_at` are new. A run that dies leaves `running` set, which is how
     # it is found.
     status.update(running=True, started_at=_iso(now))
-    write_status(cfg.status_file, status)
+    try:
+        write_status(cfg.status_file, status)
+    except OSError as e:    # a full card: the rotation below frees what expired, the space check says the rest
+        log.warning("backup status not written", extra={"error": _os_code(e)})
     # What the finished status says about this run only: a run that fails early leaves them empty.
     status.update(file=None, size=None, server_version=None, client_version=None, free_mb=None)
-    status.pop("shrank_pct", None)
+    for key in SHRANK_KEYS:
+        status.pop(key, None)
     last_size = previous["last_ok_size"] if isinstance(previous.get("last_ok_size"), int) else 0
     attempts, failure, warnings, deleted, trusted = 0, None, [], 0, False
     try:
@@ -468,6 +475,7 @@ def _backup(cfg: BackupConfig, now: datetime, previous: dict, run, sleep) -> dic
         if last_size and status["size"] < last_size / 2:
             warnings.append("shrank")
             status["shrank_pct"] = round(100 * (1 - status["size"] / last_size))
+            status["shrank_since"] = previous.get("last_ok_at")
         if trusted:     # the new one is the newest of the two that always stay
             deleted += _rotate(cfg.dumps_dir, now, warnings)
     except BackupError as e:
@@ -502,10 +510,13 @@ def _backup(cfg: BackupConfig, now: datetime, previous: dict, run, sleep) -> dic
             last_failed = None
         nights = int(previous.get("failed_nights") or 0) + (0 if last_failed == today else 1)
         status.update(ok=False, error=failure.code, failed_nights=nights)
-        if failure.stderr:
-            _write_error(cfg.error_file, failure.stderr)
-        else:
-            cfg.error_file.unlink(missing_ok=True)
+        try:
+            if failure.stderr:
+                _write_error(cfg.error_file, failure.stderr)
+            else:
+                cfg.error_file.unlink(missing_ok=True)
+        except OSError:     # the status below still says what failed
+            pass
         log.error("backup failed", extra={"error": failure.code, "returncode": failure.returncode,
                                           "attempt": attempts})
     write_status(cfg.status_file, status)
@@ -658,6 +669,9 @@ def main(argv: list[str] | None = None) -> int:
     except BackupBusy:
         log.warning("backup already running")
         return EX_TEMPFAIL
+    except OSError as e:     # the lock or the final status: nothing can be recorded on this card
+        log.error("backup status not written", extra={"error": _os_code(e)})
+        return EX_IOERR
     return 0 if status is None or status["ok"] else 1
 
 

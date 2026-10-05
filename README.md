@@ -73,10 +73,10 @@
 
 1. PostgreSQL 16 или новее (у нас 18). Положить `deploy/postgres/nestor.conf` в `/etc/postgresql/16/main/conf.d/` и поправить адрес в `listen_addresses`.
 2. Добавить строки из `deploy/postgres/pg_hba.example` в `pg_hba.conf` (адрес Pi), перезапустить PostgreSQL.
-3. Создать роли и базу. Запускать можно откуда угодно, где есть этот репозиторий и доступ суперпользователем к серверу:
+3. Создать роли и базу. Запускать можно откуда угодно, где есть этот репозиторий и доступ суперпользователем к серверу. Пароли вводятся без эха, по одному на каждое имя (`PG_ADMIN_URL` — `postgresql://postgres:...@db-host/postgres`), и не остаются ни в истории оболочки, ни на экране:
    ```sh
-   PG_ADMIN_URL='postgresql://postgres:...@db-host/postgres' COLLECTOR_PASSWORD=... READER_PASSWORD=... \
-       python -m nestor.bootstrap
+   for v in PG_ADMIN_URL COLLECTOR_PASSWORD READER_PASSWORD; do printf '%s: ' "$v"; read -rs "$v"; echo; export "$v"; done
+   python -m nestor.bootstrap; unset PG_ADMIN_URL COLLECTOR_PASSWORD READER_PASSWORD
    ```
 
 ### Raspberry Pi
@@ -123,7 +123,14 @@ sudo -u nestor /opt/nestor/.venv/bin/python -m nestor.retention --confirm       
 
 В `/var/lib/nestor-backup`: `dumps/` (0700, больше никто не читает), `status.json` (его читает сторож), `last-error.txt` (хвост ошибки `pg_dump`; в журнал и в оповещения она не попадает).
 
-Установка на Pi. `pg_dump` нужен 18 из репозитория PGDG: свой клиент Debian 13 (17) сервер 18 не берёт. Роль `nestor_backup` создаёт `python -m nestor.bootstrap backup` с ноутбука (`BACKUP_PASSWORD` в его `.env`).
+Роль `nestor_backup` создаётся с ноутбука на роутере. Адрес суперпользователя вводится явно: без него `bootstrap` взял бы `PG_ADMIN_URL` из `.env` для разработки и создал роль в локальной базе (в журнале `backup role ready` с `"server"` — куда она ушла). `PG_ADMIN_URL` — `postgresql://postgres:...@192.168.0.1/postgres`, `BACKUP_PASSWORD` — длинный случайный (`openssl rand -hex 32`), тот же пойдёт в `pgpass` на Pi:
+
+```sh
+for v in PG_ADMIN_URL BACKUP_PASSWORD; do printf '%s: ' "$v"; read -rs "$v"; echo; export "$v"; done
+python -m nestor.bootstrap backup; unset PG_ADMIN_URL BACKUP_PASSWORD
+```
+
+Установка на Pi. `pg_dump` нужен 18 из репозитория PGDG: свой клиент Debian 13 (17) сервер 18 не берёт. Сторож тоже нужен, даже без оповещений (раздел «Оповещения»): он хранит `optouts.json`, без которого восстановление из копии не сможет снова забыть тех, кто воспользовался `/forget_me`.
 
 ```sh
 sudo apt install -y postgresql-common      # только скрипт подключения репозитория PGDG, сервер не ставится
@@ -135,7 +142,7 @@ read -rs P    # вставить пароль nestor_backup, Enter; в исто�
 printf '192.168.0.1:5432:nestor:nestor_backup:%s\n' "$P" | sudo install -o nestor-backup -g nestor-backup -m 600 /dev/stdin /etc/nestor-backup/pgpass; unset P
 sudo cp /opt/nestor/deploy/systemd/nestor-backup.{service,timer} /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now nestor-backup.timer
-sudo systemctl start nestor-backup && cat /var/lib/nestor-backup/status.json     # "ok": true
+sudo systemctl start nestor-backup; cat /var/lib/nestor-backup/status.json      # "ok": true; иначе "error" — код причины
 ```
 
 Восстановление, если база потеряна. Копия возвращает и то, что после неё забыли через `/forget_me`, поэтому `restore` после загрузки применяет миграции, ещё раз забывает всех из `optouts.json` сторожа и удаляет то, что пережило срок хранения. База должна быть пустой. Порядок важен: пока кто-то держит соединение, базу не переименовать, а сборщик успел бы создать таблицы в новой.
@@ -151,12 +158,12 @@ sudo systemctl start nestor-backup && cat /var/lib/nestor-backup/status.json    
    ALTER DATABASE nestor RENAME TO nestor_broken;
    ```
    Если `ALTER` выдал ошибку, дальше не идти: шаг 3 оставит старую базу как есть.
-3. С ноутбука создать новую пустую `nestor`. `bootstrap` заново задаёт пароли ролям, поэтому нужны те, что уже стоят на Pi и в Hermes, а не пароли из `.env` для разработки:
+3. С ноутбука создать новую пустую `nestor`. `bootstrap` заново задаёт пароли ролям, поэтому нужны те, что уже стоят на Pi и в Hermes, а не пароли из `.env` для разработки. Они вводятся без эха, по одному на каждое имя, и не остаются в истории оболочки:
    ```sh
-   PG_ADMIN_URL='postgresql://postgres:...@192.168.0.1/postgres' COLLECTOR_PASSWORD=... READER_PASSWORD=... \
-       BACKUP_PASSWORD=... python -m nestor.bootstrap
+   for v in PG_ADMIN_URL COLLECTOR_PASSWORD READER_PASSWORD BACKUP_PASSWORD; do printf '%s: ' "$v"; read -rs "$v"; echo; export "$v"; done
+   python -m nestor.bootstrap; unset PG_ADMIN_URL COLLECTOR_PASSWORD READER_PASSWORD BACKUP_PASSWORD
    ```
-   `COLLECTOR_PASSWORD` — пароль из `DATABASE_URL` в `/opt/nestor/.env` на Pi, `READER_PASSWORD` — из `READER_DATABASE_URL` в `config.yaml` Hermes, `BACKUP_PASSWORD` — из `/etc/nestor-backup/pgpass`. Без `BACKUP_PASSWORD` у `nestor_backup` не будет доступа к новой базе (а на новом сервере не будет и самой роли), и копии перестанут сниматься. Сверить пароль `nestor`, не показывая его: первые 8 знаков должны совпасть — на Pi `sudo sed -nE 's|^DATABASE_URL=[^:]*://[^:]*:([^@]*)@.*|\1|p' /opt/nestor/.env | tr -d '\n' | sha256sum | cut -c1-8`, на ноутбуке `read -rs P; printf %s "$P" | sha256sum | cut -c1-8; unset P` (на Mac `shasum -a 256`).
+   `PG_ADMIN_URL` — `postgresql://postgres:...@192.168.0.1/postgres`, `COLLECTOR_PASSWORD` — пароль из `DATABASE_URL` в `/opt/nestor/.env` на Pi, `READER_PASSWORD` — из `READER_DATABASE_URL` в `config.yaml` Hermes, `BACKUP_PASSWORD` — из `/etc/nestor-backup/pgpass`. Без `BACKUP_PASSWORD` у `nestor_backup` не будет доступа к новой базе (а на новом сервере не будет и самой роли), и копии перестанут сниматься. Сверить пароль `nestor`, не показывая его: первые 8 знаков должны совпасть — на Pi `sudo sed -nE 's|^DATABASE_URL=[^:]*://[^:]*:([^@]*)@.*|\1|p' /opt/nestor/.env | tr -d '\n' | sha256sum | cut -c1-8`, на ноутбуке `read -rs P; printf %s "$P" | sha256sum | cut -c1-8; unset P` (на Mac `shasum -a 256`).
 4. На Pi:
    ```sh
    F=$(sudo ls -1 /var/lib/nestor-backup/dumps | tail -n 1)
@@ -165,19 +172,25 @@ sudo systemctl start nestor-backup && cat /var/lib/nestor-backup/status.json    
    ```
    - `restore failed not_empty`: в базе `nestor` уже что-то есть. Сначала на сервере `SELECT datname FROM pg_database`: если `nestor_broken` в списке нет, а старая база не потеряна, то это она — переименование на шаге 2 не прошло; ничего не удалять, вернуться к шагу 2. Если `nestor_broken` есть (или сервер новый), в новую базу успели записать (обычно сборщик, если его не остановили): `DROP DATABASE nestor WITH (FORCE)`, и снова шаги 3 и 4.
    - `restore failed role_missing`: на сервере нет роли, которой копия выдаёт права (обычно `nestor_backup`: шаг 3 был без `BACKUP_PASSWORD`). Шаг 3 с ним, и снова шаг 4; восстановление идёт одной транзакцией, база осталась пустой.
+   - `restore failed optouts_unreadable`: `optouts.json` сторожа нет или он повреждён (сторож не был установлен). Без `--optouts` не запускать: вернутся все, кто забыт после копии. Если `nestor_broken` ещё читается, собрать список из неё и повторить шаг 4 (база осталась пустой):
+     ```sh
+     sudo install -d -o nestor -g nestor -m 0700 /var/lib/nestor-watchdog
+     psql -h 192.168.0.1 -U postgres -d nestor_broken -Atc "SELECT coalesce(json_agg(user_id ORDER BY user_id), '[]') FROM users WHERE opted_out" \
+         | sudo install -o nestor -g nestor -m 0600 /dev/stdin /var/lib/nestor-watchdog/optouts.json
+     ```
 5. Запустить всё обратно:
    ```sh
    sudo systemctl enable --now nestor-collector nestor-backup.timer nestor-watchdog.timer
    systemctl --user start hermes-gateway
    ```
-6. Импорт истории для всех групп с ноутбука: сообщения, пришедшие после копии, Telegram второй раз не пришлёт.
+6. Импорт истории для всех групп с ноутбука: сообщения, пришедшие после копии, Telegram второй раз не пришлёт. Сообщения самого бота импорт не берёт: его ответы хранятся в `bot_requests`, а те, что забыты или вышли по сроку, не возвращаются.
 7. Через неделю нормальной работы удалить старую базу: `DROP DATABASE nestor_broken WITH (FORCE)`. Пока она есть, в ней лежит весь архив без срока хранения и без `/forget_me`: обещания `/privacy` до этого не выполнены.
 
 ## Оповещения
 
-Сторож (`python -m nestor.watchdog`, таймер `nestor-watchdog` раз в 5 минут, пользователь `nestor`) — единственный, кто пишет о сбоях. Он проверяет базу и часы, миграции, жив ли сборщик и получает ли он сообщения из Telegram (по его пульсу), Hermes, ошибки модели, копии, чистку, место и запись на карте, опоздавшие напоминания и источники новостей. О проблеме пишет один раз, когда она подтвердилась, и ещё раз — тихо, когда прошла; не больше одного сообщения за проверку и шести в час. С 23:00 до 08:00 сообщения приходят без звука (кроме критичного, которое длится больше часа). В 09:30 — тихая сводка за вчера; если в группе оповещений больше `ALERT_MAX_MEMBERS` участников (с ботом), вместо сводки только предупреждение о посторонних. Его состояние — в `/var/lib/nestor-watchdog`, поэтому он помнит, что уже сказал, и когда база недоступна.
+Сторож (`python -m nestor.watchdog`, таймер `nestor-watchdog` раз в 5 минут, пользователь `nestor`) — единственный, кто пишет о сбоях. Он проверяет базу и часы, миграции, жив ли сборщик и получает ли он сообщения из Telegram (по его пульсу), Hermes, ошибки модели, копии, чистку, место и запись на карте, опоздавшие напоминания и источники новостей. О проблеме пишет один раз, когда она подтвердилась, и ещё раз — тихо, когда прошла; не больше одного сообщения за проверку и шести в час. С 23:00 до 08:00 сообщения приходят без звука; критичная проблема, которая длится больше часа или ещё открыта в 08:00, один раз звонит. В 09:30 — тихая сводка за вчера; если в группе оповещений больше `ALERT_MAX_MEMBERS` участников (с ботом), вместо сводки только предупреждение о посторонних. Его состояние — в `/var/lib/nestor-watchdog`, поэтому он помнит, что уже сказал, и когда база недоступна.
 
-В `.env`: `ALERT_CHAT_ID` — группа оповещений (она должна быть в `ALLOWED_CHAT_IDS`, иначе бот из неё выйдет; пусто — оповещений нет), `ALERT_DAILY_AT`, `ALERT_QUIET`, `ALERT_DISK_MIN_GB`, `ALERT_MAX_MEMBERS` (у них есть значения по умолчанию) и `BACKUP_STATUS_FILE=/var/lib/nestor-backup/status.json`. Эту строку в уже существующий `/opt/nestor/.env` надо дописать: без неё сторож копии не проверяет (в `/status` — «Не удалось проверить: Резервные копии», в сводке — «Копии не отслеживаются»). После правки `.env` перезапустить сборщик.
+В `.env`: `ALERT_CHAT_ID` — группа оповещений (она должна быть в `ALLOWED_CHAT_IDS`, иначе бот из неё выйдет; пусто — оповещений нет, но таймер сторожа всё равно нужен: он хранит `optouts.json` для восстановления), `ALERT_DAILY_AT`, `ALERT_QUIET`, `ALERT_DISK_MIN_GB`, `ALERT_MAX_MEMBERS` (у них есть значения по умолчанию) и `BACKUP_STATUS_FILE=/var/lib/nestor-backup/status.json`. Эту строку в уже существующий `/opt/nestor/.env` надо дописать: без неё сторож копии не проверяет (в `/status` — «Не удалось проверить: Резервные копии», в сводке — «Копии не отслеживаются»). После правки `.env` перезапустить сборщик.
 
 ```sh
 sudo cp /opt/nestor/deploy/systemd/nestor-watchdog.{service,timer} /etc/systemd/system/
@@ -195,7 +208,7 @@ sudo -u nestor /opt/nestor/.venv/bin/python -m nestor.watchdog --mute 60   # н�
 
 Bot API не отдаёт сообщения, написанные до добавления бота, поэтому история читается разово через твой аккаунт Telegram (Telethon) и запускается с ноутбука, не с Pi.
 
-1. На https://my.telegram.org → API development tools получить `api_id` и `api_hash`, вписать в `.env` как `TG_API_ID` и `TG_API_HASH`. В `DATABASE_URL` указать базу на сервере (роль `nestor`, через туннель).
+1. На https://my.telegram.org → API development tools получить `api_id` и `api_hash`, вписать в `.env` как `TG_API_ID` и `TG_API_HASH`. В `DATABASE_URL` указать базу на сервере (роль `nestor`, через туннель), в `BOT_TOKEN` — настоящий токен бота: по нему импорт узнаёт сообщения бота и пропускает их.
 2. `pip install -e ".[import]"` (в dev-окружении уже стоит).
 3. `python -m nestor.importer --list`: список твоих групп с `chat_id`, звёздочкой отмечены те, что уже в `ALLOWED_CHAT_IDS`. Первый запуск спросит телефон и код входа; сессия сохранится в `nestor-import.session`, это залогиненный аккаунт, файл никому не отдавать.
 4. `python -m nestor.importer`: импорт всех групп из `ALLOWED_CHAT_IDS` (или `--chat <id>` для одной).

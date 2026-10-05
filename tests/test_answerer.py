@@ -454,6 +454,17 @@ async def test_forget_me_also_removes_answers_that_quote_them(make_env, conn):
     assert "палатк" not in str(llm.calls[-1])
 
 
+async def test_forget_me_removes_answers_that_quote_a_forward_of_their_message(make_env, conn):
+    _, _, feed = make_env(FakeLLM("Вася переслал: [«палатку»](#1)"))
+    origin = {"type": "user", "date": 1_789_000_000, "sender_user": {"id": 222, "is_bot": False, "first_name": "Петя"}}
+    await feed(update("message", message(1, "беру палатку", uid=111, forward_origin=origin)))
+    await feed(update("message", message(2, "нестор, кто что берёт?", uid=333)))
+    # The link names Вася, who forwarded it; the words are Петя's.
+    assert await conn.fetchval("SELECT quoted_user_ids FROM bot_requests WHERE scenario = 'other'") == [111, 222]
+    await feed(update("message", message(3, "/forget_me", uid=222)))
+    assert await conn.fetchval("SELECT answer FROM bot_requests WHERE scenario = 'other'") is None
+
+
 async def test_ids_shared_by_a_migrated_chat_and_its_old_group_are_not_linked(make_env, conn):
     old = -4242
     bot, llm, feed = make_env(FakeLLM("Это сказал Петя: [«едем в Грецию»](#7), а Вася: [«ок»](#8)"))

@@ -16,7 +16,8 @@ from nestor.watchdog import alerts, checks, probes, run
 from nestor.watchdog.alerts import AlertState
 from nestor.watchdog.checks import Ctx
 
-from .test_watchdog_checks import BY_NAME, AlertBot, Systemd, host, settings
+from .factories import CHAT_ID
+from .test_watchdog_checks import BY_NAME, AlertBot, Systemd, host, make_ctx, settings
 
 MSK = ZoneInfo("Europe/Moscow")
 NOW = datetime(2026, 10, 5, 14, 0, tzinfo=MSK)
@@ -103,7 +104,8 @@ async def test_hermes_probe(hermes, caplog):
         assert res.unknown == ("hermes.profile:",)
         # Down, then back answering 404 everywhere: that it is back is said; a profile it knew of stays.
         state = AlertState(problems={"hermes.profile:web": alerts.Problem(
-            "hermes.profile:web", "hermes", "crit", "Профиль web", "Hermes", NOW, fails=2, announced="crit")})
+            "hermes.profile:web", "hermes", "crit", "Профиль web", "Hermes", NOW, fails=2, announced="crit",
+            delivered=True, rung=True)})
         texts = []
         for minutes, urls in ((0, down), (5, down), (10, url), (15, url)):
             ctx = ctx_without_db(http=http, state=state, hermes_url=urls("gone"), hermes_web_url=urls("web"))
@@ -118,6 +120,22 @@ async def test_hermes_probe(hermes, caplog):
         assert await probes.probe_hermes(http, [("smart", url("slow"), "good-key")], timeout_s=0.2) == {"smart": "timeout"}
     # Archiving only: nothing to probe.
     assert (await run.run_check(ctx_without_db(), BY_NAME["hermes"])).status == "ok"
+
+
+async def test_answers_that_fail_while_hermes_is_down_are_not_the_models_errors(conn):
+    for _ in range(3):              # nobody got an answer: Hermes refused the connection
+        await conn.execute("INSERT INTO bot_requests (chat_id, scenario, status) VALUES ($1, 'answer', 'error')",
+                           CHAT_ID)
+    state = AlertState()
+    async with aiohttp.ClientSession() as http:
+        ctx = await make_ctx(conn, state=state, hermes_url=f"http://127.0.0.1:{closed_port()}/p/group/v1")
+        ctx.http = http
+        assert [f.key for f in (await run.run_check(ctx, BY_NAME["hermes"])).findings] == ["hermes.gateway"]
+        assert (await run.run_check(ctx, BY_NAME["model"])).status == "unknown"
+    # An hour after it was last down, failed answers are the model's again.
+    later = await make_ctx(conn, state=state)
+    later.now += timedelta(minutes=61)
+    assert [f.key for f in (await run.run_check(later, BY_NAME["model"])).findings] == ["model.errors"]
 
 
 async def test_parse_systemctl_show(tmp_path, monkeypatch):
@@ -145,6 +163,24 @@ async def test_parse_systemctl_show(tmp_path, monkeypatch):
     res = await run.run_check(ctx_without_db(systemd=probes.run_systemctl), BY_NAME["collector"])
     assert [f.key for f in res.findings] == ["watchdog.check:collector"] and res.status == "error"
     assert res.findings[0].line == prompts.ALERT_CHECK_BROKEN.format(name="collector", error="ProbeError")
+
+
+async def test_the_clock_is_synced_by_the_flag_or_by_timedatectl(tmp_path, monkeypatch):
+    flag = tmp_path / "synchronized"
+    monkeypatch.setattr(probes, "TIMESYNC_FLAG", flag)
+    flag.touch()
+    assert await probes.clock_synced() is True
+    flag.unlink()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    script = bin_dir / "timedatectl"
+    monkeypatch.setenv("PATH", str(bin_dir))
+    for answer, synced in (("echo yes", True), ("echo no", False), ("echo yes; exit 1", False)):
+        script.write_text(f'#!/bin/sh\n[ "$*" = "show -p NTPSynchronized --value" ] || exit 2\n{answer}\n')
+        script.chmod(0o755)
+        assert await probes.clock_synced() is synced
+    monkeypatch.setenv("PATH", str(tmp_path / "nothing"))                  # no timedatectl at all
+    assert await probes.clock_synced() is False
 
 
 async def test_disk_hysteresis():

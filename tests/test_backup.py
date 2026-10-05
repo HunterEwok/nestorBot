@@ -474,10 +474,11 @@ def test_status_contract_keys(tmp_path, monkeypatch):
     failed = bk.backup(cfg, NIGHT + timedelta(days=1), run=Tools("pg_dump: error: password authentication failed"))
     assert set(failed) == keys and set(status_of(cfg)) == keys
     assert failed["version"] == good["version"] == 1
-    # `shrank_pct` exists only beside the warning it belongs to.
+    # `shrank_pct` and `shrank_since` (when the copy it is compared with was made) exist only beside the warning.
     shrank = bk.backup(cfg, NIGHT + timedelta(days=2), run=Tools(size=300))
-    assert shrank["warnings"] == ["shrank"] and shrank["shrank_pct"] == 70 and set(shrank) == keys | {"shrank_pct"}
-    assert "shrank_pct" not in bk.backup(cfg, NIGHT + timedelta(days=3), run=Tools(size=300))
+    assert shrank["warnings"] == ["shrank"] and shrank["shrank_pct"] == 70 and set(shrank) == keys | set(bk.SHRANK_KEYS)
+    assert shrank["shrank_since"] == good["last_ok_at"]
+    assert not set(bk.SHRANK_KEYS) & set(bk.backup(cfg, NIGHT + timedelta(days=3), run=Tools(size=300)))
 
 
 def test_running_status_carries_the_last_verdict_so_a_retry_does_not_flap(tmp_path):
@@ -498,8 +499,9 @@ def test_running_status_carries_the_last_verdict_so_a_retry_does_not_flap(tmp_pa
     seen = Tools(size=100)
     done = bk.backup(cfg, NIGHT + timedelta(days=3), run=seen)
     during = seen.statuses[0]
-    assert (during["running"], during["warnings"], during["shrank_pct"]) == (True, shrank["warnings"], 90)
-    assert shrank["warnings"] == ["shrank"] and done["warnings"] == [] and "shrank_pct" not in done
+    assert (during["running"], during["warnings"], during["shrank_pct"], during["shrank_since"]) == (
+        True, shrank["warnings"], 90, shrank["shrank_since"])
+    assert shrank["warnings"] == ["shrank"] and done["warnings"] == [] and not set(bk.SHRANK_KEYS) & set(done)
 
 
 def test_a_failed_night_keeps_the_old_dumps_and_counts_distinct_days(tmp_path):
@@ -608,6 +610,36 @@ def test_a_full_card_lets_the_expired_copies_go_before_it_checks_the_space(tmp_p
     failed = bk.backup(cfg, NIGHT + timedelta(days=1), run=tools)
     assert (failed["error"], tools.dumps, failed["deleted"], failed["kept"], failed["rotated"]) == (
         "low_space", 0, 9, 2, True)
+
+
+def test_a_card_too_full_for_the_status_still_lets_the_expired_copies_go(tmp_path, monkeypatch, caplog):
+    cfg = cfg_in(tmp_path)
+    old_dumps(cfg, nights(11, utc(20, month=8)))
+    _last_dump(cfg, 10 * bk.MIB)
+    _free(monkeypatch, lambda path: (120 - 10 * len(bk.list_dumps(path))) * bk.MIB)
+    # Not a byte left: the status that says it runs cannot be written. The run goes on, the old copies go.
+    write, written = bk.write_status, []
+
+    def full_at_first(path, status):
+        written.append(status["running"])
+        if len(written) == 1:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        write(path, status)
+
+    monkeypatch.setattr(bk, "write_status", full_at_first)
+    tools = Tools()
+    done = bk.backup(cfg, NIGHT, run=tools)
+    assert written == [True, False] and (done["ok"], tools.dumps, done["deleted"], done["kept"]) == (True, 1, 10, 2)
+    assert status_of(cfg) == done and "backup status not written" in caplog.text
+    # Nothing at all can be written: one line in the journal and an exit code of its own, no traceback.
+    def full(path, status):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(bk, "write_status", full)
+    monkeypatch.setattr("nestor.logs.setup_logging", lambda level: None)
+    monkeypatch.setattr(bk, "load_config", lambda: cfg)
+    caplog.clear()
+    assert bk.main(["--force"]) == bk.EX_IOERR and "backup status not written" in caplog.text
 
 
 def test_failed_nights_let_expired_copies_go_and_keep_the_last_two_good_ones(tmp_path):

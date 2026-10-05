@@ -503,9 +503,11 @@ async def test_overdue_counts_every_kind(conn):
     await _msg(conn, 1, 111, "давно должно было уйти", stored=late)
     await _msg(conn, 2, 111, "уйдёт сегодня ночью", stored=fresh)
     await conn.execute(f"""INSERT INTO bot_requests (chat_id, user_id, scenario, answer, status, created_at, oldest_source_at)
-                           VALUES ($1, 111, 'other', 'ответ', 'ok', now(), now() - interval '{late}'),
-                                  ($1, 111, 'other', 'ответ', 'ok', now(), now() - interval '{fresh}'),
-                                  ($1, 111, 'other', NULL, 'ok', now() - interval '{late}', now() - interval '{late}')""",
+                           VALUES ($1, 111, 'other', 'ответ', 'ok', now() - interval '3 days', now() - interval '{late}'),
+                                  ($1, 111, 'other', 'ответ', 'ok', now() - interval '3 days', now() - interval '{fresh}'),
+                                  ($1, 111, 'other', NULL, 'ok', now() - interval '{late}', now() - interval '{late}'),
+                                  -- a follow-up to an old answer, logged today: the next night takes it
+                                  ($1, 111, 'other', 'ответ', 'ok', now() - interval '1 day', now() - interval '{late}')""",
                        CHAT_ID)
     await conn.execute(f"""INSERT INTO reminders (chat_id, user_id, request_msg_id, text, due_at, created_at, sent_at)
                            VALUES ($1, 111, 1, 'x', now(), now() - interval '{late}', now() - interval '3 days'),

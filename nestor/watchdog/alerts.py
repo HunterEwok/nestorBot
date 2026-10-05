@@ -7,10 +7,12 @@ silently, after `clear` good runs; a check that could not look (`unknown`) chang
 event is one line per key and cooldown; what happens within the cooldown is counted into the next.
 
 Everything to say waits in the outbox. A run sends at most one message of at most MAX_LINES lines,
-and at most MAX_PER_HOUR messages go out in an hour; a problem that opened and closed while it
-waited becomes one line «Было: …». In quiet hours (ALERT_QUIET) and while muted messages arrive
-without sound; muted, new problems are held until it ends. A crit open for over an hour rings once
-even in quiet hours.
+and at most MAX_PER_HOUR messages go out in an hour; a problem whose last run was good waits until it
+fails again or closes, and one that opened and closed while it waited becomes one line «Было: …»; an
+event that happens again while its line waits is counted into that line. In quiet hours (ALERT_QUIET)
+and while muted messages arrive without sound; muted, new problems are held until it ends. A crit
+rings once: when it is announced, or, announced without sound, at the first run outside the quiet
+hours and the mute, or in quiet hours once it is open for over an hour.
 
 The state lives in the watchdog's StateDirectory, so it survives database outages and reboots. Each
 run also publishes it with its snapshot in ops_state('watchdog') and keeps a copy in memory (the
@@ -294,14 +296,22 @@ def evaluate(state: AlertState, results: list[CheckResult], now: datetime, *, tz
         sent = _when(ev["sent_at"])
         ready = sent is None or now - sent >= timedelta(seconds=ev["cooldown_s"])
         if ev["pending"] and ready:
-            _push(state, {"kind": "event", "key": key, "line": ev["line"].replace("{count}", str(ev["pending"]))})
+            # Its last line has not gone out yet (Telegram down): it counts these too.
+            waiting = [i for i in state.outbox if i["kind"] == "event" and i["key"] == key and "count" in i]
+            if waiting:
+                count = waiting[-1]["count"] + ev["pending"]
+                waiting[-1].update(count=count, line=ev["line"].replace("{count}", str(count)))
+            else:
+                _push(state, {"kind": "event", "key": key, "count": ev["pending"],
+                              "line": ev["line"].replace("{count}", str(ev["pending"]))})
             ev.update(pending=0, sent_at=_iso(now))
         elif not ev["pending"] and ready:
             del state.events[key]
-    if not muted and in_quiet(now.astimezone(tz).time(), quiet):
+    if not muted:
+        quiet_now = in_quiet(now.astimezone(tz).time(), quiet)
         for p in state.problems.values():
-            if p.announced == "crit" and p.level == "crit" and not p.rung \
-                    and now - (p.crit_since or p.since) >= QUIET_RING_AFTER:
+            if p.announced == "crit" and p.level == "crit" and not p.rung and p.fails > 0 \
+                    and (not quiet_now or now - (p.crit_since or p.since) >= QUIET_RING_AFTER):
                 waiting = [i for i in state.outbox if i["kind"] == "problem" and i["key"] == p.key]
                 if waiting:
                     waiting[-1]["force"] = True
@@ -314,10 +324,13 @@ def evaluate(state: AlertState, results: list[CheckResult], now: datetime, *, tz
 
 
 def compose(state: AlertState, now: datetime, *, tz: ZoneInfo, quiet: tuple[time, time] | None) -> Outgoing | None:
-    """The message for what waits in the outbox, or None: nothing waits or the hour's messages are used."""
-    if not state.outbox or len([t for t in state.sent_times if now - t < timedelta(hours=1)]) >= MAX_PER_HOUR:
+    """The message for what waits in the outbox, or None: nothing waits or the hour's messages are used.
+    A problem whose last run was good is not said: it waits until it fails again, or closes («Было»)."""
+    waiting = [i for i in state.outbox if not (i["kind"] == "problem" and i["key"] in state.problems
+                                               and state.problems[i["key"]].fails == 0)]
+    if not waiting or len([t for t in state.sent_times if now - t < timedelta(hours=1)]) >= MAX_PER_HOUR:
         return None
-    waiting = sorted(state.outbox, key=lambda i: (_ORDER[i["kind"]], -LEVELS.get(i.get("level"), 0), i["n"]))
+    waiting.sort(key=lambda i: (_ORDER[i["kind"]], -LEVELS.get(i.get("level"), 0), i["n"]))
     chosen, size = [], 0
     for item in waiting if len(waiting) <= MAX_LINES else waiting[:MAX_LINES - 1]:
         size += len(item["line"]) + 4                   # the mark, a space, the newline

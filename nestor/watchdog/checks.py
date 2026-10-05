@@ -63,6 +63,7 @@ BACKUP_STALE = timedelta(hours=26)
 RETENTION_STALE = timedelta(hours=26)
 NEWS_FAILING_FOR = timedelta(hours=24)
 NEWS_AFTER_NETWORK = timedelta(hours=2)     # sources fail with the Pi's network: not their own fault
+MODEL_AFTER_HERMES = timedelta(hours=1)     # answers fail with the gateway: not the model's fault
 
 
 @dataclass(frozen=True)
@@ -291,6 +292,7 @@ async def check_hermes(ctx: Ctx) -> CheckResult:
     outcomes = await probe_hermes(ctx.http, profiles)
     down = sorted(o for o in outcomes.values() if o in prompts.HERMES_ERRORS)
     if down:                        # one gateway serves every profile: one line, the profiles unknown
+        ctx.memo("hermes")["down_at"] = ctx.now.isoformat()
         line = prompts.ALERT_HERMES_DOWN.format(error=prompts.HERMES_ERRORS[down[0]])
         return result("hermes", [Finding("hermes.gateway", "crit", line, confirm=2, clear=2)],
                       unknown=("hermes.profile:",))
@@ -316,7 +318,11 @@ async def check_hermes(ctx: Ctx) -> CheckResult:
 
 
 async def check_model(ctx: Ctx) -> CheckResult:
-    """model.errors: answers that failed in the last hour (a spending limit, an outage at Anthropic)."""
+    """model.errors: answers that failed in the last hour (a spending limit, an outage at Anthropic). Not while
+    Hermes is down or was within that hour: those answers failed on the Pi, which hermes.gateway says."""
+    down = _when(ctx.memo("hermes").get("down_at"))
+    if down is not None and ctx.now - down < MODEL_AFTER_HERMES:
+        return unknown("model")
     row = await ctx.conn.fetchrow(
         """SELECT count(*) FILTER (WHERE status IN ('error', 'timeout')) AS failed,
                   count(*) FILTER (WHERE model IS NOT NULL OR status IN ('error', 'timeout')) AS total
@@ -378,7 +384,7 @@ async def check_backup(ctx: Ctx) -> CheckResult:
         text = prompts.BACKUP_WARNINGS.get(warning) or _code(warning)
         if warning == "shrank":
             pct = status.get("shrank_pct") if isinstance(status.get("shrank_pct"), int) else "?"
-            line = prompts.ALERT_BACKUP_SHRANK.format(pct=pct, why=await _purged(ctx))
+            line = prompts.ALERT_BACKUP_SHRANK.format(pct=pct, why=await _purged(ctx, status))
         else:
             line = (prompts.ALERT_BACKUP_WARNING if made else prompts.ALERT_BACKUP_NOTE).format(warning=text)
         # Said again with each new copy, or each failed night.
@@ -388,13 +394,23 @@ async def check_backup(ctx: Ctx) -> CheckResult:
     return result("backup", findings, unknown=unknown_keys)
 
 
-async def _purged(ctx: Ctx) -> str:
-    """Why a dump may have shrunk: what the last nightly purge removed."""
+async def _purged(ctx: Ctx, status: dict) -> str:
+    """Why a dump may have shrunk: what the purges removed between the dump it is compared with and this one
+    (a large one confirmed by day and the next night's, at the 2027-10 cliff); without those times, what the
+    last one removed."""
     if ctx.conn is None:
         return ""
-    counts = await ctx.conn.fetchval(
-        "SELECT counts FROM maintenance_runs WHERE job = $1 AND status = 'ok' ORDER BY day DESC LIMIT 1", retention.JOB)
-    count = (counts or {}).get("messages", 0)
+    since, until = _when(status.get("shrank_since")), _when(status.get("finished_at"))
+    if since is not None and until is not None:
+        count = await ctx.conn.fetchval(
+            """SELECT coalesce(sum((counts->>'messages')::int), 0) FROM maintenance_runs
+               WHERE job = $1 AND status = 'ok' AND finished_at > $2 AND finished_at <= $3""",
+            retention.JOB, since, until)
+    else:
+        counts = await ctx.conn.fetchval(
+            "SELECT counts FROM maintenance_runs WHERE job = $1 AND status = 'ok' ORDER BY day DESC LIMIT 1",
+            retention.JOB)
+        count = (counts or {}).get("messages", 0)
     return prompts.ALERT_BACKUP_SHRANK_WHY.format(count=count) if isinstance(count, int) and count > 0 else ""
 
 
@@ -410,8 +426,9 @@ async def check_retention(ctx: Ctx) -> CheckResult:
                                                       total=int(counts.get("total", 0)))
         findings.append(Finding("retention.blocked", "warn", line, repeat_token=str(last["day"])))
     # A failed run is claimed again after 10 minutes, up to 6 times: only one that stays failed is news.
-    if last is not None and last["status"] == "failed" and (
-            last["attempts"] >= 6 or ctx.db_now - last["updated_at"] > timedelta(minutes=20)):
+    retrying = last is not None and last["status"] == "failed" and last["attempts"] < 6 \
+        and ctx.db_now - last["updated_at"] <= timedelta(minutes=20)
+    if last is not None and last["status"] == "failed" and not retrying:
         code = safe_code(last["error"] or "failed")
         reason = prompts.RETENTION_REASONS.get(code) or prompts.RETENTION_ERROR.format(error=html.escape(code))
         findings.append(Finding("retention.failed", "warn", prompts.ALERT_RETENTION_FAILED.format(reason=reason),
@@ -427,7 +444,9 @@ async def check_retention(ctx: Ctx) -> CheckResult:
         what = ", ".join(f"{prompts.RETENTION_KINDS.get(k, html.escape(k))}: {v}" for k, v in late.items())
         findings.append(Finding("retention.overdue", "crit",
                                 prompts.ALERT_RETENTION_OVERDUE.format(what=what, months=RETENTION_MONTHS)))
-    return result("retention", findings)
+    # While the day's run goes on or is tried again, the last night's verdict stays as it was.
+    pending = retrying or (last is not None and last["status"] == "running")
+    return result("retention", findings, unknown=("retention.failed", "retention.blocked") if pending else ())
 
 
 # ---- the Pi ----

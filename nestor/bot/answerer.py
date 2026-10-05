@@ -659,8 +659,8 @@ class Answerer:
 
         Also returns the authors whose words the answer carries without a usable reference, so
         that /forget_me still removes it: of such ambiguous ids, of messages gone since the prompt
-        was built (a /forget_me in flight), and of the people quoted in the bot's own answers it
-        refers to.
+        was built (a /forget_me in flight), of the forwards it refers to (the link names who
+        forwarded them), and of the people quoted in the bot's own answers it refers to.
 
         And when the oldest of the messages it refers to entered the archive, ambiguous ones
         included (and for the bot's own answers, their own oldest_source_at): the answer leaves the
@@ -680,6 +680,8 @@ class Answerer:
                 rows = found.get(mid, [])
                 for r in rows:
                     times.append(r["stored_at"])
+                    if r["forwarded_from"] is not None:     # a forward: the words are its author's
+                        authors.add(r["forwarded_from"])
                     # The bot's answer: whoever it quoted is quoted again, and it carries what that one did.
                     if r["user_id"] == self.me.user_id:
                         req = await conn.fetchrow(

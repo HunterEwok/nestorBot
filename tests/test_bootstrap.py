@@ -132,6 +132,7 @@ async def test_the_backup_command_does_only_the_backup_role(database, cli_env, m
         with caplog.at_level(logging.INFO, logger="nestor.bootstrap"):
             await bootstrap._main(["backup"])
         assert [r.getMessage() for r in caplog.records] == ["backup role ready"]
+        assert caplog.records[0].server == urlsplit(ADMIN_URL).hostname         # where it went: not the dev db
         login = await asyncpg.connect(with_database(ADMIN_URL, SCRATCH_DB, "nestor_backup", "backup"))
         await login.close()
         login = await asyncpg.connect(with_database(ADMIN_URL, SCRATCH_DB, "nestor", "collector"))   # unchanged

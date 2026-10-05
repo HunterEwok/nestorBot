@@ -165,17 +165,18 @@ async def _main(argv: list[str] | None = None) -> None:
 
     admin_url = require("PG_ADMIN_URL")
     database = os.environ.get("NESTOR_DB", "nestor")
+    where = {"server": urlsplit(admin_url).hostname, "database": database}     # never the password
     if args.command == "backup":
         if not require("BACKUP_PASSWORD"):      # .env.example leaves it empty: a role without a password is no role
             raise SystemExit("BACKUP_PASSWORD is empty")
         await ensure_backup_role(admin_url, database, os.environ["BACKUP_PASSWORD"])
-        log.info("backup role ready", extra={"database": database})
+        log.info("backup role ready", extra=where)
         return
     await bootstrap(admin_url, database, require("COLLECTOR_PASSWORD"), require("READER_PASSWORD"))
     if os.environ.get("BACKUP_PASSWORD"):
         await ensure_backup_role(admin_url, database, os.environ["BACKUP_PASSWORD"])
-        log.info("backup role ready", extra={"database": database})
-    log.info("bootstrap done", extra={"database": database})
+        log.info("backup role ready", extra=where)
+    log.info("bootstrap done", extra=where)
 
 
 if __name__ == "__main__":

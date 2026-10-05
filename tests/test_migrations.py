@@ -336,8 +336,12 @@ async def test_0008_scrubs_what_was_stored_the_way_a_new_message_is_stored(conn)
         ("да", {"reply_to_message": {"message_id": 900}, "quote": quote}),           # imported, replied is not archived
         ("да", {"reply_to_message": {"message_id": 1}, "quote": {"text": "мой текст"}}),     # ... is archived
         ("да", {"reply_to_message": {"message_id": 1}}),
+        # A reply to Петя's forward of Вася's message names Петя: the words are Вася's all the same.
+        ("ого", {"reply_to_message": {"message_id": 2, "date": 1, "from": {"id": 222}}, "quote": quote}),
+        ("ого", {"reply_to_message": {"message_id": 2}, "quote": quote}),                   # imported
     ]
     await _msg(conn, 1, 222, "мой текст")
+    await _msg(conn, 2, 222, "секрет Васи целиком", forward_origin=live, extra={"forward_origin": live})
     rows = [parse_message(message(100 + i, text, **extra)) for i, (text, extra) in enumerate(samples)]
     for row in rows:                                    # as an older collector stored them
         await conn.execute(store._INSERT_MESSAGE, *store._message_args(row))
@@ -357,6 +361,7 @@ async def test_0008_scrubs_what_was_stored_the_way_a_new_message_is_stored(conn)
     assert backfilled[1]["text"] is None and backfilled[2]["text"] == "из канала" and backfilled[3]["text"] == "мысль Пети"
     assert "quote" not in backfilled[4]["raw"] and "quote" not in backfilled[5]["raw"]
     assert backfilled[6]["raw"]["quote"]["text"] == "мой текст"
+    assert "quote" not in backfilled[8]["raw"] and "quote" not in backfilled[9]["raw"]
 
 
 async def test_a_migration_gives_up_waiting_for_a_locked_table_and_says_so(database, tmp_path, caplog):

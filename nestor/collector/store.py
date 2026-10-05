@@ -178,13 +178,23 @@ async def _quote_of_nobody(conn: asyncpg.Connection, msg: MessageRow) -> bool:
                                    msg.chat_id, msg.reply_to_id)
 
 
+async def _replied_forward_author(conn: asyncpg.Connection, msg: MessageRow) -> Any:
+    """Who wrote the words of the replied message when it is a forward in the archive: its author,
+    not the one who forwarded it, whom the reply names."""
+    if msg.reply_to_id is None:
+        return None
+    return _forward_author(await conn.fetchval("SELECT forward_origin FROM messages WHERE chat_id = $1 AND message_id = $2",
+                                               msg.chat_id, msg.reply_to_id))
+
+
 async def _without_forgotten_words(conn: asyncpg.Connection, msg: MessageRow) -> MessageRow:
     """Someone else's message carrying the words of a person who used /forget_me: a reply quoting
-    their message, or their message forwarded. The message is the sender's and stays, without
-    those words (nestor.forget does the same to what was stored before the opt-out)."""
+    their message (or somebody's forward of it), or their message forwarded. The message is the
+    sender's and stays, without those words (nestor.forget does the same to what was stored before
+    the opt-out)."""
     raw = msg.raw
-    replied = ([_dig(raw, "reply_to_message", "from", "id"), _dig(raw, "external_reply", "origin", "sender_user", "id")]
-               if "quote" in raw else [])
+    replied = ([_dig(raw, "reply_to_message", "from", "id"), _dig(raw, "external_reply", "origin", "sender_user", "id"),
+                await _replied_forward_author(conn, msg)] if "quote" in raw else [])
     forwarded = _forward_author(msg.forward_origin)
     wanted = [u for u in (*replied, forwarded) if isinstance(u, int)]
     gone = set(await conn.fetchval("SELECT array_agg(user_id) FROM users WHERE opted_out AND user_id = ANY($1::bigint[])",
