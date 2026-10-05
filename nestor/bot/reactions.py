@@ -248,14 +248,17 @@ class Reactor:
         if not queue or room <= 0 or not await self.wanted(chat_id):
             return 0
         texts = await self._texts(chat_id, [c.message_id for c in queue])
-        queue = [c for c in queue if c.message_id in texts]
+        # On the words as they are now: an edit since it came may have made a message plain («ахахах» -> «жаль»).
+        guesses = {c.message_id: g for c in queue
+                   if c.message_id in texts and (g := guess(texts[c.message_id])) is not None}
+        queue = [c for c in queue if c.message_id in guesses]
         allowed = await self.allowed(chat_id)
         if not queue or not allowed:
             return 0
         picks = await self._ask(chat_id, queue, texts, allowed, room)
-        if picks is None:   # no model now: only the sure guesses, on the words as they are now (an edit since)
+        if picks is None:   # no model now: only the sure guesses
             picks = {i: g.emoji for i, c in enumerate(queue, 1)
-                     if (g := guess(texts[c.message_id])) is not None and g.sure and g.emoji in allowed}
+                     if (g := guesses[c.message_id]).sure and g.emoji in allowed}
         if not picks:
             return 0
         # The model may take a while: a /pause, /reactions off, an edit or an author's /forget_me
