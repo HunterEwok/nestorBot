@@ -63,11 +63,6 @@ def verdict(text: str | None, *, on: bool = True, bot_word: bool = True, window:
     ("нестор оцени тезисы", "explicit"),
     ("нестор напомни завтра в 10 про встречу", "explicit"),
     ("нестор вчера тупил?", "explicit"),
-    ("нестор что я пропустил", "explicit"),         # a question by its first word, without its «?»
-    ("нестор кто прав", "explicit"),
-    ("нестор как дела", "explicit"),
-    ("нестор что нового", "explicit"),
-    ("бот сколько времени", "explicit"),
     ("бот, привет", "explicit"),
     ("нестор, глянь https://youtu.be/abc?si=xyz", "explicit"),
     # «помолчи» needs no check: it asks nothing of the model (nestor.bot.chime).
@@ -90,9 +85,10 @@ def verdict(text: str | None, *, on: bool = True, bot_word: bool = True, window:
     ("бот-то опять всё перепутал", "candidate"),
     ("Нестор-то молодец", "candidate"),
     ("бот-помощник опять всё перепутал", "candidate"),
-    ("нестор что-то тупит", "candidate"),            # not a question: «что-то», «как всегда», «когда-то»
-    ("нестор как всегда всё перепутал", "candidate"),
-    ("бот когда-то работал", "candidate"),
+    ("нестор что я пропустил", "candidate"),         # a question without its «?», or talk: the model decides
+    ("нестор кто прав", "candidate"),
+    ("бот сколько времени", "candidate"),
+    ("нестор что-то тупит", "candidate"),
     ("нестор вчера скинул ролик https://youtu.be/abc?si=xyz", "candidate"),    # a «?» in a link is no question
     # The name elsewhere with a sign of an address.
     ("слушай, Нестор, а ты как думаешь?", "candidate"),
@@ -116,6 +112,8 @@ def verdict(text: str | None, *, on: bool = True, bot_word: bool = True, window:
     ("Всем привет) Нестор, расписание на завтра", "candidate"),
     ("Доброе утро ☀️ Нестор, расписание на завтра", "candidate"),
     ("Нестору, привет от Пети", "candidate"),
+    ("спроси у Нестора, он знает", "candidate"),       # a comma after it: a call or talk, the model decides
+    ("я с Нестором, кстати, говорил", "candidate"),
     # The name in another case form.
     ("Нестору вопрос: ты как думаешь?", "candidate"),
     ("скажи, Нестору это понравится?", "candidate"),
@@ -124,8 +122,6 @@ def verdict(text: str | None, *, on: bool = True, bot_word: bool = True, window:
     ("привет боту!", "candidate"),
     # The name without any sign: talk about the bot, silence.
     ("вчера нестор тупил", "silent"),
-    ("спроси у Нестора, он знает", "silent"),
-    ("я с Нестором, кстати, говорил", "silent"),
     ("Нестору виднее", "silent"),
     ("в несторе что-то сломалось", "silent"),
     ("бота опять забанили", "silent"),
@@ -133,13 +129,13 @@ def verdict(text: str | None, *, on: bool = True, bot_word: bool = True, window:
     ("Всем привет. Нестор вчера тупил", "silent"),               # no comma after it
     ("Всем привет\nНестор вчера тупил", "silent"),
     ("скинул нестору ссылку https://youtu.be/abc?si=xyz", "silent"),
-    # «бот» in a compound word is not the name, nor is «Нестор-летописец».
+    # «бот» at the end of a compound word is not the name; at the start it is, the model decides.
     ("кто делал чат-бот?", "silent"),
     ("посоветуйте чат-бот для учёбы?", "silent"),
     ("кто-нибудь пользовался чат-ботом для перевода?", "silent"),
     ("телеграм-бот кто писал?", "silent"),
-    ("это Нестор-летописец написал?", "silent"),
-    ("а нестор-то знает?", "candidate"),                        # a particle after the name: still the name
+    ("это Нестор-летописец написал?", "candidate"),
+    ("а нестор-то знает?", "candidate"),
     # Not the name at all.
     ("ботинки купил", "silent"),
     ("несторианство — древняя ересь?", "silent"),
@@ -164,7 +160,6 @@ def test_each_word_that_speaks_to_the_bot(word):
     """No comma, no «?»: only the word tells «а нестор знаешь где ключи» from talk about the bot."""
     assert verdict(f"а нестор {word} это") == "candidate" and verdict("а нестор это") == "silent"
     assert verdict(f"нестор {word} это") == "explicit" and verdict("нестор это") == "candidate"
-    assert verdict(f"{word} это", window=True) == "candidate" and verdict("это", window=True) == "silent"
 
 
 @pytest.mark.parametrize("text, expected", [
@@ -214,69 +209,19 @@ def test_without_the_generic_bot_word(text, expected):
     assert verdict(text, bot_word=False) == expected
 
 
-@pytest.mark.parametrize("text, expected", [
-    ("а ты уверен?", "candidate"),
-    ("а почему?", "candidate"),
-    ("и что дальше", "candidate"),
-    ("А ты сам-то как считаешь", "candidate"),
-    ("можешь подробнее", "candidate"),
-    ("расскажи ещё про это", "candidate"),
-    ("откуда это известно?", "candidate"),
-    ("а ты видел https://youtu.be/x?si=y?", "candidate"),
-    ("ок", "silent"),
-    ("понятно", "silent"),
-    ("вот нарезка https://youtu.be/abc?si=xyz", "silent"),
-    ("а, понятно", "silent"),                   # a thanks or an «ок» goes on the conversation, it asks nothing
-    ("а ок", "silent"),
-    ("а, спасибо", "silent"),
-    ("и тебе спасибо", "silent"),
-    ("а, круто", "silent"),                     # nor does a reaction to the answer
-    ("а, понял, спасибо", "silent"),
-    ("а, ясно, спасибо", "silent"),
-    ("а, точно", "silent"),
-    ("а, вот оно что", "silent"),
-    ("а круто", "silent"),                      # the same without the comma, as chats write them
-    ("а прикольно", "silent"),
-    ("а точно", "silent"),
-    ("а ну да", "silent"),
-    ("а вот оно что", "silent"),
-    ("а понял спасибо", "silent"),
-    ("а ясно спасибо", "silent"),
-    ("а ок спс", "silent"),
-    ("а точно, спасибо", "silent"),
-    ("и тебе того же", "silent"),
-    ("ты лучший", "silent"),
-    ("спасибо, ты лучший", "silent"),
-    ("а почему", "candidate"),                  # a question without its «?»
-    ("ну и что", "candidate"),
-    ("а на завтра", "candidate"),               # «а …», «и …»: the conversation goes on
-    ("а подробнее", "candidate"),
-    ("а в Питере", "candidate"),
-    ("а про Кино", "candidate"),
-    ("и про Цоя тоже", "candidate"),
-    ("а теперь про Аквариум", "candidate"),
-    ("и ещё одну", "candidate"),
-    ("а Цой где похоронен", "candidate"),
-    ("а сам как считаешь", "candidate"),
-    ("а дальше что", "candidate"),
-    ("а в каком году", "candidate"),
-    ("а да", "silent"),
-    ("а ахах", "silent"),
-    ("а интересно", "silent"),
-    ("а сколько это стоит", "candidate"),
-    ("а, а ты откуда знаешь", "candidate"),
-    ("тебе не кажется, что это не так", "candidate"),
-    ("тебя это не смущает", "candidate"),
-    ("с тобой согласен не все", "candidate"),
-    ("твоя версия интереснее", "candidate"),
-    ("слышишь, это не так", "candidate"),
-    ("знаешь, это не так", "candidate"),
-    ("ахаха", "silent"),
-    ("вчера нестор тупил", "silent"),           # the name without a sign stays silent in the window too
-    ("Нестор, привет", "explicit"),
-])
-def test_in_the_window_after_an_answer(text, expected):
-    assert verdict(text, window=True) == expected
+@pytest.mark.parametrize("text", ["а ты уверен?", "а почему", "и что дальше", "можешь подробнее", "а на завтра",
+                                  "а подробнее", "и про Цоя тоже", "откуда это известно?", "а, круто", "а вот оно что",
+                                  "ахаха", "Маш, ты где?", "вот нарезка https://youtu.be/abc?si=xyz", "вчера нестор тупил"])
+def test_the_next_message_after_an_answer_is_for_the_model_whatever_it_says(text):
+    assert verdict(text, window=True) == "candidate" and verdict(text) == "silent"
+
+
+@pytest.mark.parametrize("text", ["ок", "понятно", "а, понятно", "а ок", "а, спасибо", "и тебе спасибо", "а, точно",
+                                  "а, понял, спасибо", "а понял спасибо", "а ок спс", "и тебе того же", "ты лучший",
+                                  "спасибо, ты лучший", "👍"])
+def test_a_thanks_or_an_ok_after_an_answer_is_not_checked(text):
+    """Nothing to answer: the reactions may say it."""
+    assert verdict(text, window=True) == "silent"
 
 
 @pytest.mark.parametrize("kw", [
@@ -291,15 +236,13 @@ def test_not_a_candidate_whatever_the_words(kw):
     assert verdict("а ты уверен?", window=True, **kw) == "silent"
 
 
-@pytest.mark.parametrize("text, expected", [("нестор переведи", "candidate"), ("нестор вчера тоже тупил", "candidate"),
-                                            ("нестор кто прав", "explicit"), ("бот кто прав", "explicit"),
-                                            ("Нестор\nкто тут прав", "explicit")])
-def test_the_name_at_the_start_of_a_reply_to_someone_is_for_the_model(text, expected):
-    """As a call by name it was answered with /address off: under a friend's message it is checked, not dropped,
-    and a question after the name is answered as it always was."""
+@pytest.mark.parametrize("text", ["нестор переведи", "нестор вчера тоже тупил", "нестор кто прав", "бот кто прав",
+                                  "Нестор\nкто тут прав"])
+def test_the_name_at_the_start_of_a_reply_to_someone_is_for_the_model(text):
+    """As a call by name it was answered with /address off: under a friend's message it is checked, not dropped."""
     friend = message(7, "налоги надо снизить вдвое", uid=222)
     assert verdict(text, on=False, reply_to_message=friend) == "explicit"
-    assert verdict(text, reply_to_message=friend) == expected
+    assert verdict(text, reply_to_message=friend) == "candidate"
 
 
 def test_replies_that_still_may_be_to_the_bot():
@@ -353,9 +296,9 @@ def test_rendered_without_names():
              "kind": "photo"},
             {"chat_id": CHAT_ID, "message_id": 6, "user_id": 333, "reply_to_id": None, "text": "Учёные доказали",
              "kind": "text", "forwarded": True}]
-    assert render(rows, BOT_ID) == ("1. Участник 1: Всем привет\n2. Нестор (ответ на 1): Привет!\n"
-                                    "3. Участник 2: [photo]\n4. Участник 1 (ответ на 2): а ты ⏎ уверен?\n"
-                                    "5. Участник 2: [photo] вот что выросло\n6. Участник 2 переслал: Учёные доказали")
+    assert render(rows, BOT_ID) == ("1. Аноним 1: Всем привет\n2. Нестор (ответ на 1): Привет!\n"
+                                    "3. Аноним 2: [photo]\n4. Аноним 1 (ответ на 2): а ты ⏎ уверен?\n"
+                                    "5. Аноним 2: [photo] вот что выросло\n6. Аноним 2 переслал: Учёные доказали")
 
 
 def test_texts():
@@ -458,8 +401,8 @@ async def test_the_model_sees_labels_and_the_messages_before_only(make_env, conn
     await feed(say(222, 6, "слушай, Нестор, а ты как думаешь?"))
     system, user = checker.checks[0][0]["content"], checker.checks[0][1]["content"]
     assert system == prompts.ADDRESS_SYSTEM
-    assert user == ("1. Участник 1: реплика 2\n2. Участник 2: реплика 3\n3. Участник 1: реплика 4\n"
-                    "4. Участник 2: реплика 5\n5. Участник 3: слушай, Нестор, а ты как думаешь?\n\n"
+    assert user == ("1. Аноним 1: реплика 2\n2. Аноним 2: реплика 3\n3. Аноним 1: реплика 4\n"
+                    "4. Аноним 2: реплика 5\n5. Аноним 3: слушай, Нестор, а ты как думаешь?\n\n"
                     "Обращено ли сообщение 5 к Нестору?")
     for name in ("Петя", "Петров", "petya", "User300", "User301"):
         assert name not in user
@@ -473,8 +416,8 @@ async def test_the_bots_own_answer_is_shown_as_nestor(make_env, conn):
     await feed(say(222, 1, "нестор, кто выиграл вчера?"))
     await feed(say(222, 2, "а ты уверен?", date=now() + 1))
     user = checker.checks[0][1]["content"]
-    assert user.startswith("1. Участник 1: нестор, кто выиграл вчера?\n2. Нестор: [ответ]\n"
-                           "3. Участник 1: а ты уверен?")
+    assert user.startswith("1. Аноним 1: нестор, кто выиграл вчера?\n2. Нестор: [ответ]\n"
+                           "3. Аноним 1: а ты уверен?")
 
 
 @pytest.mark.parametrize("ask, scenario", [("нестор, кто прав?", "who_is_right"), ("нестор, оцени тезисы", "theses"),
@@ -482,7 +425,7 @@ async def test_the_bots_own_answer_is_shown_as_nestor(make_env, conn):
                                            ("нестор, найди ссылку про налоги", "links"),
                                            ("нестор, а что с налогами?", "other")])
 async def test_the_bots_answers_are_shown_by_their_kind(make_env, conn, ask, scenario):
-    """The archive model names whomever it quotes, with a quote of their words: never shown, or Участник 1
+    """The archive model names whomever it quotes, with a quote of their words: never shown, or Аноним 1
     would be Петя."""
     checker = Checker(NO)
     _, _, feed = make_env(FakeLLM("Прав Петя Петров (@petya): [«налоги надо снизить»](#1)."), news_llm=checker)
@@ -493,7 +436,7 @@ async def test_the_bots_answers_are_shown_by_their_kind(make_env, conn, ask, sce
     assert await conn.fetchval("SELECT scenario FROM bot_requests WHERE trigger_msg_id = 2") == scenario
     assert "Петя Петров (@petya)" in await conn.fetchval("SELECT text FROM messages WHERE user_id = $1", BOT_ID)
     user = checker.checks[0][1]["content"]
-    assert "\n3. Нестор: [ответ]\n4. Участник 3: слушай" in user
+    assert "\n3. Нестор: [ответ]\n4. Аноним 3: слушай" in user
     for name in ("Петя", "Петров", "petya", "href"):
         assert name not in user
 
@@ -508,8 +451,8 @@ async def test_the_model_sees_the_messages_of_the_candidates_topic_only(make_env
     await feed(say(222, 4, "слушай, Нестор, а ты как думаешь?", message_thread_id=9, is_topic_message=True))
     await feed(say(222, 5, "слушай, Нестор, а ты как думаешь?"))                                      # General
     nine, general = (c[1]["content"].split("\n\n")[0] for c in checker.checks)
-    assert nine == "1. Участник 1: это в теме девять\n2. Участник 2: слушай, Нестор, а ты как думаешь?"
-    assert general == "1. Участник 1: это в общем чате\n2. Участник 2: слушай, Нестор, а ты как думаешь?"
+    assert nine == "1. Аноним 1: это в теме девять\n2. Аноним 2: слушай, Нестор, а ты как думаешь?"
+    assert general == "1. Аноним 1: это в общем чате\n2. Аноним 2: слушай, Нестор, а ты как думаешь?"
 
 
 async def test_the_message_asked_about_is_shown_whole(make_env, conn):
@@ -521,8 +464,8 @@ async def test_the_message_asked_about_is_shown_whole(make_env, conn):
     await feed(say(333, 1, story))
     await feed(say(222, 2, story + "кто из нас прав, как думаешь, нестор?"))
     before, asked = checker.checks[0][1]["content"].split("\n\n")[0].splitlines()
-    assert before == "1. Участник 1: " + story[:300] + " …[обрезано]"
-    assert asked == "2. Участник 2: " + story + "кто из нас прав, как думаешь, нестор?"
+    assert before == "1. Аноним 1: " + story[:300] + " …[обрезано]"
+    assert asked == "2. Аноним 2: " + story + "кто из нас прав, как думаешь, нестор?"
 
 
 async def test_the_bots_posts_are_shown_by_their_kind(make_env, conn):
@@ -534,8 +477,8 @@ async def test_the_bots_posts_are_shown_by_their_kind(make_env, conn):
     await feed(say(333, 2, "/stats"))
     await feed(say(222, 3, "слушай, Нестор, а ты как думаешь?", date=now() + 1))
     user = checker.checks[0][1]["content"]
-    assert user.startswith("1. Участник 1: всем привет\n2. Участник 2: /stats\n3. Нестор: [статистика]\n"
-                           "4. Участник 1: слушай, Нестор")
+    assert user.startswith("1. Аноним 1: всем привет\n2. Аноним 2: /stats\n3. Нестор: [статистика]\n"
+                           "4. Аноним 1: слушай, Нестор")
     for name in ("Петя", "Петров", "petya", "User333"):
         assert name not in user
 
@@ -554,7 +497,7 @@ async def test_every_kind_of_the_bots_posts_is_shown_by_its_kind(make_env, conn,
                        "VALUES ($1, $2, 'ok', '{2}')", CHAT_ID, scenario)
     await feed(say(222, 3, "слушай, Нестор, а ты как думаешь?", date=now() + 1))
     user = checker.checks[0][1]["content"]
-    assert user.startswith(f"1. Участник 1: всем привет\n2. Нестор: [{kind}]\n3. Участник 2: слушай")
+    assert user.startswith(f"1. Аноним 1: всем привет\n2. Нестор: [{kind}]\n3. Аноним 2: слушай")
     for name in ("Петя", "Петров", "petya", "налоги"):
         assert name not in user
 
@@ -570,7 +513,7 @@ async def test_the_news_post_is_shown_by_its_kind(make_env, pool, conn):
     assert bot.sent[-1]["text"].startswith("🗞 <b>Новости дня")
     await feed(say(222, 2, "слушай, Нестор, а ты как думаешь?", date=now() + 1))
     user = checker.checks[0][1]["content"]
-    assert "\n2. Нестор: [новости]\n3. Участник 2: слушай" in user and "Новости дня" not in user
+    assert "\n2. Нестор: [новости]\n3. Аноним 2: слушай" in user and "Новости дня" not in user
 
 
 @pytest.mark.parametrize("ask, kind", [("нестор, о чём говорили?", "пересказ"),
@@ -599,7 +542,7 @@ async def test_opted_out_authors_and_quotes_are_not_shown(make_env, conn):
     await feed(say(333, 2, "да ладно", reply_to_message=quoting, quote={"text": "мой секрет", "position": 0}))
     await feed(say(222, 3, "а ты что скажешь, нестор?"))
     user = checker.checks[0][1]["content"]
-    assert "секрет" not in user and user.startswith("1. Участник 1: да ладно\n2. Участник 2: а ты что скажешь")
+    assert "секрет" not in user and user.startswith("1. Аноним 1: да ладно\n2. Аноним 2: а ты что скажешь")
 
 
 @pytest.mark.parametrize("answer", [NO, "Да", '{"to_bot": "yes"}', "не знаю", "",
@@ -709,20 +652,9 @@ async def test_the_name_at_the_start_under_a_friends_message_is_answered_on_a_ye
     await feed(say(333, 1, "налоги надо снизить вдвое"))
     await feed(say(222, 2, "нестор переведи", reply_to_message=message(1, "налоги надо снизить вдвое", uid=333)))
     assert checker.checks[0][1]["content"].startswith(
-        "1. Участник 1: налоги надо снизить вдвое\n2. Участник 2 (ответ на 1): нестор переведи")
+        "1. Аноним 1: налоги надо снизить вдвое\n2. Аноним 2 (ответ на 1): нестор переведи")
     assert len(llm.calls) == 1 and bot.sent[-1]["reply_to"] == 2
     assert await conn.fetchval("SELECT question FROM bot_requests WHERE trigger_msg_id = 2") == "переведи"
-
-
-@pytest.mark.parametrize("text, scenario", [("нестор кто прав", "who_is_right"), ("нестор что я пропустил", "catchup")])
-async def test_a_question_after_the_name_needs_no_check(make_env, conn, text, scenario):
-    """Without its «?» too: answered as with /address off, also with no profile to check it with."""
-    bot, llm, feed = make_env()
-    await address_on(conn)
-    await feed(say(333, 1, "налоги надо снизить вдвое"))
-    await feed(say(222, 2, text, reply_to_message=message(1, "налоги надо снизить вдвое", uid=333)))
-    assert len(llm.calls) == 1 and bot.sent[-1]["reply_to"] == 2
-    assert await conn.fetchval("SELECT scenario FROM bot_requests WHERE trigger_msg_id = 2") == scenario
 
 
 async def test_a_no_still_may_get_a_reaction(make_env, conn):
@@ -828,15 +760,17 @@ async def test_thanks_right_after_an_answer_cost_nothing(make_env, conn, text):
     assert bot.reactions[-1][0] == 3 and bot.reactions[-1][1] in (["👌"], ["❤"]) and len(llm.calls) == 1
 
 
-@pytest.mark.parametrize("text", ["а, круто", "а, понял, спасибо", "а, точно", "а круто", "а вот оно что",
-                                  "а прикольно", "а точно"])
-async def test_a_reaction_right_after_an_answer_costs_nothing(make_env, conn, text):
-    checker = Checker(YES)
+@pytest.mark.parametrize("text", ["а, круто", "а вот оно что", "Маш, ты где?"])
+async def test_one_check_per_answer_at_most(make_env, conn, text):
+    """Whatever the person's next message says, the model decides, once: a no, and the window is closed."""
+    checker = Checker(NO)
     bot, llm, feed = make_env(news_llm=checker)
     await address_on(conn)
     await feed(say(222, 1, "нестор, кто выиграл вчера?"))
     await feed(say(222, 2, text, date=now() + 5))
-    assert checker.checks == [] and len(llm.calls) == 1 and [s["reply_to"] for s in bot.sent] == [1]
+    await feed(say(222, 3, "а почему?", date=now() + 10))
+    assert len(checker.checks) == 1 and len(llm.calls) == 1 and [s["reply_to"] for s in bot.sent] == [1]
+    assert checker.checks[0][1]["content"].split("\n\n")[0].endswith(f"Аноним 1: {text}")
 
 
 async def test_the_model_is_told_the_bot_has_just_answered(make_env, conn):
@@ -849,8 +783,8 @@ async def test_the_model_is_told_the_bot_has_just_answered(make_env, conn):
         await feed(say(333 + i % 2, i, f"другая тема {i}", date=now() + 1))
     await feed(say(222, 6, "а ты уверен?", date=now() + 20))
     assert checker.checks[0][1]["content"] == (
-        "1. Участник 1: другая тема 2\n2. Участник 2: другая тема 3\n3. Участник 1: другая тема 4\n"
-        "4. Участник 2: другая тема 5\n5. Участник 3: а ты уверен?\n\n"
+        "1. Аноним 1: другая тема 2\n2. Аноним 2: другая тема 3\n3. Аноним 1: другая тема 4\n"
+        "4. Аноним 2: другая тема 5\n5. Аноним 3: а ты уверен?\n\n"
         "Нестор меньше 5 мин назад ответил автору сообщения 5, и это следующее сообщение автора.\n"
         "Обращено ли сообщение 5 к Нестору?")
 
@@ -978,17 +912,19 @@ async def test_paused_chats_and_opted_out_authors_are_not_checked(make_env, conn
     assert checker.calls == [] and llm.calls == []
 
 
-def test_the_window_forgets_old_entries():
+def test_the_window_is_the_next_message_only():
     addresser = Addresser(None, lambda: None, ME, wanted=None, checks_today=None, may_spend=None, log_call=None,
                           answer=None, declined=None, cfg=AddressConfig(window_min=5))
     addresser.opened(CHAT_ID, None, 222, at=1000)
+    assert not addresser.next_message(message(1, "а ты?", uid=222, date=998))    # written before the answer came
+    assert addresser.next_message(message(2, "а ты?", uid=222, date=999))        # Telegram's date is whole seconds
+    assert not addresser.next_message(message(3, "а ты?", uid=222, date=1000))   # the next one only
+    addresser.opened(CHAT_ID, None, 222, at=1000)
+    assert not addresser.next_message(message(4, "а ты?", uid=222, date=1301))   # too late, and closed
+    addresser.opened(CHAT_ID, None, 222, at=1000)
     addresser.opened(CHAT_ID, 9, 333, at=1200)
-    assert addresser.window(message(1, "а ты?", uid=222, date=1300))
-    assert addresser.window(message(1, "а ты?", uid=222, date=999))         # Telegram's date is whole seconds
-    assert not addresser.window(message(1, "а ты?", uid=222, date=998))     # written before the answer came
-    assert not addresser.window(message(1, "а ты?", uid=222, date=1301))
-    assert not addresser.window(message(1, "а ты?", uid=333, date=1300))   # another topic
-    addresser.opened(CHAT_ID, None, 555, at=1400)
+    assert not addresser.next_message(message(5, "а ты?", uid=333, date=1300))   # another topic
+    addresser.opened(CHAT_ID, None, 555, at=1400)                                 # old entries are forgotten
     assert set(addresser._answered) == {(CHAT_ID, 9, 333), (CHAT_ID, None, 555)}
 
 

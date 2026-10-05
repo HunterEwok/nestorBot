@@ -73,31 +73,19 @@ class Pick:
     text: str
 
 
-# What the model reads besides the words (nestor.bot.addressing.render) means nothing in the chat: the
-# labels instead of names («Участник 2», «участнику-3», «третий участник», «2-й участник», «участник три»,
-# «участник под номером 2», «участник второй,»), the numbers of the messages («сообщение 3», «в сообщении
-# номер 3», «в 3-м сообщении», «#3», «№3», «(ответ на 3)») and of the topics («[тема 2]», «в теме 2», «во
-# второй теме», «в общей теме»). Years and amounts («в 1943-м», «первый синтез», «5 участников группы»,
-# «участники первого состава») pass.
-_ORDINAL = (r"(?:перв|втор|трет|четв[её]рт|пят|шест|седьм|восьм|девят|десят)"
-            r"(?:ый|ой|ий|ая|ое|ого|ому|ым|ом|ую|ей|ья|ье|ьего|ьему|ьим|ьем|ью|ьей)")
-_NUMBER = r"(?:один|одна|два|две|три|четыре|пять|шесть|семь|восемь|девять|десять)(?!\w)"
-_LABEL = re.compile(
-    r"участни[кц]\w*\W{0,3}(?:(?:под\s+)?номер\w*\s*|№\s*)?(?:\d|" + _NUMBER + r"|"
-    r"(?<!\w)" + _ORDINAL + r"(?!\s*\w))|"
-    r"\d+\s*-?\s*(?:й|ий|ый|ой|го|ого|му|ому|ему|м|ым|ом|я|ая|ую|ю|ей)\s+участни[кц]|"
-    r"сообщени\w*\W{0,3}(?:номер\s*|№\s*|#\s*)?\d|\d+\s*-?\s*(?:[а-яё]{1,3}\s+)?сообщени|"
-    r"(?<!\w)" + _ORDINAL + r"\s+(?:участни[кц]|сообщени|тем[аеуыо])|"
-    r"№\s*\d|(?<![\w&#])#\s*\d|\(\s*ответ\s+на\s+\d|"
-    r"(?<!\w)тем[аеуыо]й?\W{0,3}(?:номер\s*|№\s*)?\d|\[\s*(?:тема|общая\s+тема)|(?<!\w)в\s+общей\s+теме",
-    re.IGNORECASE)
-# «Нестор: …» or «Нестор (ответ на 3): …», as the model reads its own.
-_SIGNED = re.compile(r"^\s*нестор\s*(?:\(\s*ответ\s+на\s+\d+\s*\)\s*)?(?::|—|–|-(?!\w))\s*", re.IGNORECASE)
+# What the model reads besides the words (nestor.bot.addressing.render) means nothing in the chat: the labels
+# instead of names («Аноним 2»), of the forum's topics («[раздел 2]»), the numbers of the messages («3. …», «(ответ
+# на 3)»). The model is told never to mention them; a remark that does anyway, in any form, is not said: the
+# labels' stems and «сообщени…», or a number marked as one («#3», «№3», «ответ на 3»). Now and then a fine
+# remark goes too («по сообщениям ТАСС»): silence is the default anyway.
+_SHOWN = re.compile(r"аноним|раздел|сообщени|[#№]\s*\d|ответ\s+на\s+\d", re.IGNORECASE)
+# «Нестор: …», as the model reads its own.
+_SIGNED = re.compile(r"^\s*нестор\s*(?::|—|–|-(?!\w))\s*", re.IGNORECASE)
 
 
 def parse(answer: str | None, count: int) -> Pick | None:
     """{"reply_to": N, "text": "…"} -> Pick. {"reply_to": null}, a number that was not shown, an empty
-    text, one too long to cut, a link, a label («Участник 2 прав») or a message's number, an answer
+    text, one too long to cut, a link, a label («Аноним 2 прав») or a message's number, an answer
     with words around its object or with two objects (an object in it may be quoted from the chat),
     anything else: None, the bot stays silent. A «Нестор:» before the text is dropped."""
     data = sole_json(answer)
@@ -107,7 +95,7 @@ def parse(answer: str | None, count: int) -> Pick | None:
     if type(n) is not int or not 1 <= n <= count or not isinstance(text, str):
         return None
     text = trim(_SIGNED.sub("", text))
-    if text is None or LINK.search(text) or _LABEL.search(text):
+    if text is None or LINK.search(text) or _SHOWN.search(text):
         return None
     return Pick(n, text)
 

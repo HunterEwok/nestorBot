@@ -51,12 +51,7 @@ _SPEAKS_TO = re.compile(
     r"скажи|подскажи|расскажи|объясни|помоги|напомни|найди|глянь|посмотри|как\s+думаешь|знаешь|можешь|слышишь|"
     r"слушай|оцени|проверь|включи|подумай|перескажи)(?!\w)", re.IGNORECASE)
 # A mark right after the name: «нестор, ...», «нестор: ...», «нестор — ...», «нестор?».
-_MARK = re.compile(r"[,:;!?.…—–-]")
-# A question by its first word, without its «?»: «нестор что я пропустил», «нестор кто прав», «нестор как дела».
-# Not «что-то», «когда-то», nor «как всегда», «как и все»: «нестор что-то тупит» is about the bot.
-_ASKS = re.compile(r"(?:что|чего|кто|кого|кому|где|куда|откуда|когда|сколько|почему|зачем|"
-                   r"как(?:ой|ая|ое|ие|ую|ого|ому|им|их)|как(?![\w-])(?!\s+(?:всегда|обычно|будто|и|раз|бы|правило)"
-                   r"(?!\w)))(?![\w-])", re.IGNORECASE)
+MARK = re.compile(r"[,:;!?.…—–-]")
 # A web address, without its trailing punctuation: a «?si=» inside it is not a question.
 URL = re.compile(r"(?:https?://|www\.|(?<![\w.])[\w-]+(?:\.[\w-]+)*\.[a-z]{2,}/)\S+?(?=[.,;:!?)»\"']*(?:\s|$))")
 
@@ -67,19 +62,17 @@ def speaks_to(text: str) -> bool:
     return "?" in text or _SPEAKS_TO.search(text) is not None
 
 
-# «помолчи», «замолчи уже», «хватит», «не встревай», «пожалуйста, помолчи», «помолчи, а?», «да помолчи ты»:
-# the whole request asks the bot to keep quiet (nestor.bot.chime).
-_QUIET = re.compile(r"(?:(?:ну|да|вс[её]|ладно|давай|пожалуйста|пж|плиз|плз)\s+)*"
-                    r"(помолчи|замолчи|хватит|не\s+встревай)"
-                    r"((?:\s+(?:пожалуйста|пж|плиз|плз|уже|сегодня|пока|а|ты|немного|чуть\s+чуть|чуточку|"
-                    r"до\s+завтра|ладно|давай))*)")
+# «помолчи», «замолчи уже», «хватит», «не встревай», «ну помолчи, пожалуйста», «да помолчи ты»: a quiet word,
+# and nothing but these soft words around it (nestor.bot.chime). Anything else is a request like any other.
+_SOFT = r"(?:а|ну|да|же|уже|вс[её]|ты|ладно|давай|пожалуйста|плиз|плз|пж|пока|сегодня|немного|до|завтра)"
+_QUIET = re.compile(rf"(?:{_SOFT} )*(?:помолчи|замолчи|хватит|не встревай)((?: {_SOFT})*)")
 
 
 def quiet(text: str) -> bool:
-    """Whether the text, the bot's name taken out, asks it to keep quiet. «хватит?» alone is a question
-    («is it enough?»); «помолчи, а?» and «хватит уже, а?» are not."""
+    """Whether the text, the bot's name taken out, asks it to keep quiet. A «?» makes it a question («хватит?»,
+    is it enough?), unless only soft words come between the quiet word and the «?»: «помолчи, а?», «помолчи уже?»."""
     m = _QUIET.fullmatch(" ".join(re.sub(r"[^\w\s]", " ", text.lower()).split()))
-    return m is not None and not (m.group(1) == "хватит" and not m.group(2) and "?" in text)
+    return m is not None and ("?" not in text or (bool(m.group(1)) and re.search(r"\?\W*$", text) is not None))
 
 
 def name_forms(keywords: tuple[str, ...]) -> str:
@@ -95,18 +88,18 @@ def name_forms(keywords: tuple[str, ...]) -> str:
 
 
 def name_regex(keywords: tuple[str, ...]) -> str:
-    """A regex of the bot's names (name_forms) as whole words: not the end of «чат-бот» or «телеграм-бота»,
-    nor the start of «Нестор-летописец»; «нестор-то», «бот-ка» are the name and a particle."""
-    return rf"(?<![\w-])(?:{name_forms(keywords)})(?!\w)(?!-(?!(?:то|ка|таки)(?!\w))\w)"
+    """A regex of the bot's names (name_forms) as words of their own: not the end of «чат-бот» or
+    «телеграм-бота». «нестор-то», «Нестор-летописец» are the name: the model tells them apart."""
+    return rf"(?<![\w-])(?:{name_forms(keywords)})(?!\w)"
 
 
 def detect(msg: dict, me: BotIdentity, *, generic_keyword_enabled: bool = True,
            addressing: bool = False) -> Invocation | None:
     """An explicit call: a command, an @mention, a reply to the bot, or the name at the start.
     addressing (/address on): the name at the start counts only when a comma or another mark comes
-    after it, the rest speaks to someone, asks something or asks it to keep quiet, or there is no rest
-    («нестор», «нестор 👋»); «нестор вчера тупил» and «нестор-то вчера тупил» are left to
-    nestor.bot.addressing."""
+    after it, the rest speaks to someone (a «?», «ты», a request) or asks it to keep quiet, or there is
+    no rest («нестор», «нестор 👋»); «нестор вчера тупил», «нестор-то вчера тупил» and «нестор кто прав»
+    are left to nestor.bot.addressing, the model decides."""
     text = msg.get("text") or msg.get("caption") or ""
     entities = msg.get("entities") or msg.get("caption_entities") or []
 
@@ -140,7 +133,7 @@ def detect(msg: dict, me: BotIdentity, *, generic_keyword_enabled: bool = True,
             if re.search(r"\w-$", mark) and re.match(r"\w", rest):
                 mark = mark[:-1]
             # The bare name, maybe with an emoji or a bracket after it, calls the bot as it always did.
-            if not addressing or _MARK.search(mark) or _MARK.match(rest) or speaks_to(rest) or _ASKS.match(rest) \
-                    or quiet(rest) or not re.search(r"\w", rest):
+            if not addressing or MARK.search(mark) or MARK.match(rest) or speaks_to(rest) or quiet(rest) \
+                    or not re.search(r"\w", rest):
                 return Invocation("keyword", rest.strip())
     return None

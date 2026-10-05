@@ -202,16 +202,16 @@ class Answerer:
         inv = detect(msg, self.me, generic_keyword_enabled=generic, addressing=address)
         if "from" not in msg:
             return
+        # The person's next message after the bot's answer, whatever it is, closes their conversation window
+        # (nestor.bot.addressing); a delivered answer to it opens a new one.
+        window = self.addresser.next_message(msg)
         if inv is None:
             # A message that may be addressed to the bot without its name is checked first; one that
             # is not goes on to the reactions (_not_addressed).
             if not paused and not (address and self.addresser.consider(msg, generic_keyword_enabled=generic,
-                                                                        order=order)):
+                                                                        window=window, order=order)):
                 self._not_addressed(msg, settings)
             return
-        # Said to the bot outright, it is the person's next message: their window after the last answer is used
-        # up, «нестор, спасибо», /help or «помолчи» included. A delivered answer to it opens a new one.
-        self.addresser.closed(msg["chat"]["id"], _topic(msg), msg["from"]["id"])
         if paused and inv.command not in ("resume", "status", "forget_me", "privacy"):   # /forget_me never waits
             return
         if inv.kind == "command":

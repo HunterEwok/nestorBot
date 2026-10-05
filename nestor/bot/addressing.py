@@ -4,8 +4,8 @@ The clear cases are decided by code for free (nestor.bot.triggers.detect): a com
 a reply to the bot, the name at the start with a comma, or alone. In a group where an admin turned on
 /address, the doubtful ones are candidates: the name elsewhere in the message with a sign of
 an address («слушай, Нестор, а ты как думаешь?»), the name at the start without a comma
-(«нестор вчера тупил»), and the next message of someone the bot has just answered, with «ты»,
-a request, a question or an «а …» («а ты уверен?», «а на завтра» a minute later). A candidate,
+(«нестор вчера тупил», «нестор кто прав»), and the next message of someone the bot has just answered,
+whatever it says («а ты уверен?», «а на завтра» a minute later), but for a thanks or an «ок». A candidate,
 with the few messages before it and without names, goes to the profile without tools for a yes or
 a no; a yes is answered as if the bot had been called by name. No profile, past the daily number
 of checks, or when the day's tokens run low: no check, and no answer. The code never guesses yes.
@@ -24,7 +24,14 @@ import asyncpg
 from . import context, prompts
 from .llm import LLM, Completion, sole_json
 from .reactions import acknowledgement, eligible
-from .triggers import BotIdentity, Invocation, keyword_pattern, name_regex, speaks_to
+from .triggers import (
+    MARK,
+    BotIdentity,
+    Invocation,
+    keyword_pattern,
+    name_regex,
+    speaks_to,
+)
 
 log = logging.getLogger("nestor.addressing")
 
@@ -37,33 +44,15 @@ class AddressConfig:
     timeout_s: float = 20          # a check that takes longer is a no
 
 
-# «а почему», «и что дальше», «а на завтра», «и про Цоя тоже»: going on with the conversation.
-_GOES_ON = re.compile(r"^\s*(?:(?:а|и|ну)(?!\w)[\s,]*)+\w", re.IGNORECASE)
-# «а круто», «а, точно», «а вот оно что», «а ну да», «и ахаха»: a reaction to it, which asks nothing.
-_REACTION = re.compile(r"(?:(?:а|и|ну)\s+)*(?:круто|прикольно|класс|здорово|супер|норм|точно|да|конечно|ясно|понятно|"
-                       r"логично|интересно|бывает|жесть|ого|вау|ничего\s+себе|во[тн]\s+оно\s+(?:что|как)|вот\s+как|"
-                       r"а?х[ах]*)")
-
-
-def _reaction(text: str) -> bool:
-    return _REACTION.fullmatch(" ".join(re.sub(r"[^\w\s]", " ", text.lower()).split())) is not None
-
-
 def _keywords(me: BotIdentity, generic_keyword_enabled: bool) -> tuple[str, ...]:
     return me.keywords if generic_keyword_enabled else tuple(k for k in me.keywords if k != "бот")
 
 
 def _set_off(text: str, start: int, end: int) -> bool:
-    """The name at text[start:end] is said to someone: set off by commas («слушай, Нестор, а ...»,
-    «спасибо, нестор», «спасибо, нестор 🙏»), or at the very end before «?» or «!» («привет нестор!»).
-    A sentence or a line that starts with it needs only the comma after it: «Ребята, привет! Нестор, ...»,
-    «Всем привет) Нестор, ...», «Доброе утро ☀️ Нестор, ...», or «Нестор, ...» on a line of its own."""
-    before, after = text[:start].rstrip(), text[end:].lstrip()
-    if re.fullmatch(r"[?!]+\W*", after):
-        return True
-    starts = not before or "\n" in text[len(before):start] or not re.match(r"[\w,(«\"'—–-]", before[-1])
-    return (before.endswith(",") and (not after or after[0] in ",.!?…" or not re.search(r"\w", after))) or \
-        (after.startswith(",") and starts)
+    """The name at text[start:end] is said to someone: a comma before it («слушай, Нестор, а ...», «спасибо,
+    нестор 🙏») or a mark after it, as at the start («Всем привет. Нестор, ...», «привет нестор!»). Talk about
+    the bot may look the same («спроси у Нестора, он знает»): the model tells them apart."""
+    return text[:start].rstrip().endswith(",") or MARK.match(text[end:].lstrip()) is not None
 
 
 def _replies_to_someone(msg: dict) -> bool:
@@ -80,10 +69,11 @@ def _replies_to_someone(msg: dict) -> bool:
 def candidate(msg: dict, me: BotIdentity, *, generic_keyword_enabled: bool = True,
               window: bool = False) -> Invocation | None:
     """Whether a message that detect() did not take may still be addressed to the bot, for the
-    model to decide; None when it is clearly not. window: the bot answered this person here a
-    moment ago. Only a person's own words: no bots, channels, forwards or commands. A reply to
-    someone else is said to them, unless it starts with the name («нестор кто прав» under a
-    friend's message)."""
+    model to decide; None when it is clearly not. window: it is the person's next message here
+    after the bot answered them a moment ago, a candidate whatever it says, but for a thanks or an
+    «ок» (nothing to answer: the reactions may say it). Only a person's own words: no bots, channels,
+    forwards or commands. A reply to someone else is said to them, unless it starts with the name
+    («нестор кто прав» under a friend's message)."""
     text = msg.get("text") or msg.get("caption") or ""
     if not eligible(msg):
         return None
@@ -96,9 +86,7 @@ def candidate(msg: dict, me: BotIdentity, *, generic_keyword_enabled: bool = Tru
         return None
     if found and (speaks_to(text) or any(_set_off(text, m.start(), m.end()) for m in found)):
         return Invocation("address", strip_name(text, names))
-    # «а понятно», «и тебе спасибо», «а понял спасибо» right after an answer: a thanks, not a request.
-    if window and (speaks_to(text) or (_GOES_ON.match(text) and not _reaction(text))) \
-            and acknowledgement(text) is None:
+    if window and acknowledgement(text) is None:
         return Invocation("address", strip_name(text, names) if names else text.strip())
     return None
 
@@ -142,21 +130,22 @@ async def bot_posts(conn, rows, bot_id: int) -> dict[tuple[int, int], str]:
 
 
 def render(rows, bot_id: int, *, posts: dict[tuple[int, int], str] | None = None, whole_last: bool = False) -> str:
-    """The messages, numbered, oldest first, a label instead of each author: «Участник 1», ..., and
-    «Нестор» for the bot. A reply to one of them says which. Each is cut to SHOWN characters, with
-    «…[обрезано]» after it; whole_last: the last one, the message asked about, is shown whole (an address
-    often ends a long message). posts: the bot's answers and posts among them (bot_posts), shown by their
-    kind only. Messages of a forum's several topics say which one each is in, «[тема 1]», ..., and
-    «[общая тема]» for General. A forward says so, «Участник 2 переслал: …»: the words are someone else's.
-    A photo, a voice message, a sticker are their kind, «[voice]», a caption comes after it: «[photo] …»."""
+    """The messages, numbered, oldest first, a label instead of each author: «Аноним 1», ..., and
+    «Нестор» for the bot (labels no remark would say by chance: nestor.bot.chime refuses any that does).
+    A reply to one of them says which. Each is cut to SHOWN characters, with «…[обрезано]» after it;
+    whole_last: the last one, the message asked about, is shown whole (an address often ends a long
+    message). posts: the bot's answers and posts among them (bot_posts), shown by their kind only. Messages
+    of a forum's several topics say which one each is in, «[раздел 1]», ..., and «[общий раздел]» for
+    General. A forward says so, «Аноним 2 переслал: …»: the words are someone else's. A photo, a voice
+    message, a sticker are their kind, «[voice]», a caption comes after it: «[photo] …»."""
     labels: dict[int | None, str] = {}
     numbers = {(r["chat_id"], r["message_id"]): i for i, r in enumerate(rows, 1)}
     topics = [_row_topic(r) for r in rows]
-    topic_labels = {t: f"тема {i}" for i, t in enumerate(dict.fromkeys(t for t in topics if t is not None), 1)}
+    topic_labels = {t: f"раздел {i}" for i, t in enumerate(dict.fromkeys(t for t in topics if t is not None), 1)}
     lines = []
     for i, r in enumerate(rows, 1):
-        who = "Нестор" if r["user_id"] == bot_id else labels.setdefault(r["user_id"], f"Участник {len(labels) + 1}")
-        topic = f"[{topic_labels.get(topics[i - 1], 'общая тема')}] " if len(set(topics)) > 1 else ""
+        who = "Нестор" if r["user_id"] == bot_id else labels.setdefault(r["user_id"], f"Аноним {len(labels) + 1}")
+        topic = f"[{topic_labels.get(topics[i - 1], 'общий раздел')}] " if len(set(topics)) > 1 else ""
         target = numbers.get((r["chat_id"], r["reply_to_id"]))
         reply = f" (ответ на {target})" if target else ""
         post = (posts or {}).get((r["chat_id"], r["message_id"])) if r["user_id"] == bot_id else None
@@ -223,28 +212,27 @@ class Addresser:
             del self._answered[key]
         self._answered[(chat_id, topic, user_id)] = now
 
-    def closed(self, chat_id: int, topic: int | None, user_id: int) -> None:
-        """The person's next message here is to the bot outright (by name, a command, a reply to it): the
-        window after the last answer is used up. A delivered answer to it opens a new one (opened)."""
-        self._answered.pop((chat_id, topic, user_id), None)
-
-    def window(self, msg: dict) -> bool:
-        """Whether the message was written within the window after the bot's last answer to its
-        author here (Telegram's dates are whole seconds: a second's slack)."""
-        at = self._answered.get((msg["chat"]["id"], _topic(msg), msg["from"]["id"]))
-        return at is not None and at - 1 <= msg.get("date", 0) <= at + self.cfg.window_min * 60
+    def next_message(self, msg: dict) -> bool:
+        """A message of a person here: whether it is their next one within the window after the bot's last
+        answer to them (Telegram's dates are whole seconds: a second's slack). Whatever it is, a call by name,
+        a command, «спасибо» or a word to a friend, the window after that answer closes with it; one written
+        before the answer came leaves it open."""
+        key, date = (msg["chat"]["id"], _topic(msg), msg["from"]["id"]), msg.get("date", 0)
+        at = self._answered.get(key)
+        if at is None or date < at - 1:
+            return False
+        del self._answered[key]
+        return date <= at + self.cfg.window_min * 60
 
     # ---- candidates ----
 
-    def consider(self, msg: dict, *, generic_keyword_enabled: bool, order: int) -> bool:
+    def consider(self, msg: dict, *, generic_keyword_enabled: bool, window: bool, order: int) -> bool:
         """A new stored message detect() did not take, in a group with /address on that is not
-        paused: check it if it is a candidate. order: when it came (answerer.Job.order), so that a
-        /forget_me of its author during the check still drops the answer."""
+        paused: check it if it is a candidate. window: it is its author's next message after an answer
+        (next_message). order: when it came (answerer.Job.order), so that a /forget_me of its author
+        during the check still drops the answer."""
         if self.llm() is None:      # no profile without tools: candidates are ignored, never guessed
             return False
-        window = self.window(msg)
-        if window:      # only the person's next message: «понятно», or a word to a friend, closes it
-            del self._answered[(msg["chat"]["id"], _topic(msg), msg["from"]["id"])]
         inv = candidate(msg, self.me, generic_keyword_enabled=generic_keyword_enabled, window=window)
         if inv is None:
             return False
