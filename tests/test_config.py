@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import re
 from dataclasses import fields
 from datetime import time
 from pathlib import Path
@@ -211,3 +212,37 @@ def test_the_watchdog_test_and_dry_run_say_what_they_did(env, tmp_path, capsys):
     status, sent = capsys.readouterr().out.split("\n---\n")
     assert status.startswith("🩺 Состояние Нестора") and "🟠 Мало места" in status and "<b>" not in status
     assert sent == "🚨 Нестор: проблема\n🟠 Мало места\n" and len(bot.sent) == 1
+
+
+def test_the_watchdog_mute_from_the_command_line(env, tmp_path, capsys):
+    env.setattr(watchdog_main, "setup_logging", lambda level: None)
+    env.setenv("STATE_DIRECTORY", str(tmp_path))
+    env.setenv("RUNTIME_DIRECTORY", str(tmp_path / "run"))
+    env.setenv("ALLOWED_CHAT_IDS", "-1001111111111")
+    env.setenv("ALERT_CHAT_ID", "-1001111111111")
+
+    async def no_run(settings, **kw):
+        raise AssertionError("--mute ran the watchdog")
+
+    env.setattr(watchdog_main, "run_once", no_run)
+    path, in_memory = tmp_path / run.STATE_FILE, tmp_path / "run" / run.STATE_FILE
+    in_memory.parent.mkdir()
+    assert watchdog_main.main(["--mute", "60"]) == 0
+    assert re.fullmatch(r"muted until \d\d:\d\d\n", capsys.readouterr().out)
+    assert alerts.load_state(path).mute_until is not None
+    assert alerts.load_state(in_memory).mute_until == alerts.load_state(path).mute_until
+    # 0 ends it: it unmutes, and runs nothing.
+    assert watchdog_main.main(["--mute", "0"]) == 0 and capsys.readouterr().out == "unmuted\n"
+    assert alerts.load_state(path).mute_until is None and alerts.load_state(in_memory).mute_until is None
+    # A card that cannot be written: one line with the directory and the error's class, no traceback.
+    (tmp_path / (run.STATE_FILE + ".tmp")).mkdir()
+    with pytest.raises(SystemExit) as refused:
+        watchdog_main.main(["--mute", "60"])
+    assert str(refused.value) == f"cannot write the watchdog state in {tmp_path}: IsADirectoryError"
+    assert alerts.load_state(path).mute_until is None and alerts.load_state(in_memory).mute_until is None
+
+
+def test_the_watchdog_unit_keeps_its_state_where_the_code_looks():
+    unit = (Path(__file__).parent.parent / "deploy" / "systemd" / "nestor-watchdog.service").read_text()
+    assert f"StateDirectory={run.STATE_DIR.name}\n" in unit and f"RuntimeDirectory={run.RUNTIME_DIR.name}\n" in unit
+    assert "RuntimeDirectoryPreserve=yes\n" in unit         # the copy in memory outlives each run of the timer

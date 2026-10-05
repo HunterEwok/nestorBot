@@ -349,6 +349,7 @@ ALERT_BACKUP_EXPOSED = ("Папка с копиями открыта для по
 ALERT_BACKUP_SHRANK = "Копия меньше прошлой на {pct}%{why}"
 ALERT_BACKUP_SHRANK_WHY = ", а ночная чистка удалила сообщений: {count}"
 ALERT_BACKUP_WARNING = "Резервная копия сделана, но {warning}"
+ALERT_BACKUP_NOTE = "Резервные копии: {warning}"      # of a run that made no copy (ALERT_BACKUP_FAILED says so)
 ALERT_RETENTION_FAILED = "Ночная чистка архива не прошла: {reason}"
 ALERT_RETENTION_STALE = "Чистка архива не проходила с {since}"
 ALERT_RETENTION_OVERDUE = "В архиве есть {what} старше {months} мес.: обещание из /privacy не выполняется"
@@ -404,6 +405,9 @@ BACKUP_REASONS = {
 BACKUP_WARNINGS = {"clock_unsynced": "часы Pi не синхронизированы, старые копии не удалялись",
                    "clock_backwards": "часы Pi отстают от времени прошлой копии, старые копии не удалялись",
                    "rotation_failed": "старые копии удалить не получилось"}
+# What «снова в порядке» names for them: not «Резервные копии», which may still be failing.
+BACKUP_WARNING_LABELS = {"clock_unsynced": "Удаление старых копий", "clock_backwards": "Удаление старых копий",
+                         "rotation_failed": "Удаление старых копий", "shrank": "Размер копии"}
 RETENTION_REASONS = {"clock_skew": "часы Pi и базы расходятся больше чем на 10 минут",
                      "future_rows": "в архиве есть сообщения с датой из будущего",
                      "cutoff_invalid": "срок хранения вышел короче 360 дней",
@@ -420,6 +424,7 @@ DAILY_DB_DOWN = "🗄 База недоступна: архив, ответы и
 DAILY_ANSWERS = "💬 Ответов {answers}, ошибок {errors}; токены {tokens} из {limit} ({pct}%)"
 DAILY_BACKUP = "💾 Копия: {time}, {size}, копий {kept}, самая старая от {oldest}"
 DAILY_BACKUP_NONE = "💾 Удачных копий ещё нет"
+DAILY_BACKUP_OFF = "💾 Копии не отслеживаются: в .env нет BACKUP_STATUS_FILE"
 DAILY_PURGE = "🧹 Чистка: в последний раз удалила сообщений {count}; по сроку за 7 дней удалится {next}"
 DAILY_DISK = "💽 Карта Pi: свободно {free} из {total}"
 DAILY_COLLECTOR = "⚙️ Сборщик: память до {memory}, перезапусков за сутки {restarts}"

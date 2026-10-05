@@ -145,15 +145,26 @@ sudo systemctl start nestor-backup && cat /var/lib/nestor-backup/status.json    
    sudo systemctl disable --now nestor-collector nestor-backup.timer nestor-watchdog.timer
    systemctl --user stop hermes-gateway        # его MCP-сервер тоже держит соединение с базой
    ```
-2. На сервере базы, суперпользователем, если старая база ещё есть: `ALTER DATABASE nestor RENAME TO nestor_broken`.
-3. С ноутбука `python -m nestor.bootstrap`: создаст новую пустую `nestor`.
+2. Если старая база ещё есть: на сервере базы суперпользователем, подключившись к базе `postgres` (не к `nestor`), закрыть её соединения (DataGrip, psql с ноутбука) и переименовать её:
+   ```sql
+   SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'nestor' AND pid <> pg_backend_pid();
+   ALTER DATABASE nestor RENAME TO nestor_broken;
+   ```
+   Если `ALTER` выдал ошибку, дальше не идти: шаг 3 оставит старую базу как есть.
+3. С ноутбука создать новую пустую `nestor`. `bootstrap` заново задаёт пароли ролям, поэтому нужны те, что уже стоят на Pi и в Hermes, а не пароли из `.env` для разработки:
+   ```sh
+   PG_ADMIN_URL='postgresql://postgres:...@192.168.0.1/postgres' COLLECTOR_PASSWORD=... READER_PASSWORD=... \
+       BACKUP_PASSWORD=... python -m nestor.bootstrap
+   ```
+   `COLLECTOR_PASSWORD` — пароль из `DATABASE_URL` в `/opt/nestor/.env` на Pi, `READER_PASSWORD` — из `READER_DATABASE_URL` в `config.yaml` Hermes, `BACKUP_PASSWORD` — из `/etc/nestor-backup/pgpass`. Без `BACKUP_PASSWORD` у `nestor_backup` не будет доступа к новой базе (а на новом сервере не будет и самой роли), и копии перестанут сниматься. Сверить пароль `nestor`, не показывая его: первые 8 знаков должны совпасть — на Pi `sudo sed -nE 's|^DATABASE_URL=[^:]*://[^:]*:([^@]*)@.*|\1|p' /opt/nestor/.env | tr -d '\n' | sha256sum | cut -c1-8`, на ноутбуке `read -rs P; printf %s "$P" | sha256sum | cut -c1-8; unset P` (на Mac `shasum -a 256`).
 4. На Pi:
    ```sh
    F=$(sudo ls -1 /var/lib/nestor-backup/dumps | tail -n 1)
    sudo cat "/var/lib/nestor-backup/dumps/$F" | sudo -u nestor /opt/nestor/.venv/bin/python -m nestor.backup restore \
        --database nestor --optouts /var/lib/nestor-watchdog/optouts.json                  # restore done
    ```
-   `restore failed not_empty`: в новую базу уже что-то записали (обычно сборщик, если его не остановили). Тогда на сервере `DROP DATABASE nestor WITH (FORCE)`, и снова шаги 3 и 4.
+   - `restore failed not_empty`: в базе `nestor` уже что-то есть. Сначала на сервере `SELECT datname FROM pg_database`: если `nestor_broken` в списке нет, а старая база не потеряна, то это она — переименование на шаге 2 не прошло; ничего не удалять, вернуться к шагу 2. Если `nestor_broken` есть (или сервер новый), в новую базу успели записать (обычно сборщик, если его не остановили): `DROP DATABASE nestor WITH (FORCE)`, и снова шаги 3 и 4.
+   - `restore failed role_missing`: на сервере нет роли, которой копия выдаёт права (обычно `nestor_backup`: шаг 3 был без `BACKUP_PASSWORD`). Шаг 3 с ним, и снова шаг 4; восстановление идёт одной транзакцией, база осталась пустой.
 5. Запустить всё обратно:
    ```sh
    sudo systemctl enable --now nestor-collector nestor-backup.timer nestor-watchdog.timer
@@ -166,7 +177,7 @@ sudo systemctl start nestor-backup && cat /var/lib/nestor-backup/status.json    
 
 Сторож (`python -m nestor.watchdog`, таймер `nestor-watchdog` раз в 5 минут, пользователь `nestor`) — единственный, кто пишет о сбоях. Он проверяет базу и часы, миграции, жив ли сборщик и получает ли он сообщения из Telegram (по его пульсу), Hermes, ошибки модели, копии, чистку, место и запись на карте, опоздавшие напоминания и источники новостей. О проблеме пишет один раз, когда она подтвердилась, и ещё раз — тихо, когда прошла; не больше одного сообщения за проверку и шести в час. С 23:00 до 08:00 сообщения приходят без звука (кроме критичного, которое длится больше часа). В 09:30 — тихая сводка за вчера; если в группе оповещений больше `ALERT_MAX_MEMBERS` участников (с ботом), вместо сводки только предупреждение о посторонних. Его состояние — в `/var/lib/nestor-watchdog`, поэтому он помнит, что уже сказал, и когда база недоступна.
 
-В `.env`: `ALERT_CHAT_ID` — группа оповещений (она должна быть в `ALLOWED_CHAT_IDS`, иначе бот из неё выйдет; пусто — оповещений нет), `ALERT_DAILY_AT`, `ALERT_QUIET`, `ALERT_DISK_MIN_GB`, `ALERT_MAX_MEMBERS`, `BACKUP_STATUS_FILE=/var/lib/nestor-backup/status.json`. После правки `.env` перезапустить сборщик.
+В `.env`: `ALERT_CHAT_ID` — группа оповещений (она должна быть в `ALLOWED_CHAT_IDS`, иначе бот из неё выйдет; пусто — оповещений нет), `ALERT_DAILY_AT`, `ALERT_QUIET`, `ALERT_DISK_MIN_GB`, `ALERT_MAX_MEMBERS` (у них есть значения по умолчанию) и `BACKUP_STATUS_FILE=/var/lib/nestor-backup/status.json`. Эту строку в уже существующий `/opt/nestor/.env` надо дописать: без неё сторож копии не проверяет (в `/status` — «Не удалось проверить: Резервные копии», в сводке — «Копии не отслеживаются»). После правки `.env` перезапустить сборщик.
 
 ```sh
 sudo cp /opt/nestor/deploy/systemd/nestor-watchdog.{service,timer} /etc/systemd/system/

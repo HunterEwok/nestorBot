@@ -9,7 +9,8 @@
 7. the snapshot for /status into ops_state('watchdog'), in its own short transaction, with the state:
    the next run takes it from there if this one cannot save it (alerts.adopt);
 8. the opted-out user ids into optouts.json (0600): a restore from a backup forgets them again;
-9. save the state.
+9. save the state, on the card and in the unit's RuntimeDirectory (memory, lost on reboot): a card that
+   went read-only while the database is down still lets the next run know what this one said.
 """
 from __future__ import annotations
 
@@ -47,6 +48,7 @@ from .summary import daily_summary
 log = logging.getLogger("nestor.watchdog")
 
 STATE_DIR = Path("/var/lib/nestor-watchdog")      # the unit's StateDirectory
+RUNTIME_DIR = Path("/run/nestor-watchdog")        # its RuntimeDirectory
 STATE_FILE = "state.json"
 OPTOUTS_FILE = "optouts.json"
 CHECK_TIMEOUT_S = 20
@@ -94,6 +96,24 @@ async def connect(url: str) -> tuple[asyncpg.Connection | None, datetime | None,
     except Exception as e:  # noqa: BLE001
         conn.terminate()
         return None, None, type(e).__name__
+
+
+def load_state(state_dir: Path, runtime_dir: Path | None) -> AlertState:
+    """The newer of the state on the card and its copy in memory."""
+    states = [alerts.load_state(state_dir / STATE_FILE)]
+    if runtime_dir is not None and (runtime_dir / STATE_FILE).exists():
+        states.append(alerts.load_state(runtime_dir / STATE_FILE))
+    oldest = datetime.min.replace(tzinfo=UTC)
+    return max(states, key=lambda s: s.saved_at or oldest)
+
+
+def keep_in_memory(runtime_dir: Path | None, state: AlertState, now: datetime) -> None:
+    """The copy of the state in the RuntimeDirectory, if there is one."""
+    if runtime_dir is not None and runtime_dir.is_dir():
+        try:
+            alerts.save_state(runtime_dir / STATE_FILE, state, now)
+        except OSError as e:
+            log.warning("watchdog state not kept in memory", extra={"error": type(e).__name__})
 
 
 def due(check: Check, state: AlertState, now: datetime) -> bool:
@@ -172,23 +192,25 @@ async def keep_optouts(conn: asyncpg.Connection, state_dir: Path) -> None:
 
 async def run_once(settings: Settings, *, now: datetime | None = None, bot: Bot | None = None,
                    http: aiohttp.ClientSession | None = None, systemctl=run_systemctl, host: Host | None = None,
-                   state_dir: Path = STATE_DIR, checks: tuple[Check, ...] = CHECKS, dry_run: bool = False) -> Report:
+                   state_dir: Path = STATE_DIR, runtime_dir: Path | None = None, checks: tuple[Check, ...] = CHECKS,
+                   dry_run: bool = False) -> Report:
     """One run. With dry_run nothing is sent, written or saved: the report says what would have been.
-    Busy when another run holds the state."""
+    Busy when another run holds the state. runtime_dir: where the state is also kept in memory (None: not)."""
     now = now or datetime.now(UTC)
     held = None if dry_run else lock(state_dir)
     try:
-        return await _run(settings, now, bot, http, systemctl, host or Host(), state_dir, checks, dry_run)
+        return await _run(settings, now, bot, http, systemctl, host or Host(), state_dir, runtime_dir, checks, dry_run)
     finally:
         if held is not None:
             os.close(held)
 
 
 async def _run(settings: Settings, now: datetime, bot: Bot | None, http: aiohttp.ClientSession | None, systemctl,
-               host: Host, state_dir: Path, checks: tuple[Check, ...], dry_run: bool) -> Report:
+               host: Host, state_dir: Path, runtime_dir: Path | None, checks: tuple[Check, ...],
+               dry_run: bool) -> Report:
     tz = ZoneInfo(settings.timezone)
     results = [card_result(state_dir)]
-    state = alerts.load_state(state_dir / STATE_FILE)
+    state = load_state(state_dir, runtime_dir)
     conn, db_now, error = await connect(settings.database_url)
     ctx = Ctx(settings, now, tz, state, conn, db_now, http, systemctl, host)
     try:
@@ -223,9 +245,10 @@ async def _run(settings: Settings, now: datetime, bot: Bot | None, http: aiohttp
             if ctx.conn is not None:
                 await _publish(ctx.conn, snap)
                 await keep_optouts(ctx.conn, state_dir)
+            keep_in_memory(runtime_dir, state, now)
             try:
                 alerts.save_state(state_dir / STATE_FILE, state, now)
-            except OSError as e:     # sd.write says it; the snapshot keeps what was announced
+            except OSError as e:     # sd.write says it; the snapshot and the copy in memory keep what was said
                 log.warning("watchdog state not saved", extra={"error": type(e).__name__})
         log.info("watchdog run", extra={"checks": {r.name: r.status for r in results},
                                         "open": [p["key"] for p in snap["problems"]], "sent": sent,
@@ -236,14 +259,16 @@ async def _run(settings: Settings, now: datetime, bot: Bot | None, http: aiohttp
             await ctx.conn.close()
 
 
-def mute(state_dir: Path, minutes: int, now: datetime | None = None) -> datetime | None:
+def mute(state_dir: Path, minutes: int, now: datetime | None = None, *,
+         runtime_dir: Path | None = None) -> datetime | None:
     """--mute: until now + minutes, new problems are held and messages arrive without sound; 0 ends it."""
     now = now or datetime.now(UTC)
     held = lock(state_dir, wait=True)
     try:
-        state = alerts.load_state(state_dir / STATE_FILE)
+        state = load_state(state_dir, runtime_dir)
         state.mute_until = now + timedelta(minutes=minutes) if minutes > 0 else None
-        alerts.save_state(state_dir / STATE_FILE, state, now)
+        alerts.save_state(state_dir / STATE_FILE, state, now)      # OSError: the card is where a mute is kept
+        keep_in_memory(runtime_dir, state, now)
         return state.mute_until
     finally:
         if held is not None:

@@ -330,9 +330,10 @@ async def check_model(ctx: Ctx) -> CheckResult:
 # ---- backups and retention ----
 
 async def check_backup(ctx: Ctx) -> CheckResult:
-    """backup.*, from nestor.backup's status.json. An empty BACKUP_STATUS_FILE: backups are not watched."""
+    """backup.*, from nestor.backup's status.json. An empty BACKUP_STATUS_FILE: backups are not watched, which
+    /status shows as unchecked and the daily summary says."""
     if not ctx.settings.backup_status_file:
-        return result("backup")
+        return unknown("backup")
     path = Path(ctx.settings.backup_status_file)
     findings, unknown_keys = [], []
     dumps = path.parent / "dumps"
@@ -364,15 +365,26 @@ async def check_backup(ctx: Ctx) -> CheckResult:
     if oldest is not None and ctx.now - oldest > timedelta(days=BACKUP_MAX_AGE_DAYS):
         line = prompts.ALERT_BACKUP_OLD.format(days=(ctx.now - oldest).days, max_days=BACKUP_MAX_AGE_DAYS)
         findings.append(Finding("backup.old_copies", "crit", line))
+    # A run that made no copy still says what it did with the old ones (the clock, the rotation), but not
+    # that a copy was made; whether a copy shrank waits for the next one.
+    made = status.get("ok") is True
+    if status.get("ok") is False:
+        unknown_keys.append("backup.warning:shrank")
+        if not status.get("rotated") and not status.get("warnings"):
+            unknown_keys.append("backup.warning:")      # it failed before it looked at the old copies
     for warning in status.get("warnings") or ():
         if not isinstance(warning, str) or not re.fullmatch(r"[a-z_]{1,40}", warning):
             continue
+        text = prompts.BACKUP_WARNINGS.get(warning) or _code(warning)
         if warning == "shrank":
             pct = status.get("shrank_pct") if isinstance(status.get("shrank_pct"), int) else "?"
             line = prompts.ALERT_BACKUP_SHRANK.format(pct=pct, why=await _purged(ctx))
         else:
-            line = prompts.ALERT_BACKUP_WARNING.format(warning=prompts.BACKUP_WARNINGS.get(warning) or _code(warning))
-        findings.append(Finding(f"backup.warning:{warning}", "warn", line, repeat_token=str(status.get("file"))))
+            line = (prompts.ALERT_BACKUP_WARNING if made else prompts.ALERT_BACKUP_NOTE).format(warning=text)
+        # Said again with each new copy, or each failed night.
+        token = status.get("file") if made else status.get("failed_nights")
+        findings.append(Finding(f"backup.warning:{warning}", "warn", line,
+                                label=prompts.BACKUP_WARNING_LABELS.get(warning, ""), repeat_token=str(token)))
     return result("backup", findings, unknown=unknown_keys)
 
 

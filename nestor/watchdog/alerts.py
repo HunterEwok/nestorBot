@@ -13,8 +13,9 @@ without sound; muted, new problems are held until it ends. A crit open for over 
 even in quiet hours.
 
 The state lives in the watchdog's StateDirectory, so it survives database outages and reboots. Each
-run also publishes it with its snapshot in ops_state('watchdog'): a card that cannot be written does
-not make every run repeat what the runs before it said.
+run also publishes it with its snapshot in ops_state('watchdog') and keeps a copy in memory (the
+RuntimeDirectory, nestor.watchdog.run): a card that cannot be written, even while the database is down,
+does not make every run repeat what the runs before it said.
 """
 from __future__ import annotations
 
@@ -253,7 +254,8 @@ def evaluate(state: AlertState, results: list[CheckResult], now: datetime, *, tz
     """Applies one run's results to the state; returns it and the message to send now, if any."""
     muted = state.mute_until is not None and now < state.mute_until
     for r in results:
-        state.statuses[r.name] = r.status
+        # One that could look at only a part (Hermes without /models: not its profiles) is unchecked in /status.
+        state.statuses[r.name] = "unknown" if r.status == "ok" and r.unknown else r.status
         if r.status == "unknown":
             continue                # it looks again on the next run, whatever its interval
         state.ran[r.name] = now

@@ -59,11 +59,20 @@ FLOOD = refusal(429, "Too Many Requests: retry after 7", retry_after=7)
 
 
 class Clock:
+    """The Pi's clock, `at`; `monotonic` is the process's own, which a step of the Pi's clock (`step`) does not move."""
+
     def __init__(self, at: datetime = T0):
-        self.at = at
+        self.at, self.stepped = at, timedelta()
 
     def __call__(self) -> datetime:
         return self.at
+
+    def monotonic(self) -> float:
+        return (self.at - self.stepped).timestamp()
+
+    def step(self, by: timedelta) -> None:
+        self.at += by
+        self.stepped += by
 
 
 @pytest.fixture
@@ -268,8 +277,9 @@ async def test_collector_reports_missing_watchdog_once_and_recovery_silently(poo
     async def tick(tel=None, **kw):
         await (tel or watch).tick(pool, bot=bot, alert_chat_id=ALERT_CHAT, tz=MSK, **kw)
 
-    watch = Telemetry(clock=clock)
-    # Just started: the watchdog may not have had its turn yet.
+    watch = Telemetry(clock=clock, monotonic=clock.monotonic)
+    # Just started (the first tick is at once): the watchdog may not have had its turn yet.
+    await tick()
     clock.at += timedelta(minutes=19)
     await tick()
     assert bot.sent == []
@@ -281,19 +291,22 @@ async def test_collector_reports_missing_watchdog_once_and_recovery_silently(poo
     # Once: not on the next tick, not after the collector restarts.
     clock.at += timedelta(minutes=30)
     await tick()
-    restarted = Telemetry(clock=Clock(clock.at - timedelta(hours=1)))
-    restarted.clock = clock
-    await tick(restarted)
+    restarted = Telemetry(clock=clock, monotonic=clock.monotonic)
+    for _ in range(2):
+        clock.at += timedelta(minutes=30)
+        await tick(restarted)
     assert len(bot.sent) == 1
     # It runs again: said once, silently.
     await _watchdog_ran(conn)
     await tick()
     await tick()
     assert [(m["text"], m["disable_notification"]) for m in bot.sent[1:]] == [(prompts.WATCHDOG_BACK, True)]
-    # It stops: counted from its last snapshot; at night without sound.
-    await _watchdog_ran(conn, "25 minutes")
+    # It stops: counted from when its snapshot stopped changing; at night without sound.
+    await _watchdog_ran(conn, "5 minutes")
     last = await conn.fetchval("SELECT updated_at FROM ops_state WHERE key = 'watchdog'")
-    clock.at = datetime(2026, 10, 6, 2, 0, tzinfo=MSK)
+    clock.at = datetime(2026, 10, 6, 1, 40, tzinfo=MSK)
+    await tick()
+    clock.at += timedelta(minutes=20)
     await tick(quiet=(time(23), time(8)))
     assert bot.sent[-1] == {**bot.sent[-1], "text": prompts.WATCHDOG_DOWN.format(since=alerts.fmt_since(last, clock.at, MSK)),
                             "disable_notification": True}
@@ -310,7 +323,7 @@ async def test_collector_reports_missing_watchdog_once_and_recovery_silently(poo
 async def test_a_database_outage_is_not_the_watchdog_stopping(pool, conn):
     # Neither can write while the database is down, and once it is back the collector usually looks first.
     clock = Clock(datetime(2026, 10, 5, 12, 0, tzinfo=MSK))
-    watch = Telemetry(clock=clock)
+    watch = Telemetry(clock=clock, monotonic=clock.monotonic)
     clock.at += timedelta(hours=2)                      # it has run for two hours
     bot = AlertBot()
 
@@ -333,6 +346,48 @@ async def test_a_database_outage_is_not_the_watchdog_stopping(pool, conn):
     last = await conn.fetchval("SELECT updated_at FROM ops_state WHERE key = 'watchdog'")
     assert [(m["text"], m["disable_notification"]) for m in bot.sent] == [
         (prompts.WATCHDOG_DOWN.format(since=alerts.fmt_since(last, clock.at, MSK)), False)]
+
+
+async def test_a_clock_stepped_after_a_power_cut_is_not_the_watchdog_stopping(pool, conn):
+    # No RTC on the Pi or the router: both start from a saved time, and NTP steps them when the internet is back.
+    clock = Clock(datetime(2026, 10, 5, 12, 0, tzinfo=MSK))
+    watch = Telemetry(clock=clock, monotonic=clock.monotonic)
+    bot = AlertBot()
+
+    async def tick():
+        await watch.tick(pool, bot=bot, alert_chat_id=ALERT_CHAT, tz=MSK)
+
+    await _watchdog_ran(conn, "42 minutes")             # its last snapshot is from before the power cut
+    clock.at += timedelta(minutes=1)
+    await tick()
+    clock.step(timedelta(minutes=40))                   # the Pi's clock catches up
+    clock.at += timedelta(minutes=1)
+    await tick()
+    assert bot.sent == []
+    # The watchdog writes every 5 minutes; then the router's clock is stepped 3 hours forward, so what it
+    # wrote 2 minutes ago now reads 182 minutes old.
+    for _ in range(4):
+        clock.at += timedelta(minutes=5)
+        await _watchdog_ran(conn)
+        await tick()
+    await _watchdog_ran(conn, "182 minutes")
+    clock.at += timedelta(minutes=1)
+    await tick()
+    for _ in range(4):
+        clock.at += timedelta(minutes=5)
+        await _watchdog_ran(conn)
+        await tick()
+    assert bot.sent == []
+    # It does stop: 20 minutes of the collector's own time without a new snapshot, whatever the clocks say.
+    last = await conn.fetchval("SELECT updated_at FROM ops_state WHERE key = 'watchdog'")
+    clock.step(timedelta(hours=-2))
+    for _ in range(19):
+        clock.at += timedelta(minutes=1)
+        await tick()
+    assert bot.sent == []
+    clock.at += timedelta(minutes=1)
+    await tick()
+    assert [m["text"] for m in bot.sent] == [prompts.WATCHDOG_DOWN.format(since=alerts.fmt_since(last, clock.at, MSK))]
 
 
 # ---- the collector -------------------------------------------------------------------------------------------

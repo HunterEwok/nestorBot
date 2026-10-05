@@ -645,6 +645,37 @@ def test_a_failed_run_deletes_nothing_by_a_clock_it_cannot_trust(tmp_path):
         ["clock_backwards"], False, 0, 31)
 
 
+def _undeletable(monkeypatch, name: str) -> None:
+    """One dump the card refuses to delete (chattr +i, an owner mixed up by a copy by hand)."""
+    unlink = Path.unlink
+
+    def refuse(self, *args, **kw):
+        if self.name == name:
+            raise PermissionError(errno.EPERM, "Operation not permitted", str(self))
+        return unlink(self, *args, **kw)
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+
+
+def test_an_old_copy_the_card_will_not_delete_is_a_warning_not_a_failed_backup(tmp_path, monkeypatch):
+    cfg = cfg_in(tmp_path)
+    old = nights(10, utc(20, month=8))                                # all far older than 35 days
+    old_dumps(cfg, old)
+    _undeletable(monkeypatch, bk.dump_name(old[0]))
+    tools = Tools()
+    done = bk.backup(cfg, NIGHT, run=tools)
+    # The rotation runs before the dump and after it: neither one stops the dump. The oldest copy refuses
+    # first, so the rest of that rotation waits for the next night.
+    assert (done["ok"], tools.dumps, done["warnings"], done["rotated"], done["deleted"], done["kept"]) == (
+        True, 1, ["rotation_failed"], False, 0, 11)
+    assert (cfg.dumps_dir / done["file"]).exists()
+    # A night the dump fails too: the error is the dump's, not the rotation's.
+    tools = Tools("pg_dump: error: connection to server at \"192.168.0.1\", port 5432 failed: Connection refused")
+    failed = bk.backup(replace(cfg, attempts=1), NIGHT + timedelta(days=1), run=tools)
+    assert (failed["ok"], failed["error"], tools.dumps, failed["warnings"]) == (
+        False, "unreachable", 1, ["rotation_failed"])
+
+
 def test_a_dying_card_is_named_without_its_path(tmp_path):
     cfg = cfg_in(tmp_path)
     failed = bk.backup(cfg, NIGHT, run=Tools(OSError(errno.EROFS, "Read-only file system", str(cfg.dumps_dir))))

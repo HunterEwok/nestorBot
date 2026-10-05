@@ -295,8 +295,13 @@ async def test_backup_contract_from_backup_write_status(conn, tmp_path, monkeypa
                              backup_status_file=str(cfg.status_file))
         return await check(ctx, "backup")
 
+    # BACKUP_STATUS_FILE empty: backups are not watched, and /status and the summary say so.
     off = await make_ctx(conn, now=after)
-    assert (await check(off, "backup")).status == "ok"                     # BACKUP_STATUS_FILE empty: not watched
+    res = await check(off, "backup")
+    assert res.status == "unknown" and summary._backup(off) == [prompts.DAILY_BACKUP_OFF]
+    alerts.evaluate(off.state, [res], after, tz=MSK, quiet=None)
+    assert alerts.render_status(alerts.snapshot(off.state, after), after, MSK).endswith(
+        prompts.STATUS_UNCHECKED.format(names="Резервные копии"))
     res = await look()
     assert [(f.key, f.level, f.line) for f in res.findings] == [
         ("backup.missing", "crit", prompts.ALERT_BACKUP_MISSING)]
@@ -342,6 +347,51 @@ async def test_backup_contract_from_backup_write_status(conn, tmp_path, monkeypa
     assert [(f.key, f.line, f.repeat_token) for f in res.findings] == [
         ("backup.warning:shrank", prompts.ALERT_BACKUP_SHRANK.format(
             pct=90, why=prompts.ALERT_BACKUP_SHRANK_WHY.format(count=4100)), small["file"])]
+
+
+async def test_a_night_without_a_copy_never_says_one_was_made(conn, tmp_path, monkeypatch):
+    monkeypatch.setattr(bk, "TIMESYNC_FLAG", tmp_path / "no-timesync-flag")     # Tools(synced=...) decides
+    cfg = cfg_in(tmp_path)
+    down = "pg_dump: error: connection to server at \"192.168.0.1\", port 5432 failed: Connection refused"
+    state, said = AlertState(), []
+
+    async def look(now):
+        nonlocal state
+        ctx = await make_ctx(conn, now=now, state=state, backup_status_file=str(cfg.status_file))
+        res = await check(ctx, "backup")
+        state, out = alerts.evaluate(state, [res], now, tz=MSK, quiet=None)
+        if out is not None:
+            alerts.delivered(state, out, now)
+            said.append(out.text)
+        return res
+
+    bk.backup(cfg, NIGHT - timedelta(days=1), run=Tools(size=1000))
+    bk.backup(cfg, NIGHT, run=Tools(size=100))
+    await look(NIGHT + timedelta(minutes=15))
+    assert said == [prompts.ALERT_NEW + "\n🟠 " + prompts.ALERT_BACKUP_SHRANK.format(pct=90, why="")]
+    # A power cut: the missed run starts at boot, before the clock is synced and the router's database is up.
+    boot = NIGHT + timedelta(days=1)
+    failed = bk.backup(replace(cfg, attempts=1), boot, run=Tools(down, synced=False))
+    assert (failed["ok"], failed["error"], failed["warnings"]) == (False, "unreachable", ["clock_unsynced"])
+    res = await look(boot + timedelta(minutes=15))
+    assert [(f.key, f.line, f.label, f.repeat_token) for f in res.findings if f.key.startswith("backup.warning")] == [
+        ("backup.warning:clock_unsynced", prompts.ALERT_BACKUP_NOTE.format(warning=prompts.BACKUP_WARNINGS[
+            "clock_unsynced"]), "Удаление старых копий", "1")]
+    assert "Резервная копия не сделана (1-я ночь)" in said[-1] and "сделана, но" not in said[-1]
+    # No new copy: whether one shrank is not news either way.
+    assert "backup.warning:shrank" in state.problems and "снова в порядке" not in said[-1]
+    # 13:30: the clock is synced, the database still down. The old copies were looked at; the backups are not fine.
+    retry = boot.replace(hour=13, minute=30)
+    assert bk.backup(replace(cfg, attempts=1), retry, run=Tools(down), force=True)["warnings"] == []
+    await look(retry + timedelta(minutes=15))
+    assert "🔴 Свежей резервной копии нет" in said[-1] and "• Удаление старых копий: снова в порядке" in said[-1]
+    assert "Резервные копии: снова в порядке" not in "\n".join(said) and "сделана, но" not in "\n".join(said)
+    assert {"backup.failed", "backup.stale", "backup.warning:shrank"} <= set(state.problems)
+    # The next copy: the size is news again, and the backups are fine.
+    bk.backup(cfg, NIGHT + timedelta(days=2), run=Tools(size=100))
+    await look(NIGHT + timedelta(days=2, minutes=15))
+    assert "• Размер копии: снова в порядке" in said[-1] and "• Резервные копии: снова в порядке" in said[-1]
+    assert state.problems == {}
 
 
 async def test_backup_dir_readable_by_nestor_is_alerted(conn, tmp_path):
@@ -572,13 +622,28 @@ async def test_a_run_sends_publishes_the_snapshot_and_the_daily_summary(database
     assert alerts.load_state(tmp_path / run.STATE_FILE).outbox == []
 
 
+MIDNIGHT = "(date_trunc('day', now() AT TIME ZONE 'Europe/Moscow') AT TIME ZONE 'Europe/Moscow')"     # today's
+
+
 async def test_daily_summary_reads_backup_news_memory_and_restarts(conn, tmp_path):
     await conn.execute("INSERT INTO chats (chat_id, type, title) VALUES ($1, 'supergroup', 'Nestor')", CHAT_ID)
     await conn.execute("INSERT INTO users (user_id, first_name) VALUES (111, 'U')")
-    await conn.execute("""INSERT INTO messages (chat_id, message_id, user_id, sent_at, text, raw, stored_at)
-                          VALUES ($1, 1, 111, now(), 'вчера', '{}', date_trunc('day', now() AT TIME ZONE 'Europe/Moscow')
-                                                                   AT TIME ZONE 'Europe/Moscow' - interval '12 hours'),
-                                 ($1, 2, 111, now(), 'сегодня', '{}', now())""", CHAT_ID)
+    await conn.execute(f"""INSERT INTO messages (chat_id, message_id, user_id, sent_at, text, raw, stored_at)
+                           VALUES ($1, 1, 111, now(), 'вчера', '{{}}', {MIDNIGHT} - interval '12 hours'),
+                                  ($1, 2, 111, now(), 'сегодня', '{{}}', now()),
+                                  ($1, 3, 111, now(), 'позавчера', '{{}}', {MIDNIGHT} - interval '36 hours'),
+                                  ($1, 4, 111, now(), 'почти год', '{{}}',
+                                   now() - interval '12 months' + interval '3 days')""", CHAT_ID)
+    # Yesterday's answers and their tokens; not today's, not the day before's.
+    await conn.execute(f"""INSERT INTO bot_requests (chat_id, trigger_msg_id, user_id, status, input_tokens,
+                                                     output_tokens, created_at)
+                           VALUES ($1, 1, 111, 'ok', 1000, 500, {MIDNIGHT} - interval '12 hours'),
+                                  ($1, 1, 111, 'error', NULL, NULL, {MIDNIGHT} - interval '11 hours'),
+                                  ($1, 2, 111, 'ok', 100000, 0, now()),
+                                  ($1, 3, 111, 'ok', 200000, 0, {MIDNIGHT} - interval '36 hours')""", CHAT_ID)
+    await conn.execute(f"""INSERT INTO maintenance_runs (job, day, status, counts, finished_at)
+                           VALUES ('retention', ({MIDNIGHT} - interval '12 hours')::date, 'ok', '{{"messages": 42}}',
+                                   now())""")
     await conn.execute("""INSERT INTO news_sources (key, last_run_at, last_ok_at, status, failures)
                           VALUES ('pubmed', now(), now() - interval '1 hour', 'ok', 0),
                                  ('reggaeville', now(), now() - interval '3 days', 'http_403', 5)""")
@@ -591,7 +656,9 @@ async def test_daily_summary_reads_backup_news_memory_and_restarts(conn, tmp_pat
         nestor_collector=collector), backup_status_file=str(cfg.status_file))
     ctx.state.baselines["summary_restarts"] = 3                         # what yesterday's summary saw
     lines = (await summary.daily_summary(conn, ctx, AlertBot())).split("\n")
-    assert lines[1].startswith(prompts.DAILY_ARCHIVE.format(chats="«Nestor» 1", size=""))  # not today's
+    assert lines[1].startswith(prompts.DAILY_ARCHIVE.format(chats="«Nestor» 1", size=""))  # yesterday's only
+    assert lines[2] == prompts.DAILY_ANSWERS.format(answers=1, errors=1, tokens=1500, limit=250_000, pct=1)
+    assert lines[3] == prompts.DAILY_PURGE.format(count=42, next=1)     # the one that expires within 7 days
     oldest = datetime.fromisoformat(good["oldest_dump_at"]).astimezone(MSK).date()
     assert prompts.DAILY_BACKUP.format(time=ctx.fmt(datetime.fromisoformat(good["last_ok_at"])), size="5 МБ", kept=2,
                                        oldest=day_name(oldest)) in lines and oldest == date(2026, 10, 4)
@@ -609,18 +676,30 @@ async def test_daily_summary_waits_while_the_hours_messages_are_used(database, c
     used = AlertState(sent_times=[morning - timedelta(minutes=50 - i) for i in range(alerts.MAX_PER_HOUR)])
     alerts.save_state(tmp_path / run.STATE_FILE, used, morning - timedelta(minutes=5))
     bot, cfg = AlertBot(), settings(database["collector"], alert_quiet=None)
+    systemd = Systemd(nestor_collector={**ACTIVE, "NRestarts": "4"})
     no_clock = tuple(c for c in CHECKS if c.name != "clock")
-    report = await run.run_once(cfg, now=morning, bot=bot, systemctl=Systemd(), host=host(), state_dir=tmp_path,
+    report = await run.run_once(cfg, now=morning, bot=bot, systemctl=systemd, host=host(), state_dir=tmp_path,
                                 checks=no_clock)
     assert report.summary is not None and bot.sent == []
-    assert alerts.load_state(tmp_path / run.STATE_FILE).last_daily is None
+    held = alerts.load_state(tmp_path / run.STATE_FILE)
+    assert held.last_daily is None and "summary_restarts" not in held.baselines     # counted from when it goes
     # The first of those six is an hour old: the summary goes, once.
     for minutes in (11, 16):
-        await run.run_once(cfg, now=morning + timedelta(minutes=minutes), bot=bot, systemctl=Systemd(), host=host(),
+        await run.run_once(cfg, now=morning + timedelta(minutes=minutes), bot=bot, systemctl=systemd, host=host(),
                            state_dir=tmp_path, checks=no_clock)
-    assert [(m["text"].split("\n")[0], m["disable_notification"]) for m in bot.sent] == [
-        (prompts.DAILY_HEADER.format(date=day_name(morning.date() - timedelta(days=1))), True)]
-    assert alerts.load_state(tmp_path / run.STATE_FILE).last_daily == morning.date()
+    header = prompts.DAILY_HEADER.format(date=day_name(morning.date() - timedelta(days=1)))
+    assert [(m["text"].split("\n")[0], m["disable_notification"]) for m in bot.sent] == [(header, True)]
+    assert prompts.DAILY_COLLECTOR.format(memory="150 МБ", restarts=4) in bot.sent[0]["text"].split("\n")
+    sent = alerts.load_state(tmp_path / run.STATE_FILE)
+    assert sent.last_daily == morning.date() and sent.baselines["summary_restarts"] == 4
+    # The next morning: the restarts of the day in between.
+    systemd.units["nestor-collector"]["NRestarts"] = "6"
+    await run.run_once(cfg, now=morning + timedelta(days=1), bot=bot, systemctl=systemd, host=host(),
+                       state_dir=tmp_path, checks=no_clock)
+    (summary_text,) = [m["text"] for m in bot.sent[1:] if m["text"].startswith(prompts.DAILY_HEADER.format(
+        date=day_name(morning.date())))]
+    assert prompts.DAILY_COLLECTOR.format(memory="150 МБ", restarts=2) in summary_text.split("\n")
+    assert alerts.load_state(tmp_path / run.STATE_FILE).baselines["summary_restarts"] == 6
 
 
 async def test_a_message_telegram_refuses_as_html_goes_as_plain_text(tmp_path):
@@ -664,7 +743,9 @@ async def test_a_card_that_cannot_keep_the_state_does_not_repeat_itself(database
         (state_dir / name).unlink(missing_ok=True)
         (state_dir / name).mkdir()
     systemd.units["nestor-collector"]["NRestarts"] = "3"
-    for minutes in range(35, 80, 5):                    # the summary is due from 09:30; the disk is fine again
+    # Past the hour an event waits before it is said again: the checks too work on the state taken from the
+    # snapshot, not on the card's stale one. The summary is due from 09:30; the disk is fine again.
+    for minutes in range(35, 140, 5):
         await once(minutes, 40)
     assert (state_dir / run.STATE_FILE).exists() and alerts.load_state(state_dir / run.STATE_FILE).saved_at == nine
     header = prompts.DAILY_HEADER.format(date=day_name(nine.date() - timedelta(days=1)))
@@ -673,8 +754,42 @@ async def test_a_card_that_cannot_keep_the_state_does_not_repeat_itself(database
     assert len(summaries) == 1 and len(alerts_sent) == 2
     said = "\n".join(alerts_sent)
     for line in ("Резервная копия не сделана", prompts.ALERT_SD_WRITE.format(error="<code>EISDIR</code>"),
-                 "перезапускался 3 раз", "Место на карте Pi: снова в порядке"):
+                 "перезапускался 3 раз", "перезапускался", "Место на карте Pi: снова в порядке"):
         assert said.count(line) == 1, line
+    published = await conn.fetchval("SELECT value FROM ops_state WHERE key = 'watchdog'")
+    assert published["state"]["baselines"]["collector_restarts"] == 3
+
+
+async def test_a_card_that_cannot_keep_the_state_while_the_database_is_down(tmp_path):
+    # Then the snapshot cannot help either: the copy of the state in memory (the unit's RuntimeDirectory) does.
+    state_dir, runtime_dir = tmp_path / "state", tmp_path / "run"
+    state_dir.mkdir()
+    runtime_dir.mkdir()
+    before = datetime(2026, 10, 5, 13, 55, tzinfo=MSK)
+    alerts.save_state(state_dir / run.STATE_FILE, AlertState(), before)
+    for name in ("probe", run.STATE_FILE + ".tmp"):
+        (state_dir / name).mkdir()
+    bot = AlertBot()
+    s = settings("postgresql://nestor:x@127.0.0.1:1/nestor", alert_quiet=None, alert_daily_at=time(9, 0))
+    sent = []
+    for minutes in range(5, 65, 5):                     # an hour of runs
+        await run.run_once(s, now=before + timedelta(minutes=minutes), bot=bot, systemctl=Systemd(), host=host(),
+                           state_dir=state_dir, runtime_dir=runtime_dir)
+        sent.append(len(bot.sent))
+    texts = [m["text"] for m in bot.sent]
+    header = prompts.DAILY_HEADER.format(date=day_name(date(2026, 10, 4)))
+    assert sent[:2] == [2, 3] and len(texts) == 3 <= alerts.MAX_PER_HOUR
+    assert [t.startswith(header) for t in texts] == [False, True, False]
+    assert texts[0] == prompts.ALERT_NEW + "\n🔴 " + prompts.ALERT_SD_WRITE.format(error="<code>EISDIR</code>")
+    assert texts[2] == prompts.ALERT_NEW + "\n🔴 " + prompts.ALERT_DB_DOWN.format(
+        since="14:00", error=prompts.DB_ERRORS["ConnectionRefusedError"])          # confirmed on the second run
+    assert alerts.load_state(state_dir / run.STATE_FILE).saved_at == before
+    kept = alerts.load_state(runtime_dir / run.STATE_FILE)
+    assert kept.saved_at == before + timedelta(hours=1) and kept.last_daily == date(2026, 10, 5)
+    assert (runtime_dir / run.STATE_FILE).stat().st_mode & 0o777 == 0o600
+    # The Pi restarts: the copy in memory is gone, the card's state is what there is.
+    (runtime_dir / run.STATE_FILE).unlink()
+    assert run.load_state(state_dir, runtime_dir).saved_at == before
 
 
 async def test_daily_summary_without_the_database_stays_within_a_message():

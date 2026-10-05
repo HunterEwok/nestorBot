@@ -89,6 +89,11 @@ async def test_hermes_probe(hermes, caplog):
             res = await run.run_check(ctx, BY_NAME["hermes"])
             assert (res.status, res.findings, res.unknown) == ("ok", [], ("hermes.profile:",))
         assert caplog.text.count("404 to /models") == 1
+        # /status does not count it as checked: no profile's problem could be raised.
+        alerts.evaluate(state, [res], NOW, tz=MSK, quiet=None)
+        assert alerts.render_status(alerts.snapshot(state, NOW), NOW, MSK) == "\n".join([
+            prompts.STATUS_HEADER.format(time="14:00"), prompts.STATUS_ALL_OK,
+            prompts.STATUS_UNCHECKED.format(names="Hermes")])
         # The gateway is down: one line for it, the profiles neither raised nor cleared.
         down = f"http://127.0.0.1:{closed_port()}/p/{{}}/v1".format
         ctx = ctx_without_db(http=http, hermes_url=down("group"), hermes_web_url=down("web"))

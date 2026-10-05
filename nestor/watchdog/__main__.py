@@ -23,7 +23,7 @@ from ..config import Settings, check_alert_chat, load_settings
 from ..logs import setup_logging
 from . import notify
 from .alerts import fmt_since, render_status
-from .run import STATE_DIR, Busy, connect, keep_optouts, mute, run_once
+from .run import RUNTIME_DIR, STATE_DIR, Busy, connect, keep_optouts, mute, run_once
 
 log = logging.getLogger("nestor.watchdog")
 
@@ -37,7 +37,7 @@ async def _optouts_only(settings: Settings, state_dir: Path) -> None:
             await conn.close()
 
 
-async def _main(settings: Settings, args: argparse.Namespace, state_dir: Path) -> int:
+async def _main(settings: Settings, args: argparse.Namespace, state_dir: Path, runtime_dir: Path) -> int:
     bot = Bot(settings.bot_token)
     try:
         if args.test:
@@ -45,7 +45,8 @@ async def _main(settings: Settings, args: argparse.Namespace, state_dir: Path) -
             print("test sent" if ok else "test failed: see the journal")
             return 0 if ok else 1
         async with aiohttp.ClientSession() as http:
-            report = await run_once(settings, bot=bot, http=http, state_dir=state_dir, dry_run=args.dry_run)
+            report = await run_once(settings, bot=bot, http=http, state_dir=state_dir, runtime_dir=runtime_dir,
+                                    dry_run=args.dry_run)
         if args.dry_run:
             now = datetime.now(UTC)
             print(markup.to_plain(render_status(report.snapshot, now, ZoneInfo(settings.timezone))))
@@ -69,6 +70,7 @@ def main(argv: list[str] | None = None) -> int:
     settings = load_settings()
     setup_logging(settings.log_level)
     state_dir = Path(os.environ.get("STATE_DIRECTORY") or STATE_DIR)    # set by systemd for StateDirectory=
+    runtime_dir = Path(os.environ.get("RUNTIME_DIRECTORY") or RUNTIME_DIR)    # ... and for RuntimeDirectory=
     problem = check_alert_chat(settings)
     if problem:
         if not (args.test or args.dry_run) and args.mute is None:
@@ -76,7 +78,7 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(problem)
     if args.mute is not None:
         try:
-            until = mute(state_dir, args.mute)
+            until = mute(state_dir, args.mute, runtime_dir=runtime_dir)
         except OSError as e:
             raise SystemExit(f"cannot write the watchdog state in {state_dir}: {type(e).__name__}") from None
         tz = ZoneInfo(settings.timezone)
@@ -89,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
         log.warning("alerts are off: ALERT_CHAT_ID is empty")
         asyncio.run(_optouts_only(settings, state_dir))
         return 0
-    return asyncio.run(_main(settings, args, state_dir))
+    return asyncio.run(_main(settings, args, state_dir, runtime_dir))
 
 
 if __name__ == "__main__":

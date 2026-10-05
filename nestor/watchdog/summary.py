@@ -109,7 +109,7 @@ async def _database(conn: asyncpg.Connection, ctx: Ctx, start: datetime, end: da
 
 def _backup(ctx: Ctx) -> list[str]:
     if not ctx.settings.backup_status_file:
-        return []
+        return [prompts.DAILY_BACKUP_OFF]
     try:
         status = read_json(Path(ctx.settings.backup_status_file)) or {}
     except (OSError, ValueError, TypeError):

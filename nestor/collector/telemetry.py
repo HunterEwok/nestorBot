@@ -15,10 +15,13 @@ ops_state('collector'), the row checks.check_heartbeat reads:
 Codes and counters only: no text Telegram sent back, no chat, no message.
 
 The watchdog is the only one who sends alerts, so nobody would hear that it stopped: when its snapshot
-in ops_state('watchdog') is missing or older than 20 minutes (and this process has reached the database
-that long without a break: while it is down, the watchdog cannot write either), the collector says so in
-the alert group once, and once more, silently, when it is back. Whether it said so is kept in
-ops_state('collector_watch'), so a restart does not say it again.
+in ops_state('watchdog') is missing or has not changed for 20 minutes while this process reached the
+database (while it is down, the watchdog cannot write either), the collector says so in the alert group
+once, and once more, silently, when the snapshot changes. The 20 minutes are counted on this process's
+own monotonic clock: after a power cut the Pi's and the router's clocks are stepped by NTP when the
+internet comes back, which must neither make a fresh snapshot look old nor hide one that stopped.
+Whether it said so (and which snapshot it saw then) is kept in ops_state('collector_watch'), so a
+restart does not say it again.
 """
 from __future__ import annotations
 
@@ -26,6 +29,7 @@ import asyncio
 import logging
 from collections.abc import Callable
 from datetime import UTC, datetime, time, timedelta
+from time import monotonic as monotonic_clock
 from zoneinfo import ZoneInfo
 
 import asyncpg
@@ -66,10 +70,13 @@ def error_code(exc: BaseException) -> str:
 
 
 class Telemetry:
-    def __init__(self, clock: Callable[[], datetime] = utcnow):
-        self.clock = clock
+    def __init__(self, clock: Callable[[], datetime] = utcnow,
+                 monotonic: Callable[[], float] = monotonic_clock):
+        self.clock, self.monotonic = clock, monotonic
         self.started_at = clock()
-        self.db_ok_since: datetime | None = self.started_at    # None while the database is unreachable
+        self.db_ok_since: float | None = monotonic()   # monotonic; None while the database is unreachable
+        # The watchdog's snapshot as last read (its updated_at, None: no row) and since when (monotonic) it is so.
+        self.watched: tuple[datetime | None, float] | None = None
         self.updates_ok_at: datetime | None = None
         self.updates_failures = 0
         self.updates_error: str | None = None
@@ -119,7 +126,8 @@ class Telemetry:
                     """INSERT INTO ops_state (key, value, updated_at) VALUES ('collector', $1, now())
                        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()""",
                     self.snapshot(), timeout=10)
-            self.db_ok_since = self.db_ok_since or self.clock()
+            if self.db_ok_since is None:
+                self.db_ok_since = self.monotonic()
             if alert_chat_id is not None:
                 await self._watch(pool, bot, alert_chat_id, tz, quiet, watchdog_stale)
         except _TRANSIENT:
@@ -129,36 +137,37 @@ class Telemetry:
 
     async def _watch(self, pool: asyncpg.Pool, bot: Bot, chat_id: int, tz: ZoneInfo,
                      quiet: tuple[time, time] | None, stale: timedelta) -> None:
-        """WATCHDOG_DOWN once when the watchdog's snapshot is missing or stale, WATCHDOG_BACK silently after.
-        Telegram is not waited for with a connection of the pool in hand."""
+        """WATCHDOG_DOWN once when the watchdog's snapshot is missing or unchanged for `stale`, WATCHDOG_BACK
+        silently once it changed. Telegram is not waited for with a connection of the pool in hand."""
         from ..bot import prompts
         from ..watchdog import notify
         from ..watchdog.alerts import fmt_since, in_quiet
 
         async with pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT updated_at, now() - updated_at > $1 AS stale FROM ops_state "
-                                      "WHERE key = 'watchdog'", stale, timeout=10)
-            said = (await conn.fetchval("SELECT value FROM ops_state WHERE key = 'collector_watch'", timeout=10)
-                    or {}).get("down", False)
-        now = self.clock()
-        down = row is None or row["stale"]
-        if down and not said and self.db_ok_since is not None and now - self.db_ok_since >= stale:
-            since = row["updated_at"] if row is not None else self.started_at
-            text = prompts.WATCHDOG_DOWN.format(since=fmt_since(since, now, tz))
+            updated = await conn.fetchval("SELECT updated_at FROM ops_state WHERE key = 'watchdog'", timeout=10)
+            said = await conn.fetchval("SELECT value FROM ops_state WHERE key = 'collector_watch'", timeout=10) or {}
+        mono, now = self.monotonic(), self.clock()
+        if self.watched is None or self.watched[0] != updated:
+            self.watched = (updated, mono)          # it wrote, or this process has just begun to look
+        seen = updated.isoformat() if updated is not None else None
+        if not said.get("down") and mono - max(self.watched[1], self.db_ok_since) >= stale.total_seconds():
+            text = prompts.WATCHDOG_DOWN.format(since=fmt_since(updated or self.started_at, now, tz))
             if not await notify.send(bot, chat_id, text, silent=in_quiet(now.astimezone(tz).time(), quiet)):
                 return      # said on a later tick
             log.warning("watchdog not running, said in the alert group")
-        elif not down and said:
+            value = {"down": True, "seen": seen}
+        elif said.get("down") and said.get("seen") != seen:
             if not await notify.send(bot, chat_id, prompts.WATCHDOG_BACK, silent=True):
                 return
             log.info("watchdog back")
+            value = {"down": False}
         else:
             return
         async with pool.acquire() as conn:
             await conn.execute(
                 """INSERT INTO ops_state (key, value, updated_at) VALUES ('collector_watch', $1, now())
                    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()""",
-                {"down": down}, timeout=10)
+                value, timeout=10)
 
 
 class TelegramProbe(BaseRequestMiddleware):
