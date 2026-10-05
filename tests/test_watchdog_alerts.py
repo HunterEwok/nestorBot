@@ -305,10 +305,14 @@ def test_mute_holds_then_sends_open_problems():
     assert out.silent and "Место на карте Pi: снова в порядке" in out.text and "Сборщик" not in out.text
     assert alerts.snapshot(state, at(10))["muted_until"] is not None
     assert [p["key"] for p in alerts.snapshot(state, at(10))["problems"]] == ["collector.down"]   # /status shows it
+    assert prompts.STATUS_MUTED.format(time="15:00") in alerts.render_status(alerts.snapshot(state, at(10)), at(10), MSK)
     assert run(state, result("collector", [down]), when=at(55)) is None
     out = run(state, result("collector", [down]), when=at(65))          # the mute is over
     assert not out.silent and out.text == f"{prompts.ALERT_NEW}\n🔴 Сборщик не работает"
     assert "Напоминания" not in out.text                                # it came and went while muted
+    # Only `--mute 0` clears it from the state; /status no longer says it once it is over.
+    assert state.mute_until == at(60)
+    assert "🔕" not in alerts.render_status(alerts.snapshot(state, at(65)), at(65), MSK)
 
 
 def test_corrupt_state_starts_fresh(tmp_path, caplog):
@@ -370,10 +374,12 @@ def test_status_lists_open_problems_and_what_could_not_be_checked():
     state = alerts.AlertState()
     run(state, db(True, confirm=1), result("hermes", [Finding("hermes.gateway", "crit", "Hermes не отвечает",
                                                                confirm=2)]),
-        result("disk", [Finding("disk.low:/", "warn", "Мало места")]), unknown("retention"), when=at(0))
+        result("disk", [Finding("disk.low:/", "warn", "Мало места")]), unknown("retention"),
+        broken("backup", "TimeoutError", confirm=2), when=at(0))
+    # A check that broke once is not a problem yet, but it was not checked either.
     text = alerts.render_status(alerts.snapshot(state, at(0)), at(3), MSK)
     assert text == "\n".join([prompts.STATUS_HEADER.format(time="14:00"), "🔴 База недоступна", "🟠 Мало места",
-                              prompts.STATUS_UNCHECKED.format(names="Чистка архива")])
-    run(state, db(False), result("disk"), result("retention"), when=at(5))
+                              prompts.STATUS_UNCHECKED.format(names="Резервные копии, Чистка архива")])
+    run(state, db(False), result("disk"), result("retention"), result("backup"), when=at(5))
     run(state, db(False), result("hermes"), when=at(10))
     assert alerts.render_status(alerts.snapshot(state, at(10)), at(10), MSK).endswith(prompts.STATUS_ALL_OK)

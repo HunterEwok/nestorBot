@@ -3,6 +3,7 @@ restore from such a dump after a disaster.
 
     python -m nestor.backup [--force]                          # the unit; --force dumps even if tonight's is done
     python -m nestor.backup restore --database NAME [--optouts PATH] < nestor-YYYYMMDDTHHMMSSZ.dump
+    python -m nestor.backup forget --since YYYYMMDDTHHMMSSZ      # after the restore and the import
 
 The unit (deploy/systemd/nestor-backup.service) runs as its own Linux user with the database role
 nestor_backup, which can only read. It dumps at BACKUP_AT (04:30, after the 03:30 purge) and once more
@@ -19,7 +20,8 @@ only place that text goes, never the journal or the status) and the lock.
 
 The restore runs as user nestor with the dump on stdin, into an empty database that bootstrap created.
 A copy brings back what was forgotten since it was made, so after loading it applies the migrations,
-replays every opt-out the watchdog recorded (--optouts) and purges what has outlived the retention.
+replays every opt-out the watchdog recorded (--optouts) and purges what has outlived the retention. A
+/forget_me made after the watchdog last wrote that list is found after the import, by `forget`.
 
 At import only the standard library and nestor.promises: the backup user needs nothing else to start.
 The settings bring nestor.config, the restore asyncpg and the rest of nestor.
@@ -67,6 +69,7 @@ CLOCK_SLACK = timedelta(minutes=5)  # a newer dump than now + this: the clock we
 # What stderr of pg_dump and pg_restore says, by cause, first match wins. The disk comes before the full
 # disk: "could not write to output file: Input/output error" is a dying card, not a full one.
 ERRORS = (
+    ("hba_rejected", ("no pg_hba.conf entry",)),
     ("unreachable", ("Connection refused", "could not connect", "timeout expired", "No route to host",
                      "could not translate host name", "server closed the connection")),
     ("too_many_connections", ("too many connections",)),
@@ -537,26 +540,11 @@ def _load_optouts(path: Path | None) -> list[int]:
     return sorted(set(ids))
 
 
-async def restore(source: BinaryIO, database: str, *, optouts: Path | None) -> dict:
-    """Restores the dump on `source` (a file or a pipe: it needs a file descriptor) into the empty
-    `database`, then migrates, replays the opt-outs and purges. Counts only. A database that already holds
-    the archive is refused: nothing is overwritten. DATABASE_URL and BOT_TOKEN come from the environment or
-    /opt/nestor/.env, as the collector's unit has them.
-
-    With the clocks of the Pi and the router apart, the purge is left out ("purge_refused" in the
-    result) and the collector's nightly run does it once they agree. A failure after the copy is
-    loaded is BackupError(loaded=True): that database is not empty any more."""
-    import asyncpg
+def _settings() -> tuple[str, int]:
+    """DATABASE_URL and the bot's id (the number before the colon in BOT_TOKEN), from the environment or
+    /opt/nestor/.env, as the collector's unit has them: the restore and `forget` run by hand."""
     from dotenv import dotenv_values
 
-    from . import forget, retention
-    from .bootstrap import with_database
-    from .collector import store
-    from .config import _env
-    from .migrate import migrate
-
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", database):
-        raise BackupError("bad_database")
     fallback = dotenv_values(ENV_FILE)
 
     def setting(name: str) -> str:
@@ -568,9 +556,32 @@ async def restore(source: BinaryIO, database: str, *, optouts: Path | None) -> d
         bot_id = int(setting("BOT_TOKEN").split(":", 1)[0])
     except ValueError:
         raise SystemExit("BOT_TOKEN is missing or not a bot token: in the environment or in " + ENV_FILE) from None
+    return setting("DATABASE_URL"), bot_id
+
+
+async def restore(source: BinaryIO, database: str, *, optouts: Path | None) -> dict:
+    """Restores the dump on `source` (a file or a pipe: it needs a file descriptor) into the empty
+    `database`, then migrates, replays the opt-outs and purges. Counts only. A database that already holds
+    the archive is refused: nothing is overwritten. DATABASE_URL and BOT_TOKEN come from the environment or
+    /opt/nestor/.env, as the collector's unit has them.
+
+    With the clocks of the Pi and the router apart, the purge is left out ("purge_refused" in the
+    result) and the collector's nightly run does it once they agree. A failure after the copy is
+    loaded is BackupError(loaded=True): that database is not empty any more."""
+    import asyncpg
+
+    from . import forget, retention
+    from .bootstrap import with_database
+    from .collector import store
+    from .config import _env
+    from .migrate import migrate
+
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", database):
+        raise BackupError("bad_database")
+    dsn, bot_id = _settings()
     ids = [i for i in _load_optouts(optouts) if i not in forget.SHARED_IDS]     # not one person: never forgotten
     bindir = find_bindir(Path(_env("BACKUP_PG_BINDIR")) if _env("BACKUP_PG_BINDIR") else None)
-    url = with_database(setting("DATABASE_URL"), database)
+    url = with_database(dsn, database)
     try:
         conn = await asyncpg.connect(url, timeout=10)
     except asyncpg.InvalidCatalogNameError:
@@ -633,6 +644,41 @@ async def restore(source: BinaryIO, database: str, *, optouts: Path | None) -> d
     return {**counts, "forgotten": len(ids), "purged": purged} | ({"purge_refused": refused} if refused else {})
 
 
+async def forget_since(since: datetime) -> list[int]:
+    """After a restore and the import that follows it. Whoever used /forget_me after the watchdog last wrote
+    optouts.json is in neither it nor the copy, and the import has just brought their messages back, with
+    the command itself. Every sender of /forget_me since `since` (when the copy was made) is forgotten
+    again: forgetting someone twice changes nothing. Telegram holds an update for up to a day, so a command
+    the bot carried out after the copy may have been sent a day before it. The archive does not know the
+    bot's name: a /forget_me@another_bot counts too. Returns their ids."""
+    import asyncpg
+
+    from . import forget
+
+    dsn, bot_id = _settings()
+    conn = await asyncpg.connect(dsn, timeout=10)
+    try:
+        ids = [r["user_id"] for r in await conn.fetch(
+            """SELECT DISTINCT user_id FROM messages
+               WHERE sent_at >= $1 AND text ~* '^\\s*/forget_me(@\\w+)?(\\s|$)' AND user_id <> ALL($2::bigint[])
+               ORDER BY user_id""", since - timedelta(days=1), sorted(forget.SHARED_IDS))]
+        for user_id in ids:
+            async with conn.transaction():
+                await forget.forget(conn, user_id, bot_id)
+    finally:
+        await conn.close()
+    return ids
+
+
+def _copy_time(value: str) -> datetime:
+    """--since: 20261005T013000Z as in the copy's file name (the whole name will do), or an ISO time with a zone."""
+    match = DUMP_RE.match(value)
+    when = datetime.fromisoformat(match.group(1) if match else value)
+    if when.tzinfo is None:
+        raise ValueError("no time zone")
+    return when
+
+
 def main(argv: list[str] | None = None) -> int:
     from .config import _env
     from .logs import setup_logging
@@ -644,6 +690,10 @@ def main(argv: list[str] | None = None) -> int:
     back.add_argument("--database", required=True, help="the empty database bootstrap created")
     back.add_argument("--optouts", type=Path, metavar="PATH",
                       help="the watchdog's optouts.json: every id in it is forgotten again")
+    again = commands.add_parser("forget", help="after the restore and the import: forget again whoever sent "
+                                               "/forget_me since the copy was made (as user nestor)")
+    again.add_argument("--since", required=True, type=_copy_time, metavar="TIME",
+                       help="when the restored copy was made, as in its file name: 20261005T013000Z")
     args = parser.parse_args(argv)
     setup_logging(_env("LOG_LEVEL", "INFO"))
 
@@ -662,6 +712,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"restore failed {type(e).__name__}")
             return 1
         print("restore done", json.dumps(done, ensure_ascii=False))
+        return 0
+    if args.command == "forget":
+        try:
+            ids = asyncio.run(forget_since(args.since))
+        except Exception as e:  # noqa: BLE001 - the class only: its text may hold a row
+            print(f"forget failed {type(e).__name__}")
+            return 1
+        print("forgotten", len(ids))
         return 0
 
     try:

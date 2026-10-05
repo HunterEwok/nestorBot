@@ -392,6 +392,7 @@ BACKUP_REASONS = {
     "too_many_connections": "у nestor_backup заняты все подключения",
     "starting_up": "база перезапускалась",
     "auth_failed": "пароль nestor_backup не подходит (pgpass)",
+    "hba_rejected": "сервер базы не пускает nestor_backup: нет строки в pg_hba.conf",
     "version_mismatch": "pg_dump старее сервера: обнови postgresql-client",
     "permission_denied": "у nestor_backup нет прав на чтение",
     "lock_timeout": "таблицы заняты миграцией",

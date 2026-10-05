@@ -159,6 +159,8 @@ def test_classify_pg_dump_errors():
         'pg_dump: error: connection to server at "192.168.0.1", port 5432 failed: FATAL:  password authentication '
         'failed for user "nestor_backup"': "auth_failed",
         "pg_dump: error: connection to server failed: fe_sendauth: no password supplied": "auth_failed",
+        'pg_dump: error: connection to server at "192.168.0.1", port 5432 failed: FATAL:  no pg_hba.conf entry for '
+        'host "192.168.0.2", user "nestor_backup", database "nestor", no encryption': "hba_rejected",
         "pg_dump: error: aborting because of server version mismatch\npg_dump: detail: server version: 18.1; "
         "pg_dump version: 17.6": "version_mismatch",
         "pg_dump: error: query failed: ERROR:  permission denied for table messages": "permission_denied",
@@ -1325,3 +1327,31 @@ async def test_main_restores_and_prints_counts_only(conn, cfg, fresh, restore_en
     monkeypatch.setattr(sys, "stdin", SimpleNamespace(buffer=dump.open("rb")))
     assert await asyncio.to_thread(bk.main, ["restore", "--database", fresh]) == 1       # now it is not empty
     assert capfd.readouterr().out == "restore failed not_empty\n"
+
+
+async def test_forget_after_the_import_finds_who_used_forget_me_since_the_copy(conn, restore_env, capfd):
+    """A /forget_me after the watchdog last wrote optouts.json is in neither it nor the copy. The import after
+    the restore brings it back with its author's messages, and `forget` finds it there."""
+    X, Y, Z, W, ANON = 777, 888, 999, 555, 1087968824
+    made = datetime.now(UTC).replace(microsecond=0) - timedelta(hours=3)        # when the copy was made
+    await conn.execute("INSERT INTO chats (chat_id, type) VALUES ($1, 'supergroup')", CHAT_ID)
+    for uid in (X, Y, Z, W, ANON):
+        await conn.execute("INSERT INTO users (user_id, first_name) VALUES ($1, 'Имя')", uid)
+    for mid, uid, text, sent in (
+            (1, X, "слова Икса", made + timedelta(hours=1)),
+            (2, X, "/forget_me", made + timedelta(hours=2)),
+            (3, Y, "/Forget_me@ewok_nestor_bot", made - timedelta(hours=23)),  # sent before, carried out after
+            (4, Z, "/forget_me", made - timedelta(days=2)),     # the copy has it: forgotten then, or refused
+            (5, W, "напиши /forget_me, если хочешь", made + timedelta(hours=1)),
+            (6, ANON, "/forget_me", made + timedelta(hours=1))):    # many people: never forgotten as one
+        await conn.execute("INSERT INTO messages (chat_id, message_id, user_id, sent_at, text, raw) "
+                           "VALUES ($1, $2, $3, $4, $5, $6)", CHAT_ID, mid, uid, sent, text,
+                           {"message_id": mid, "text": text})
+
+    since = f"nestor-{made:%Y%m%dT%H%M%SZ}.dump"
+    assert await asyncio.to_thread(bk.main, ["forget", "--since", since]) == 0
+    assert capfd.readouterr().out == "forgotten 2\n"
+    assert [r[0] for r in await conn.fetch("SELECT user_id FROM users WHERE opted_out ORDER BY 1")] == [X, Y]
+    assert [r[0] for r in await conn.fetch("SELECT message_id FROM messages ORDER BY 1")] == [4, 5, 6]
+    with pytest.raises(SystemExit):
+        bk.main(["forget", "--since", "2026-10-05T01:30"])         # a time without a zone is refused

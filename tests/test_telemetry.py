@@ -283,6 +283,12 @@ async def test_collector_reports_missing_watchdog_once_and_recovery_silently(poo
     clock.at += timedelta(minutes=19)
     await tick()
     assert bot.sent == []
+    # Telegram down when it is time to say it: not recorded as said, so a later tick says it.
+    clock.at += timedelta(minutes=1)
+    bot.errors = [TelegramNetworkError(method=None, message="down")]
+    await tick()
+    assert bot.sent == []
+    assert not (await conn.fetchval("SELECT value FROM ops_state WHERE key = 'collector_watch'") or {}).get("down")
     clock.at += timedelta(minutes=1)
     await tick()
     assert [(m["chat_id"], m["text"], m["disable_notification"]) for m in bot.sent] == [
@@ -336,7 +342,7 @@ async def test_a_database_outage_is_not_the_watchdog_stopping(pool, conn):
     for _ in range(30):                                 # the router reboots for half an hour
         clock.at += timedelta(minutes=1)
         await tick(down)
-    await _watchdog_ran(conn, "31 minutes")             # its last snapshot is from before
+    # Its last snapshot is unchanged: it could not write either. Only the outage restarts the 20 minutes.
     for minutes in (1, 19):                             # back: the watchdog gets 20 minutes of it to write
         clock.at += timedelta(minutes=minutes)
         await tick()

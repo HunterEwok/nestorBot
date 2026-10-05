@@ -18,8 +18,10 @@ from aiogram.methods import GetUpdates
 from nestor.logs import setup_logging
 
 CANARY = "КАНАРЕЙКА секретный текст"
-TOKEN = "123456789:AAHcanaryCANARYcanaryCANARYcanary_-x"
+TOKEN = "123456789:AAHcanaryCANARYcanaryCANARYcanary_-"     # 35 characters after the colon, as BotFather's
+SHORT_TOKEN = "987654321:AAHcanaryCANARYcanaryCANARYcanary_"  # 34, as the Bot API documentation's example
 DSN = "postgresql://nestor:CANARYpass@192.168.0.1:5432/nestor"
+PG_DSN = "postgres://nestor:CANARYpg@192.168.0.1/nestor"      # the other spelling libpq and asyncpg take
 
 
 @pytest.fixture
@@ -84,15 +86,16 @@ async def test_aiogram_args_become_class_names_and_tokens_are_redacted(journal):
                                  "exception": future.exception(), "future": future})
     # Whatever a line holds, secrets do not get through, and the line stays JSON.
     logging.getLogger("nestor.watchdog").warning(
-        'probe %s', f'{url} Authorization: Bearer hermes-CANARY-key {DSN} '
-                    f'api_key=CANARY1&x=1 password="CANARY2 \\" end" PASSWORD=CANARY3')
+        'probe %s', f'{url} https://api.telegram.org/bot{SHORT_TOKEN}/getMe Authorization: Bearer hermes-CANARY-key '
+                    f'{DSN} {PG_DSN} api_key=CANARY1&x=1 password="CANARY2 \\" end" PASSWORD=CANARY3')
     raw, lines = journal()
     assert [line["logger"] for line in lines] == ["aiogram.dispatcher", "asyncio", "nestor.watchdog"]
     assert lines[0]["msg"] == "Failed to fetch updates - TelegramNetworkError: aiogram.exceptions.TelegramNetworkError"
     assert lines[1]["msg"] == "Future exception was never retrieved" and lines[1]["exc"].endswith("ValueError")
-    assert lines[2]["msg"] == ("probe https://api.telegram.org/bot<bot-token>/getUpdates Authorization: Bearer <redacted> "
-                               "postgresql://<redacted>@192.168.0.1:5432/nestor api_key=<redacted>&x=1 "
-                               'password=<redacted> \\" end" PASSWORD=<redacted>')
+    assert lines[2]["msg"] == ("probe https://api.telegram.org/bot<bot-token>/getUpdates "
+                               "https://api.telegram.org/bot<bot-token>/getMe Authorization: Bearer <redacted> "
+                               "postgresql://<redacted>@192.168.0.1:5432/nestor postgres://<redacted>@192.168.0.1/nestor "
+                               'api_key=<redacted>&x=1 password=<redacted> \\" end" PASSWORD=<redacted>')
     for canary in ("canary", "КАНАРЕЙКА", "AAH"):
         assert canary.lower() not in raw.lower(), canary
 

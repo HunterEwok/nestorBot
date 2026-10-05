@@ -132,6 +132,8 @@ for v in PG_ADMIN_URL BACKUP_PASSWORD; do printf '%s: ' "$v"; read -rs "$v"; ech
 python -m nestor.bootstrap backup; unset PG_ADMIN_URL BACKUP_PASSWORD
 ```
 
+Серверу, настроенному по разделу «Сервер базы», нужна и строка для `nestor_backup` в `pg_hba.conf` (третья в `deploy/postgres/pg_hba.example`): без неё каждая копия падает с `hba_rejected`. В Docker-образе PostgreSQL роль и так пускает строка по умолчанию `host all all all scram-sha-256`.
+
 Установка на Pi. `pg_dump` нужен 18 из репозитория PGDG: свой клиент Debian 13 (17) сервер 18 не берёт. Сторож тоже нужен, даже без оповещений (раздел «Оповещения»): он хранит `optouts.json`, без которого восстановление из копии не сможет снова забыть тех, кто воспользовался `/forget_me`.
 
 ```sh
@@ -186,7 +188,11 @@ sudo systemctl start nestor-backup; cat /var/lib/nestor-backup/status.json      
    systemctl --user start hermes-gateway
    ```
 6. Импорт истории для всех групп с ноутбука: сообщения, пришедшие после копии, Telegram второй раз не пришлёт. Сообщения самого бота импорт не берёт: его ответы хранятся в `bot_requests`, а те, что забыты или вышли по сроку, не возвращаются.
-7. Через неделю нормальной работы удалить старую базу: `DROP DATABASE nestor_broken WITH (FORCE)`. Пока она есть, в ней лежит весь архив без срока хранения и без `/forget_me`: обещания `/privacy` до этого не выполнены.
+7. Сторож обновляет `optouts.json` раз в 5 минут: кто написал `/forget_me` в последние минуты перед потерей базы, того нет ни в копии, ни в списке, а импорт вернул его сообщения вместе с самой командой. На Pi снова забыть всех, кто писал `/forget_me` после копии (время — из имени файла шага 4, UTC); кого бот уже забыл, повтор не меняет:
+   ```sh
+   sudo -u nestor /opt/nestor/.venv/bin/python -m nestor.backup forget --since 20261005T013000Z    # forgotten 1
+   ```
+8. Через неделю нормальной работы удалить старую базу: `DROP DATABASE nestor_broken WITH (FORCE)`. Пока она есть, в ней лежит весь архив без срока хранения и без `/forget_me`: обещания `/privacy` до этого не выполнены.
 
 ## Оповещения
 

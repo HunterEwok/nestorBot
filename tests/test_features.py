@@ -11,7 +11,7 @@ from aiogram.exceptions import TelegramForbiddenError, TelegramNetworkError, Tel
 from aiogram.methods import SendMessage
 
 from nestor import forget
-from nestor.bot import markup, prompts
+from nestor.bot import markup, prompts, reminders
 from nestor.bot.context import classify
 from nestor.bot.scheduler import Scheduler
 from nestor.mcp import tools
@@ -96,6 +96,34 @@ async def test_reminder_set_listed_and_sent_once(make_env, conn):
     assert await conn.fetchval("SELECT count(*) FROM messages WHERE user_id = $1 AND text LIKE '✅ Напомню%'",
                                BOT_ID) == 0
     assert llm.calls == []
+
+
+async def test_a_reminder_queued_before_forget_me_is_not_set(make_env, conn):
+    bot, _, feed = make_env(FakeLLM(delay=0.4))
+    busy = asyncio.create_task(feed(update("message", message(1, "нестор, что нового?", uid=111, date=ago()))))
+    await asyncio.sleep(0.1)                        # someone else's question is being answered
+    remind = asyncio.create_task(feed(update("message", message(2, "нестор, напомни через 2 часа позвонить маме",
+                                                                 uid=222, date=ago()))))
+    await asyncio.sleep(0.05)
+    await feed(update("message", message(3, "/forget_me", uid=222, date=ago())))
+    await asyncio.gather(busy, remind)
+    assert await conn.fetchval("SELECT count(*) FROM reminders") == 0
+    assert await conn.fetchval("SELECT count(*) FROM bot_requests WHERE user_id = 222") == 0
+    assert not any(m["text"].startswith("✅ Напомню") for m in bot.sent)
+
+
+async def test_a_reminder_written_while_forget_me_ran_goes_with_the_request(make_env, conn, monkeypatch):
+    _, _, feed = make_env()
+    create = reminders.create
+
+    async def forgotten_meanwhile(conn, **kw):      # their /forget_me commits just before the insert
+        await feed.answerer.forget_user(kw["user_id"])
+        return await create(conn, **kw)
+    monkeypatch.setattr(reminders, "create", forgotten_meanwhile)
+    await feed(update("message", message(1, "нестор, напомни через 2 часа позвонить маме", uid=222, date=ago())))
+    assert await conn.fetchval("SELECT count(*) FROM reminders") == 0
+    req = await conn.fetchrow("SELECT user_id, question, answer FROM bot_requests")
+    assert tuple(req) == (222, None, None)
 
 
 async def test_a_long_list_of_reminders_comes_in_several_messages(make_env, conn):

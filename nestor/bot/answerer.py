@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import html
+import itertools
 import logging
 import re
 import secrets
@@ -39,6 +40,7 @@ log = logging.getLogger("nestor.answerer")
 ANONYMOUS_ADMIN_ID = 1087968824  # GroupAnonymousBot: an admin posting as the group (one of forget.SHARED_IDS)
 STATUS_STALE_AFTER = timedelta(minutes=15)     # the watchdog runs every 5 minutes
 _OFF = ("off", "выкл", "0", "нет", "no")
+_ORDER = itertools.count()      # orders requests and /forget_me commands (Answerer._overtaken)
 
 
 @dataclass(frozen=True)
@@ -79,6 +81,7 @@ class Job:
     # When the oldest message whose words the answer may carry entered the archive: the answer
     # leaves the archive with it (bot_requests.oldest_source_at, nestor.retention).
     sources_at: datetime | None = None
+    order: int = field(default_factory=lambda: next(_ORDER))   # when it was asked
 
     def saw(self, rows=(), *, at: datetime | None = None) -> None:
         """The answer may carry the words of these archive rows, or of something that entered the
@@ -124,6 +127,7 @@ class Answerer:
                                          log_call=self._log_reaction, cfg=cfg.reactions)
         self._queues: dict[int, asyncio.Queue[Callable[[], Awaitable[None]]]] = {}
         self._workers: dict[int, asyncio.Task] = {}
+        self._forgotten: dict[int, int] = {}   # user_id -> when their last /forget_me came, as Job.order
 
     # ---- entry points, called by the collector ----
 
@@ -355,9 +359,16 @@ class Answerer:
         return member.status in ("creator", "administrator")
 
     async def forget_user(self, user_id: int) -> int:
-        """/forget_me: delete the user's messages and reminders everywhere and stop storing new ones."""
+        """/forget_me: delete the user's messages and reminders everywhere and stop storing new ones.
+        Their requests still queued or being answered store nothing of theirs either (_overtaken)."""
+        self._forgotten[user_id] = next(_ORDER)
         async with self.pool.acquire() as conn, conn.transaction():
             return await forget.forget(conn, user_id, self.me.user_id)
+
+    def _overtaken(self, job: Job) -> bool:
+        """The asker used /forget_me after asking. forget() erased what was stored of theirs when it ran;
+        this request must not store their question or a reminder after it."""
+        return self._forgotten.get(job.msg["from"]["id"], -1) > job.order
 
     async def _scrub_answers(self, conn, user_id: int, request_id: int | None = None) -> None:
         await forget.scrub_answers(conn, user_id, self.me.user_id, request_id)
@@ -523,6 +534,8 @@ class Answerer:
             "FROM bot_requests WHERE created_at >= $1", self._day_start())
 
     async def _log(self, conn, job: Job, status: str, **fields) -> int:
+        """Queued requests log holding forget.ERASE_LOCK: a /forget_me of the asker then waits for
+        this row, or this row sees that it came."""
         msg = job.msg
         return await conn.fetchval(
             """INSERT INTO bot_requests (chat_id, trigger_msg_id, user_id, thread_id, scenario, question,
@@ -532,7 +545,7 @@ class Answerer:
                        (SELECT id FROM bot_requests WHERE id = $14),    -- the retention purge may have deleted it
                        $15, $16, least(now(), coalesce($17::timestamptz, now()))) RETURNING id""",
             msg["chat"]["id"], msg["message_id"], msg["from"]["id"], msg.get("message_thread_id"),
-            job.scenario, job.question, fields.get("answer"), fields.get("model"),
+            job.scenario, None if self._overtaken(job) else job.question, fields.get("answer"), fields.get("model"),
             fields.get("input_tokens"), fields.get("output_tokens"), fields.get("latency_ms"), status,
             fields.get("answer_msg_ids"), fields.get("parent_id"), fields.get("profile"), fields.get("quoted_user_ids"),
             fields.get("oldest_source_at"),
@@ -540,10 +553,14 @@ class Answerer:
 
     async def _answer(self, job: Job) -> None:
         msg = job.msg
+        if self._overtaken(job):        # asked, then /forget_me while it waited in the queue: dropped
+            return
         async with self.pool.acquire() as conn:
             reason = await self._limit_reason(conn, msg["from"]["id"])
             if reason:
-                await self._log(conn, job, "rate_limited")
+                async with conn.transaction():
+                    await forget.erase_lock(conn)
+                    await self._log(conn, job, "rate_limited")
         if reason:
             await self._say(msg, reason)
             return
@@ -584,11 +601,14 @@ class Answerer:
                 await conn.execute("DELETE FROM request_tickets WHERE ticket = $1 OR expires_at < now()", ticket)
                 async with conn.transaction():
                     # It may erase, and the purge may delete the parent request meanwhile: the lock
-                    # comes before the insert's row locks, and waits for a purge batch to commit.
-                    if fields.get("quoted_user_ids") or fields.get("parent_id"):
-                        await forget.erase_lock(conn)
+                    # comes before the insert's row locks, and waits for a purge batch to commit. A
+                    # /forget_me of the asker or of someone quoted waits for it, or has come before it.
+                    await forget.erase_lock(conn)
                     rid = await self._log(conn, job, status, **fields)
                     await self._scrub_if_opted_out(conn, rid, fields.get("quoted_user_ids"))
+                    if self._overtaken(job):    # a reminder set while their /forget_me ran
+                        await conn.execute("DELETE FROM reminders WHERE chat_id = $1 AND request_msg_id = $2 "
+                                           "AND user_id = $3", msg["chat"]["id"], msg["message_id"], msg["from"]["id"])
             await self._react(msg, None)
         log.info("answered", extra={"chat_id": msg["chat"]["id"], "scenario": job.scenario, "status": status,
                                     "latency_ms": fields["latency_ms"], "input_tokens": fields.get("input_tokens"),

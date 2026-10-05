@@ -567,6 +567,19 @@ async def test_forget_me_during_an_answer_in_flight_still_removes_it(make_env, c
     assert "котелок" not in str(llm.calls[-1])
 
 
+async def test_the_askers_forget_me_during_their_own_answer_keeps_no_question(make_env, conn):
+    bot, llm, feed = make_env(FakeLLM("Ответ", delay=0.4))
+    asking = asyncio.create_task(feed(update("message", message(1, "нестор, мой секретный вопрос про котелок",
+                                                                 uid=222))))
+    await asyncio.sleep(0.15)                       # the model is thinking
+    assert len(llm.calls) == 1
+    await feed(update("message", message(2, "/forget_me", uid=222)))
+    await asking
+    assert bot.sent[-1]["text"] == "Ответ"          # answered all the same
+    req = await conn.fetchrow("SELECT user_id, question, status FROM bot_requests")
+    assert tuple(req) == (222, None, "ok")
+
+
 async def test_answers_that_repeat_an_earlier_answer_go_with_it(make_env, conn):
     bot, llm, feed = make_env(FakeLLM("Петя берёт: [«палатку»](#1)"))
     await feed(update("message", message(1, "беру палатку", uid=222)))

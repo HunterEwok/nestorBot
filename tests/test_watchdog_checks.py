@@ -1,6 +1,7 @@
 """Stage 4 watchdog, the checks against the real database and a whole run: what each check reads (the
 collector's heartbeat, maintenance_runs, nestor.backup's status.json, systemctl), what it says, and that
 it only reads. systemctl, the clock's sync, the card and Telegram are stood in for."""
+import asyncio
 import json
 import os
 import threading
@@ -23,7 +24,7 @@ from nestor.config import Settings
 from nestor.watchdog import alerts, checks, run, summary
 from nestor.watchdog.alerts import AlertState
 from nestor.watchdog.checks import CHECKS, Check, Ctx, Finding, result
-from nestor.watchdog.probes import Host
+from nestor.watchdog.probes import Host, ProbeError
 
 from .factories import CHAT_ID
 from .test_backup import NIGHT, Tools, cfg_in, old_dumps
@@ -51,6 +52,19 @@ class Systemd:
         assert args[0] == "show" and args[2] == "-p"
         props = self.units.get(args[1], {"LoadState": "not-found", "ActiveState": "inactive"})
         return "".join(f"{k}={v}\n" for k, v in props.items())
+
+
+class FailingSystemd(Systemd):
+    """systemctl that fails for these units, as nestor.watchdog.probes.systemctl does (ProbeError)."""
+
+    def __init__(self, *failing: str, **units: dict):
+        super().__init__(**units)
+        self.failing = set(failing)
+
+    async def __call__(self, *args: str) -> str:
+        if args[1] in self.failing:
+            raise ProbeError("systemctl_exit_4")
+        return await super().__call__(*args)
 
 
 class AlertBot(Bot):
@@ -121,6 +135,10 @@ async def test_migrations_pending_unknown_and_crash_text(conn, monkeypatch):
     ctx = await make_ctx(conn, systemd=Systemd(nestor_collector={"ActiveState": "failed", "SubState": "failed",
                                                                   "Result": "exit-code"}))
     assert (await check(ctx, "migrations")).findings[0].line == prompts.ALERT_MIGRATION_CRASH.format(versions="0009_next")
+    # systemctl fails: still pending, only whether it crashes cannot be told.
+    res = await check(await make_ctx(conn, systemd=FailingSystemd("nestor-collector")), "migrations")
+    assert [(f.key, f.line) for f in res.findings] == [
+        ("migrations.pending", prompts.ALERT_MIGRATIONS.format(versions="0009_next"))]
     # The database is newer than the code on the Pi.
     monkeypatch.setattr(checks, "migration_files", lambda: files[:-1])
     res = await check(ctx, "migrations")
@@ -157,6 +175,15 @@ async def test_heartbeat_stale_only_when_unit_active(conn, caplog):
     assert keys(res) == ["telegram.polling"] and res.findings[0].confirm == 2
     assert res.findings[0].line == prompts.ALERT_POLLING.format(since=alerts.fmt_since(now - timedelta(minutes=10), now, MSK),
                                                                 error="<code>5xx</code>")
+    # Not one good poll since it started (the Pi was up before the router's uplink): counted from its start.
+    one = (now - timedelta(minutes=1)).isoformat()
+    await _beat(conn, started_at=one, updates_ok_at=None, updates_failures=3, updates_error="network")
+    assert (await check(await make_ctx(conn), "heartbeat")).status == "ok"
+    await _beat(conn, started_at=ten, updates_ok_at=None, updates_failures=40, updates_error="network")
+    res = await check(await make_ctx(conn), "heartbeat")
+    assert keys(res) == ["telegram.polling"]
+    assert res.findings[0].line == prompts.ALERT_POLLING.format(since=alerts.fmt_since(now - timedelta(minutes=10), now, MSK),
+                                                                error="<code>network</code>")
     # 401 and 409 are not a passing outage: said on the first run. The watchdog sends with the same token, so
     # the 401 line arrives only once .env has a new one, which the running collector has not read yet.
     assert prompts.ALERT_TOKEN_REVOKED.endswith("<code>sudo systemctl restart nestor-collector</code>")
@@ -196,6 +223,15 @@ async def test_collector_down_and_restarts(conn):
     res = await check(await make_ctx(conn, state=state, systemd=systemd), "collector")
     assert [(f.key, f.level, f.confirm) for f in res.findings] == [("collector.down", "crit", 2)]
     assert "<code>failed/failed, exit-code</code>" in res.findings[0].line
+    # Back, then down again days later: said from when it went down this time, not the first time.
+    systemd.units["nestor-collector"] = {**ACTIVE, "NRestarts": "1"}
+    back = await make_ctx(conn, state=state, systemd=systemd, now=datetime.now(MSK) + timedelta(minutes=10))
+    assert (await check(back, "collector")).status == "ok" and state.memo["collector"] == {}
+    systemd.units["nestor-collector"] = {"ActiveState": "failed", "SubState": "failed", "Result": "exit-code",
+                                         "NRestarts": "1"}
+    again = await make_ctx(conn, state=state, systemd=systemd, now=back.now + timedelta(days=4))
+    assert (await check(again, "collector")).findings[0].line == prompts.ALERT_COLLECTOR_DOWN.format(
+        since=alerts.fmt_since(again.now, again.now, MSK), state="<code>failed/failed, exit-code</code>")
 
 
 async def test_restarts_before_the_first_run_after_a_reboot_are_not_the_collectors(database, conn, tmp_path):
@@ -226,6 +262,10 @@ async def test_db_unreachable_clears_after_two_good_runs(conn):
     assert "db.unreachable" in state.problems                              # one good run is not enough
     alerts.evaluate(state, [checks.db_result(ctx, None)], ctx.now, tz=MSK, quiet=None)
     assert "db.unreachable" not in state.problems
+    # Down again days later: said from when it went down this time, not the first time.
+    later = await make_ctx(conn, now=ctx.now + timedelta(days=4), state=ctx.state)
+    assert checks.db_result(later, "ConnectionRefusedError").findings[0].line == prompts.ALERT_DB_DOWN.format(
+        since=alerts.fmt_since(later.now, later.now, MSK), error=prompts.DB_ERRORS["ConnectionRefusedError"])
 
 
 async def test_db_down_makes_db_checks_unknown_and_suppresses_collector(database, pool, tmp_path):
@@ -401,6 +441,13 @@ async def test_backup_contract_from_backup_write_status(conn, tmp_path, monkeypa
         prompts.ALERT_BACKUP_INTERRUPTED.format(since="04:30")]
     running = Systemd(nestor_backup={"ActiveState": "activating"})
     assert "backup.interrupted" not in keys(await look(now=after + timedelta(days=3), systemd=running))
+    # systemctl fails: whether it still runs cannot be told, and the open problem stays as it is.
+    state = AlertState()
+    alerts.evaluate(state, [res], after + timedelta(days=3), tz=MSK, quiet=None)
+    unsure = await look(now=after + timedelta(days=3, minutes=5), systemd=FailingSystemd("nestor-backup"))
+    assert "backup.interrupted" not in keys(unsure) and "backup.interrupted" in unsure.unknown
+    alerts.evaluate(state, [unsure], after + timedelta(days=3, minutes=5), tz=MSK, quiet=None)
+    assert "backup.interrupted" in state.problems
     # Copies older than promised stay while the clock cannot be trusted to rotate them.
     old_dumps(cfg, [NIGHT - timedelta(days=40)])
     unsynced = bk.backup(cfg, NIGHT + timedelta(days=4), run=Tools(size=1000, synced=False), force=True)
@@ -676,6 +723,31 @@ async def test_a_check_that_hangs_loses_the_database_for_the_rest_of_the_run(dat
         assert (await check(ctx, "model")).status == "unknown"
     finally:
         own.terminate()
+
+
+async def test_a_check_that_loses_the_database_is_unknown_not_broken(database):
+    async def sleeps(ctx):
+        await ctx.conn.execute("SELECT pg_sleep(5)")
+        return result("sleeps")
+
+    own = await asyncpg.connect(database["collector"])          # its own: the run gives it up
+    killer = await asyncpg.connect(database["collector"])
+
+    async def restart():                                        # PostgreSQL goes away under the check
+        await asyncio.sleep(0.3)
+        await killer.execute("SELECT pg_terminate_backend($1)", own.get_server_pid())
+
+    try:
+        ctx = await make_ctx(own)
+        restarting = asyncio.create_task(restart())
+        res = await run.run_check(ctx, Check("sleeps", sleeps))
+        await restarting
+        # db.unreachable speaks for it, not «Проверка sleeps сломалась»; unknown keeps its other problems.
+        assert (res.status, res.findings) == ("unknown", [])
+        assert ctx.conn is None and own.is_closed()
+    finally:
+        own.terminate()
+        await killer.close()
 
 
 async def test_optouts_file_accumulates(conn, tmp_path):
