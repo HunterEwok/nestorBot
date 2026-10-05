@@ -18,10 +18,12 @@ from nestor.bot.llm import Completion
 
 from .factories import CHAT_ID, message, update
 from .test_answerer import BOT_ID, FakeLLM, make_env_fixture  # noqa: F401 - make_env
+from .test_features import WISDOM
 
 TZ = ZoneInfo("Europe/Moscow")     # the answerer's default zone
 DAY = date(2026, 10, 5)            # the morning the digest comes; it retells the days before it
 LINK = "https://t.me/c/1000000001/"
+OTHER = CHAT_ID - 1                # another allowed group
 
 
 def at(day: date, hour: int, minute: int = 0, tz: ZoneInfo = TZ, **kw) -> datetime:
@@ -34,13 +36,13 @@ def spread(first: datetime, until: datetime, n: int) -> list[datetime]:
     return [first + i * step for i in range(n)]
 
 
-async def write(conn, times: list[datetime], first: int = 1000, chat_id: int = CHAT_ID) -> list[int]:
-    """Messages of the test group at these times, by users 200..209 in turn; their ids."""
+async def write(conn, times: list[datetime], first: int = 1000, chat_id: int = CHAT_ID, more: str = "") -> list[int]:
+    """Messages of the test group at these times, by users 200..209 in turn; their ids. more: added to each text."""
     await conn.execute("INSERT INTO chats (chat_id, type, title) VALUES ($1, 'supergroup', 'Test group') "
                        "ON CONFLICT DO NOTHING", chat_id)
     await conn.execute("INSERT INTO users (user_id, first_name) SELECT g, 'User' || g FROM generate_series(200, 209) g "
                        "ON CONFLICT DO NOTHING")
-    rows = [(chat_id, first + i, 200 + i % 10, t, f"обсуждаем тему {first + i}") for i, t in enumerate(times)]
+    rows = [(chat_id, first + i, 200 + i % 10, t, f"обсуждаем тему {first + i}{more}") for i, t in enumerate(times)]
     await conn.executemany("INSERT INTO messages (chat_id, message_id, user_id, sent_at, text, raw) "
                            "VALUES ($1, $2, $3, $4, $5, '{}')", rows)
     return [r[1] for r in rows]
@@ -60,6 +62,20 @@ async def digest_on(conn, chat_id: int = CHAT_ID, **settings) -> None:
 async def run(feed, now: datetime) -> None:
     await feed.answerer.run_daily_posts(now)
     await feed.answerer.drain()
+
+
+async def retry_later(conn) -> None:
+    """A failed attempt is claimed again 10 minutes later (daily.claim)."""
+    await conn.execute("UPDATE daily_posts SET updated_at = now() - interval '11 minutes'")
+
+
+async def next_day(conn) -> None:
+    """The tokens spent so far were spent yesterday (the daily limit counts by the real clock)."""
+    await conn.execute("UPDATE bot_requests SET created_at = created_at - interval '1 day'")
+
+
+def unsent() -> TelegramNetworkError:
+    return TelegramNetworkError(SendMessage(chat_id=CHAT_ID, text="x"), "timeout")
 
 
 def shown(call: list[dict]) -> list[int]:
@@ -328,12 +344,24 @@ async def test_a_digest_that_would_not_fit_reads_fewer_messages(make_env, conn):
 
     # Thirty days later most of the day's tokens are spent already: it reads what one call reads.
     later = await write(conn, spread(until, until + timedelta(days=30), 1200), first=3000)
-    await spend(conn, 85_000)
+    await spend(conn, 70_000)
     await run(feed, at(DAY + timedelta(days=30), 9, 30))
     last = shown(llm.calls[-1])
     assert llm.calls[-1][0]["content"] == prompts.DIGEST_PERIOD_SYSTEM and len(last) == 500
     assert last[0] == later[0] and last[-1] >= later[-3]
     assert await conn.fetchval("SELECT array_agg(status ORDER BY day) FROM daily_posts") == ["posted"] * 2
+
+    # Thirty days later again not even one call's worth is left: it is skipped, and comes the next morning.
+    await write(conn, spread(until + timedelta(days=30), until + timedelta(days=60), 1200), first=5000)
+    await spend(conn, 10_000)
+    calls = len(llm.calls)
+    await run(feed, at(DAY + timedelta(days=60), 9, 30))
+    assert len(llm.calls) == calls
+    await next_day(conn)
+    await run(feed, at(DAY + timedelta(days=61), 9, 30))
+    assert len(llm.calls) == calls + 3
+    assert await conn.fetchval("SELECT array_agg(status ORDER BY day) FROM daily_posts") == \
+        ["posted", "posted", "skipped", "posted"]
 
 
 async def test_a_started_digest_finishes_past_the_limit(make_env, conn):
@@ -350,6 +378,78 @@ async def test_a_started_digest_finishes_past_the_limit(make_env, conn):
     assert await conn.fetchval("SELECT status FROM daily_posts") == "posted"
     async with feed.answerer.pool.acquire() as c:
         assert await feed.answerer._tokens_today(c) == 60_000 + 4 * 100_000
+
+
+class MeasuredLLM(PartsLLM):
+    """Reports the tokens a real model would: one per 2.5 characters of the prompt and 2000 more for the
+    agent's own instructions; 300 for notes, 1000 for anything else."""
+
+    async def complete(self, messages):
+        done = await super().complete(messages)
+        size = sum(len(m["content"]) for m in messages)
+        return Completion(done.text, done.model, int(size / 2.5) + 2000,
+                          300 if messages[0]["content"] == prompts.DIGEST_NOTES_SYSTEM else 1000)
+
+
+async def test_the_digests_of_all_groups_take_half_of_the_day_together(make_env, conn):
+    # Three busy groups come due the same morning; the limit is the default 250 000 tokens.
+    groups = [CHAT_ID, OTHER, CHAT_ID - 2]
+    llm = MeasuredLLM()
+    llm.delay = 0.005
+    bot, llm, feed = make_env(llm, allowed_chat_ids=frozenset(groups))
+    since, until = daily.digest_bounds(DAY, 30, TZ)
+    for n, chat_id in enumerate(groups):
+        await write(conn, spread(since, until, 2500), first=10_000 * (n + 1), chat_id=chat_id,
+                    more=", и вот что я об этом думаю: " + "довольно длинное рассуждение " * 4)
+        await digest_on(conn, chat_id)
+
+    async def digests_today() -> int:
+        return await conn.fetchval(
+            "SELECT coalesce(sum(input_tokens + output_tokens), 0) FROM bot_requests "
+            "WHERE scenario IN ('digest', 'digest_notes') AND created_at > now() - interval '1 hour'")
+
+    posted = []
+    for d in range(3):
+        await run(feed, at(DAY + timedelta(days=d), 9, 30))
+        posted.append(await conn.fetchval("SELECT count(*) FROM daily_posts WHERE day = $1 AND status = 'posted'",
+                                          DAY + timedelta(days=d)))
+        # One digest takes most of the digests' half of the day; the others are skipped, the next morning tries
+        # again.
+        assert 100_000 < await digests_today() <= 250_000 // 2
+        if d == 0:      # the other half is for answers
+            await feed(update("message", message(1, "нестор, как дела?", uid=300)))
+            assert bot.sent[-1]["text"] == "Ответ модели"
+        await next_day(conn)
+    assert posted == [1, 1, 1] and llm.max_active == 1
+    assert await conn.fetchval("SELECT count(*) FROM daily_posts WHERE status = 'skipped'") == 3
+
+
+async def test_new_notes_on_parts_that_changed_must_fit_in_the_half(make_env, conn):
+    async def rename(call: int) -> None:
+        if call == 3:       # during the last call of notes User200, who writes in every part, changes their name
+            await conn.execute("UPDATE users SET first_name = 'Вася' WHERE user_id = 200")
+
+    _, llm, feed = make_env(PartsLLM(hook=rename, tokens=(30_000, 0)))      # the limit: 250 000
+    since, until = daily.digest_bounds(DAY, 30, TZ)
+    await write(conn, spread(since, until, 1200))
+    await digest_on(conn)
+    await run(feed, at(DAY, 9, 30))
+    # Three parts, measured to fit in half of the day. New notes on the first part still fit in what is left of it,
+    # those on the second do not: the attempt fails, and the digests stay within their half.
+    assert [c[0]["content"] for c in llm.calls] == [prompts.DIGEST_NOTES_SYSTEM] * 4
+    assert "Вася" in llm.calls[3][1]["content"] and "Вася" not in llm.calls[0][1]["content"]
+    assert await conn.fetchval("SELECT status FROM daily_posts") == "failed"
+    async with feed.answerer.pool.acquire() as c:
+        assert await feed.answerer._tokens_today(c) == 120_000
+    # Nor do they on the retry, which makes no call; the next morning it starts over with a new half.
+    await retry_later(conn)
+    await run(feed, at(DAY, 9, 45))
+    assert len(llm.calls) == 4 and await conn.fetchrow("SELECT status, attempts FROM daily_posts") == ("failed", 2)
+    await next_day(conn)
+    await run(feed, at(DAY + timedelta(days=1), 9, 30))
+    assert [c[0]["content"] for c in llm.calls[4:]] == [prompts.DIGEST_NOTES_SYSTEM] * 3 + [
+        prompts.DIGEST_PERIOD_SYSTEM]
+    assert await conn.fetchval("SELECT array_agg(status ORDER BY day) FROM daily_posts") == ["failed", "posted"]
 
 
 # ---- retries and the queue ----
@@ -384,6 +484,65 @@ async def test_a_retry_pays_only_for_notes_on_parts_that_changed(make_env, conn)
     assert bot.sent[-1]["text"].startswith("☀️ <b>Дайджест за 30 дней")
     assert await conn.fetchrow("SELECT status, attempts FROM daily_posts") == ("posted", 3)
     assert await conn.fetchval("SELECT count(*) FROM bot_requests WHERE scenario = 'digest_notes'") == 7
+
+
+async def test_notes_outlive_an_attempt_that_cannot_reach_telegram(make_env, conn):
+    bot, llm, feed = make_env(PartsLLM())
+    since, until = daily.digest_bounds(DAY, 30, TZ)
+    await write(conn, spread(since, until, 1200))
+    await digest_on(conn)
+    bot.send_errors = [unsent()]
+    await run(feed, at(DAY, 9, 30))         # notes and the digest written, the post not taken
+    assert len(llm.calls) == 4
+
+    async def unreachable(*args, **kw):
+        raise unsent()
+
+    member, bot.get_chat_member = bot.get_chat_member, unreachable
+    await retry_later(conn)
+    await run(feed, at(DAY, 9, 45))         # Telegram still unreachable: the attempt fails before any call
+    assert len(llm.calls) == 4 and await conn.fetchrow("SELECT status, attempts FROM daily_posts") == ("failed", 2)
+    bot.get_chat_member = member
+    await retry_later(conn)
+    await run(feed, at(DAY, 10, 0))
+    # The notes are still there: only the digest is written again, from the same notes.
+    assert len(llm.calls) == 5 and llm.calls[4] == llm.calls[3]
+    assert await conn.fetchrow("SELECT status, attempts FROM daily_posts") == ("posted", 3)
+
+
+async def test_notes_of_a_failed_day_are_not_used_the_next_day(make_env, conn):
+    bot, llm, feed = make_env(PartsLLM())
+    since, until = daily.digest_bounds(DAY, 30, TZ)
+    await write(conn, spread(since, until, 1200))
+    today = await write(conn, spread(at(DAY, 0), at(DAY, 9), 10), first=3000)
+    await digest_on(conn)
+    bot.send_errors = [unsent()]
+    await run(feed, at(DAY, 9, 30))         # written, but not taken, and not tried again that day
+    before = len(llm.calls)
+    await run(feed, at(DAY + timedelta(days=1), 9, 30))
+    # The next morning retells its own 30 days: new parts and new notes, with the last day among them.
+    notes = llm.calls[before:-1]
+    assert len(notes) == 3 and set(today) <= {i for c in notes for i in shown(c)}
+    assert bot.sent[-1]["text"].startswith("☀️ <b>Дайджест за 30 дней, 6 сентября — 5 октября</b>")
+    assert await conn.fetchval("SELECT array_agg(status ORDER BY day) FROM daily_posts") == ["failed", "posted"]
+
+
+async def test_a_retry_after_a_new_period_reads_the_new_period(make_env, conn):
+    bot, llm, feed = make_env(PartsLLM())
+    since, until = daily.digest_bounds(DAY, 30, TZ)
+    await write(conn, spread(since, until, 1200))
+    await digest_on(conn)
+    bot.send_errors = [unsent()]
+    await run(feed, at(DAY, 9, 30))
+    await digest_on(conn, digest_days=7)    # /digest 7 before the retry
+    await retry_later(conn)
+    before = len(llm.calls)
+    await run(feed, at(DAY, 9, 45))
+    week = await conn.fetch("SELECT message_id FROM messages WHERE sent_at >= $1 AND sent_at < $2 ORDER BY sent_at",
+                            *daily.digest_bounds(DAY, 7, TZ))
+    assert [shown(c) for c in llm.calls[before:]] == [[r["message_id"] for r in week]]
+    assert bot.sent[-1]["text"].startswith("☀️ <b>Дайджест за 7 дней, 28 сентября — 4 октября</b>")
+    assert await conn.fetchrow("SELECT status, attempts FROM daily_posts") == ("posted", 2)
 
 
 async def test_parts_that_keep_changing_are_read_again_later(make_env, conn):
@@ -436,37 +595,74 @@ async def test_questions_do_not_wait_for_a_digest(make_env, conn):
     assert await conn.fetchval("SELECT status FROM daily_posts") == "posted"
 
 
-async def test_digests_of_two_groups_come_one_after_the_other(make_env, conn):
-    other = CHAT_ID - 1
-    llm = PartsLLM(tokens=(30_000, 0))
-    llm.delay = 0.01
-    _, llm, feed = make_env(llm, daily_token_limit=100_000, allowed_chat_ids=frozenset({CHAT_ID, other}))
+async def test_the_wisdom_of_the_day_does_not_wait_for_a_digest(make_env, conn):
+    async def wisdom_posted() -> None:
+        while not any(s["chat_id"] == OTHER for s in bot.sent):
+            await asyncio.sleep(0.01)
+
+    async def evening(call: int) -> None:
+        if call == 1:       # while the first part of a digest is read, another group's wisdom comes due
+            await feed.answerer.run_daily_posts(at(DAY, 21, 30))
+            await asyncio.wait_for(wisdom_posted(), 5)
+
+    bot, llm, feed = make_env(PartsLLM(hook=evening), smart=FakeLLM(WISDOM), wisdom_chat_ids=frozenset({OTHER}),
+                              allowed_chat_ids=frozenset({CHAT_ID, OTHER}))
     since, until = daily.digest_bounds(DAY, 30, TZ)
-    for chat_id, first in ((CHAT_ID, 1000), (other, 3000)):
-        await write(conn, spread(since, until, 1200), first=first, chat_id=chat_id)
-        await digest_on(conn, chat_id)
+    await write(conn, spread(since, until, 1200))
+    await conn.execute("INSERT INTO chats (chat_id, type, title) VALUES ($1, 'supergroup', 'Other group')", OTHER)
+    await digest_on(conn)
     await run(feed, at(DAY, 9, 30))
-    # The first measures the day's tokens and reads in two parts; the second, after it, sees what it spent
-    # and reads one call's worth.
-    group = ["other" if re.search(r"#3\d{3}\b", c[1]["content"]) else "test" for c in llm.calls]
-    assert group in (["test"] * 3 + ["other"], ["other"] * 3 + ["test"]) and llm.max_active == 1
-    assert len(shown(llm.calls[-1])) == 500
-    assert await conn.fetchval("SELECT array_agg(status) FROM daily_posts") == ["posted"] * 2
+    # Posted while the digest had three more calls to make: only digests wait for each other.
+    assert len(llm.calls) == 4
+    rows = await conn.fetch("SELECT chat_id, kind, status FROM daily_posts ORDER BY kind")
+    assert [tuple(r) for r in rows] == [(CHAT_ID, "digest", "posted"), (OTHER, "wisdom", "posted")]
 
 
-async def test_a_post_still_running_is_not_claimed_again(make_env, conn):
+async def test_a_post_still_queued_or_running_is_not_claimed_again(make_env, conn):
     async def tick(call: int) -> None:
-        if call == 1:       # a tick half an hour into the digest: it is not taken for one that died mid-way
+        if call == 1:       # half an hour into the first digest, while the other still waits in the queue
             await conn.execute("UPDATE daily_posts SET updated_at = now() - interval '31 minutes'")
             await feed.answerer.run_daily_posts(at(DAY, 10, 0))
 
-    bot, llm, feed = make_env(PartsLLM(hook=tick))
+    bot, llm, feed = make_env(PartsLLM(hook=tick), allowed_chat_ids=frozenset({CHAT_ID, OTHER}))
     since, until = daily.digest_bounds(DAY, 30, TZ)
-    await write(conn, spread(since, until, 1200))
-    await digest_on(conn)
+    for chat_id, first in ((CHAT_ID, 1000), (OTHER, 3000)):
+        await write(conn, spread(since, until, 1200), first=first, chat_id=chat_id)
+        await digest_on(conn, chat_id)
     await run(feed, at(DAY, 9, 30))
-    assert await conn.fetchrow("SELECT status, attempts FROM daily_posts") == ("posted", 1)
-    assert len(llm.calls) == 4 and sum(s["text"].startswith("☀️") for s in bot.sent) == 1
+    # Neither is taken for one that died mid-way.
+    assert [tuple(r) for r in await conn.fetch("SELECT status, attempts FROM daily_posts")] == [("posted", 1)] * 2
+    assert len(llm.calls) == 8 and sum(s["text"].startswith("☀️") for s in bot.sent) == 2
+    assert await conn.fetchval("SELECT count(*) FROM bot_requests WHERE scenario = 'digest'") == 2
+
+
+@pytest.mark.parametrize("command", ["/digest off", "/pause"])
+async def test_a_queued_digest_is_dropped_when_the_group_says_no(make_env, conn, command):
+    said: list[asyncio.Task] = []
+
+    async def confirmed() -> None:
+        while not any(s["reply_to"] == 1 for s in bot.sent):
+            await asyncio.sleep(0.01)
+
+    async def say_no(call: int) -> None:
+        if call == 1:       # while the other group's digest is read, ours comes due and waits; then an admin says no
+            await digest_on(conn)
+            await feed.answerer.run_daily_posts(at(DAY, 9, 30))
+            said.append(asyncio.create_task(feed(update("message", message(1, command)))))
+            await asyncio.wait_for(confirmed(), 5)
+
+    bot, llm, feed = make_env(PartsLLM(hook=say_no), admins={111}, allowed_chat_ids=frozenset({CHAT_ID, OTHER}))
+    since, until = daily.digest_bounds(DAY, 30, TZ)
+    ours = await write(conn, spread(since, until, 1200))
+    await write(conn, spread(since, until, 1200), first=3000, chat_id=OTHER)
+    await digest_on(conn, OTHER)
+    await run(feed, at(DAY, 9, 30))
+    await said[0]
+    # None of our messages reached the model, and nothing was posted here.
+    assert len(llm.calls) == 4 and not set(ours) & {i for c in llm.calls for i in shown(c)}
+    assert [s["reply_to"] for s in bot.sent if s["chat_id"] == CHAT_ID] == [1]      # only the confirmation
+    rows = await conn.fetch("SELECT chat_id, status FROM daily_posts ORDER BY chat_id")
+    assert [tuple(r) for r in rows] == sorted([(OTHER, "posted"), (CHAT_ID, "skipped")])
 
 
 # ---- /forget_me ----
