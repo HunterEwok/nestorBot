@@ -16,8 +16,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from datetime import time as dtime
 
+from .. import forget
 from .llm import extract_json
-from .triggers import BotIdentity, name_forms
+from .triggers import BotIdentity, name_forms, quiet
 
 MAX_CHARS = 300         # a remark is one or two sentences
 MIN_CUT = 20            # an overlong remark cut shorter than this is not worth saying
@@ -38,16 +39,10 @@ def in_hours(at: dtime, hours: tuple[dtime, dtime]) -> bool:
     return hours[0] <= at < hours[1]
 
 
-# «нестор, помолчи», «замолчи уже», «хватит», «не встревай»: the whole request, with or without the name.
-_QUIET = re.compile(r"(?:ну\s+|да\s+|вс[её]\s+)?(?:помолчи|замолчи|хватит|не\s+встревай)"
-                    r"(?:\s+(?:пожалуйста|пж|плиз|уже|сегодня|пока|а))*")
-
-
 def asks_quiet(text: str | None, me: BotIdentity) -> bool:
-    """Whether a request to the bot asks it to keep quiet: then no remarks until the end of the day."""
-    words = re.sub(rf"(?<!\w)(?:{name_forms(me.keywords)})(?!\w)", " ", (text or "").lower())
-    words = " ".join(re.sub(r"[^\w\s]", " ", words).split())
-    return _QUIET.fullmatch(words) is not None
+    """Whether a request to the bot asks it to keep quiet («нестор, помолчи», «замолчи уже», «хватит»,
+    «не встревай», with or without the name): then no remarks until the end of the day."""
+    return quiet(re.sub(rf"(?<!\w)(?:{name_forms(me.keywords)})(?!\w)", " ", (text or "").lower()))
 
 
 # A web address in any form: https://…, www.…, t.me/…, example.com, сайт.рф.
@@ -70,24 +65,32 @@ class Pick:
     text: str
 
 
+# The labels the model reads instead of names (nestor.bot.addressing.render) mean nothing in the chat.
+_LABEL = re.compile(r"участник\w*\s*№?\s*\d", re.IGNORECASE)
+_SIGNED = re.compile(r"^\s*нестор\s*(?::|—|–|-(?!\w))\s*", re.IGNORECASE)     # «Нестор: …», as the model reads its own
+
+
 def parse(answer: str | None, count: int) -> Pick | None:
     """{"reply_to": N, "text": "…"} -> Pick. {"reply_to": null}, a number that was not shown, an empty
-    text, one too long to cut, a link, anything else: None, the bot stays silent."""
+    text, one too long to cut, a link, a label («Участник 2 прав»), anything else: None, the bot stays
+    silent. A «Нестор:» before the text is dropped."""
     data = extract_json(answer)
     if not isinstance(data, dict):
         return None
     n, text = data.get("reply_to"), data.get("text")
     if type(n) is not int or not 1 <= n <= count or not isinstance(text, str):
         return None
-    text = trim(text)
-    if text is None or LINK.search(text):
+    text = trim(_SIGNED.sub("", text))
+    if text is None or LINK.search(text) or _LABEL.search(text):
         return None
     return Pick(n, text)
 
 
 def targetable(row, *, bot_id: int, previous: list[int] | None, now: datetime, max_age: timedelta) -> bool:
-    """Whether a remark may answer this archive row, read back after the model chose it (a deleted
-    message, or one whose author used /forget_me meanwhile, is not found at all): a person's message,
-    not a bot's, at most max_age old, and not of the person the chat's previous remark answered."""
+    """Whether a remark may answer this archive row (context.messages_by_id), read back after the model
+    chose it (a deleted message, or one whose author used /forget_me meanwhile, is not found at all): a
+    person's message, not a bot's, a channel's post or an admin's as the group, at most max_age old, and
+    not of the person the chat's previous remark answered."""
     return (row is not None and row["user_id"] is not None and row["user_id"] != bot_id and not row["is_bot"]
+            and row["sender_chat_id"] is None and row["user_id"] not in forget.SHARED_IDS
             and row["user_id"] not in (previous or ()) and now - row["sent_at"] <= max_age)

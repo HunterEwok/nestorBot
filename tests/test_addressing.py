@@ -51,6 +51,12 @@ def verdict(text: str | None, *, on: bool = True, bot_word: bool = True, window:
     ("нестор напомни завтра в 10 про встречу", "explicit"),
     ("нестор вчера тупил?", "explicit"),
     ("бот, привет", "explicit"),
+    ("нестор, глянь https://youtu.be/abc?si=xyz", "explicit"),
+    # «помолчи» needs no check: it asks nothing of the model (nestor.bot.chime).
+    ("нестор помолчи", "explicit"),
+    ("Нестор замолчи", "explicit"),
+    ("нестор хватит", "explicit"),
+    ("бот не встревай", "explicit"),
     # Only the name, maybe with a mark or an emoji: a call, as today.
     ("нестор", "explicit"),
     ("Нестор ", "explicit"),
@@ -62,6 +68,11 @@ def verdict(text: str | None, *, on: bool = True, bot_word: bool = True, window:
     ("нестор вчера тупил", "candidate"),
     ("бот опять всё перепутал", "candidate"),
     ("Нестор молодец", "candidate"),
+    ("нестор-то вчера тупил", "candidate"),          # a hyphen joined to the next word is not a mark
+    ("бот-то опять всё перепутал", "candidate"),
+    ("Нестор-то молодец", "candidate"),
+    ("бот-помощник опять всё перепутал", "candidate"),
+    ("нестор вчера скинул ролик https://youtu.be/abc?si=xyz", "candidate"),    # a «?» in a link is no question
     # The name elsewhere with a sign of an address.
     ("слушай, Нестор, а ты как думаешь?", "candidate"),
     ("Ну что, Нестор, пойдём", "candidate"),
@@ -74,6 +85,15 @@ def verdict(text: str | None, *, on: bool = True, bot_word: bool = True, window:
     ("Несторчик, ну скажи", "candidate"),
     ("эй бот, ты тут?", "candidate"),
     ("кто знает, бот это сможет?", "candidate"),
+    ("спасибо, нестор)", "candidate"),
+    ("спасибо, нестор 🙏", "candidate"),
+    ("доброе утро, нестор ☀️", "candidate"),
+    # The name in another case form.
+    ("Нестору вопрос: ты как думаешь?", "candidate"),
+    ("скажи, Нестору это понравится?", "candidate"),
+    ("а Нестора можно спросить?", "candidate"),
+    ("с Нестором, ты как?", "candidate"),
+    ("привет боту!", "candidate"),
     # The name without any sign: talk about the bot, silence.
     ("вчера нестор тупил", "silent"),
     ("спроси у Нестора, он знает", "silent"),
@@ -81,6 +101,8 @@ def verdict(text: str | None, *, on: bool = True, bot_word: bool = True, window:
     ("Нестору виднее", "silent"),
     ("в несторе что-то сломалось", "silent"),
     ("бота опять забанили", "silent"),
+    ("спасибо нестор 🙏", "silent"),
+    ("скинул нестору ссылку https://youtu.be/abc?si=xyz", "silent"),
     # Not the name at all.
     ("ботинки купил", "silent"),
     ("несторианство — древняя ересь?", "silent"),
@@ -96,6 +118,7 @@ def test_with_address_on(text, expected):
 @pytest.mark.parametrize("text, expected", [
     ("нестор вчера тупил", "explicit"),             # the name at the start: as it always was
     ("бот опять всё перепутал", "explicit"),
+    ("нестор-то вчера тупил", "explicit"),
     ("Нестор, привет", "explicit"),
     ("слушай, Нестор, а ты как думаешь?", "silent"),
     ("как думаешь, нестор?", "silent"),
@@ -113,6 +136,7 @@ def test_with_address_off_nothing_changes(text, expected):
     ("бот опять всё перепутал", "silent"),
     ("эй бот, ты тут?", "silent"),
     ("кто знает, бот это сможет?", "silent"),
+    ("привет боту!", "silent"),
     ("нестор вчера тупил", "candidate"),
     ("слушай, Нестор, а ты как думаешь?", "candidate"),
     ("Нестор, привет", "explicit"),
@@ -129,8 +153,14 @@ def test_without_the_generic_bot_word(text, expected):
     ("можешь подробнее", "candidate"),
     ("расскажи ещё про это", "candidate"),
     ("откуда это известно?", "candidate"),
+    ("а ты видел https://youtu.be/x?si=y?", "candidate"),
     ("ок", "silent"),
     ("понятно", "silent"),
+    ("вот нарезка https://youtu.be/abc?si=xyz", "silent"),
+    ("а, понятно", "silent"),                   # a thanks or an «ок» goes on the conversation, it asks nothing
+    ("а ок", "silent"),
+    ("а, спасибо", "silent"),
+    ("и тебе спасибо", "silent"),
     ("ахаха", "silent"),
     ("вчера нестор тупил", "silent"),           # the name without a sign stays silent in the window too
     ("Нестор, привет", "explicit"),
@@ -151,6 +181,15 @@ def test_not_a_candidate_whatever_the_words(kw):
     assert verdict("а ты уверен?", window=True, **kw) == "silent"
 
 
+@pytest.mark.parametrize("text", ["нестор кто прав", "бот кто прав", "нестор переведи", "Нестор\nкто тут прав",
+                                  "нестор вчера тоже тупил"])
+def test_the_name_at_the_start_of_a_reply_to_someone_is_for_the_model(text):
+    """As a call by name it was answered with /address off: under a friend's message it is checked, not dropped."""
+    friend = message(7, "налоги надо снизить вдвое", uid=222)
+    assert verdict(text, on=False, reply_to_message=friend) == "explicit"
+    assert verdict(text, reply_to_message=friend) == "candidate"
+
+
 def test_replies_that_still_may_be_to_the_bot():
     own = message(7, "я тут подумал", uid=111)
     assert verdict("а ты как думаешь, нестор?", reply_to_message=own) == "candidate"
@@ -167,6 +206,7 @@ def test_replies_that_still_may_be_to_the_bot():
     ("спасибо, нестор", "спасибо"),
     ("привет нестор!", "привет!"),
     ("нестор вчера тупил", "вчера тупил"),
+    ("нестор-то вчера тупил", "вчера тупил"),
     ("Несторушка, помоги с задачей", "помоги с задачей"),
     ("слушай, Нестор, а ты как думаешь?", "слушай, Нестор, а ты как думаешь?"),    # in the middle it stays
     ("а ты уверен?", "а ты уверен?"),
@@ -311,6 +351,48 @@ async def test_the_bots_own_answer_is_shown_as_nestor(make_env, conn):
                            "3. Участник 1: а ты уверен?")
 
 
+async def test_the_model_sees_the_messages_of_the_candidates_topic_only(make_env, conn):
+    checker = Checker(NO)
+    _, _, feed = make_env(news_llm=checker)
+    await address_on(conn)
+    await feed(say(300, 1, "это в общем чате"))                                                     # General
+    await feed(say(301, 2, "это в теме восемь", message_thread_id=8, is_topic_message=True))
+    await feed(say(302, 3, "это в теме девять", message_thread_id=9, is_topic_message=True))
+    await feed(say(222, 4, "слушай, Нестор, а ты как думаешь?", message_thread_id=9, is_topic_message=True))
+    await feed(say(222, 5, "слушай, Нестор, а ты как думаешь?"))                                      # General
+    nine, general = (c[1]["content"].split("\n\n")[0] for c in checker.checks)
+    assert nine == "1. Участник 1: это в теме девять\n2. Участник 2: слушай, Нестор, а ты как думаешь?"
+    assert general == "1. Участник 1: это в общем чате\n2. Участник 2: слушай, Нестор, а ты как думаешь?"
+
+
+async def test_the_message_asked_about_is_shown_whole(make_env, conn):
+    """The address often ends a long message: «…, как думаешь, нестор?». The messages before it are cut."""
+    checker = Checker(NO)
+    _, _, feed = make_env(news_llm=checker)
+    await address_on(conn)
+    story = "Короче, вчера мы с Серёгой спорили про то, когда впервые синтезировали ЛСД, " + "и так далее, " * 25
+    await feed(say(333, 1, story))
+    await feed(say(222, 2, story + "кто из нас прав, как думаешь, нестор?"))
+    before, asked = checker.checks[0][1]["content"].split("\n\n")[0].splitlines()
+    assert before == "1. Участник 1: " + story[:300]
+    assert asked == "2. Участник 2: " + story + "кто из нас прав, как думаешь, нестор?"
+
+
+async def test_the_bots_posts_are_shown_by_their_kind(make_env, conn):
+    """A /stats answer names people with their usernames: the model sees only that it was one."""
+    checker = Checker(NO)
+    _, _, feed = make_env(news_llm=checker)
+    await address_on(conn)
+    await feed(say(222, 1, "всем привет"))
+    await feed(say(333, 2, "/stats"))
+    await feed(say(222, 3, "слушай, Нестор, а ты как думаешь?", date=now() + 1))
+    user = checker.checks[0][1]["content"]
+    assert user.startswith("1. Участник 1: всем привет\n2. Участник 2: /stats\n3. Нестор: [статистика]\n"
+                           "4. Участник 1: слушай, Нестор")
+    for name in ("Петя", "Петров", "petya", "User333"):
+        assert name not in user
+
+
 async def test_opted_out_authors_and_quotes_are_not_shown(make_env, conn):
     checker = Checker(NO)
     _, _, feed = make_env(news_llm=checker)
@@ -365,9 +447,28 @@ async def test_the_daily_checks_per_chat(make_env, conn):
     await address_on(conn)
     await conn.execute("INSERT INTO bot_requests (chat_id, scenario, status, created_at) "
                        "VALUES ($1, 'address', 'ok', now() - interval '2 days')", CHAT_ID)    # not today's
+    await conn.execute("INSERT INTO bot_requests (chat_id, scenario, status) "
+                       "VALUES ($1, 'address', 'ok'), ($1, 'address', 'ok')", CHAT_ID - 1)    # another group's
     for i in range(1, 5):
         await feed(say(222, i, f"слушай, Нестор, а ты как думаешь? {i}"))
     assert len(checker.checks) == 2
+    assert await conn.fetchval("SELECT count(*) FROM bot_requests WHERE scenario = 'address' AND chat_id = $1",
+                               CHAT_ID) == 3
+
+
+async def test_checks_of_several_people_at_once_keep_the_daily_number(make_env, conn):
+    checker = Checker(NO, delay=0.2)
+    _, _, feed = make_env(news_llm=checker, address=AddressConfig(daily_checks=3))
+    await address_on(conn)
+    await conn.execute("INSERT INTO bot_requests (chat_id, scenario, status) "
+                       "VALUES ($1, 'address', 'ok'), ($1, 'address', 'ok')", CHAT_ID)
+    answerer = feed.answerer
+    for i, uid in enumerate((222, 333, 444), 1):      # one after another, while the first check still runs
+        msg = message(i, "слушай, Нестор, а ты как думаешь?", uid=uid, date=now())
+        await answerer.save_outgoing(msg)
+        await answerer.on_message(msg, paused=False)
+    await answerer.drain()
+    assert len(checker.checks) == 1
     assert await conn.fetchval("SELECT count(*) FROM bot_requests WHERE scenario = 'address'") == 3
 
 
@@ -401,6 +502,18 @@ async def test_thanks_in_own_words_get_a_reaction(make_env, conn):
     assert bot.reactions == [(1, ["❤"])] and llm.calls == [] and bot.sent == []
 
 
+async def test_the_name_at_the_start_under_a_friends_message_is_answered_on_a_yes(make_env, conn):
+    checker = Checker(YES)
+    bot, llm, feed = make_env(news_llm=checker)
+    await address_on(conn)
+    await feed(say(333, 1, "налоги надо снизить вдвое"))
+    await feed(say(222, 2, "нестор кто прав", reply_to_message=message(1, "налоги надо снизить вдвое", uid=333)))
+    assert checker.checks[0][1]["content"].startswith(
+        "1. Участник 1: налоги надо снизить вдвое\n2. Участник 2 (ответ на 1): нестор кто прав")
+    assert len(llm.calls) == 1 and bot.sent[-1]["reply_to"] == 2
+    assert await conn.fetchval("SELECT scenario FROM bot_requests WHERE trigger_msg_id = 2") == "who_is_right"
+
+
 async def test_a_no_still_may_get_a_reaction(make_env, conn):
     checker = Checker(NO, other=json.dumps({"reactions": [{"n": 1, "emoji": "😁"}]}))
     bot, llm, feed = make_env(news_llm=checker, reaction_chat_ids=frozenset({CHAT_ID}),
@@ -426,6 +539,46 @@ async def test_the_window_opens_for_the_person_the_bot_answered(make_env, conn):
     assert len(checker.checks) == 2 and len(llm.calls) == 3
     await feed(say(222, 5, "а почему?", date=now() + 302 + 300))
     assert len(checker.checks) == 2 and len(llm.calls) == 3
+
+
+async def test_a_yes_answered_opens_the_window_again(make_env, conn):
+    checker = Checker(YES)
+    bot, llm, feed = make_env(news_llm=checker)
+    await address_on(conn)
+    feed.answerer.addresser.opened(CHAT_ID, None, 222, at=now() - 200)      # an answer 200 seconds ago
+    await feed(say(222, 1, "а ты уверен?"))
+    assert len(checker.checks) == 1 and len(llm.calls) == 1
+    # Past that answer's window: only the one the yes's answer opened lets it in.
+    await feed(say(222, 2, "а почему?", date=now() + 200))
+    assert len(checker.checks) == 2 and len(llm.calls) == 2 and bot.sent[-1]["reply_to"] == 2
+
+
+async def test_the_window_is_for_the_next_message_only(make_env, conn):
+    checker = Checker(NO)
+    _, llm, feed = make_env(news_llm=checker)
+    await address_on(conn)
+    await feed(say(222, 1, "нестор, кто выиграл вчера?"))
+    await feed(say(222, 2, "понятно", date=now() + 5))
+    await feed(say(222, 3, "Маш, ты где?", date=now() + 60))            # to someone else, after the next one
+    assert checker.checks == []
+    await feed(say(222, 4, "нестор, а позавчера?"))
+    await feed(say(222, 5, "а ты уверен?", date=now() + 5))             # checked: a no
+    await feed(say(222, 6, "а почему?", date=now() + 10))
+    assert len(checker.checks) == 1 and len(llm.calls) == 2
+
+
+@pytest.mark.parametrize("text", ["а, понятно", "а, спасибо", "и тебе спасибо", "а ок"])
+async def test_thanks_right_after_an_answer_cost_nothing(make_env, conn, text):
+    checker = Checker(YES)
+    bot, llm, feed = make_env(news_llm=checker)
+    await address_on(conn)
+    await feed(say(222, 1, "нестор, кто выиграл вчера?"))
+    await feed(say(222, 2, text, date=now() + 1))
+    assert checker.checks == [] and len(llm.calls) == 1 and len(bot.sent) == 1
+    # Said in reply to the answer, it gets a reaction instead of another answer.
+    answer = message(bot.sent[-1]["message_id"], "Ответ модели", uid=BOT_ID)
+    await feed(say(222, 3, text, reply_to_message=answer))
+    assert bot.reactions[-1][0] == 3 and bot.reactions[-1][1] in (["👌"], ["❤"]) and len(llm.calls) == 1
 
 
 async def test_the_window_is_per_topic(make_env, conn):

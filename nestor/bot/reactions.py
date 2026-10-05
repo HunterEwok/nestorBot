@@ -103,9 +103,10 @@ def eligible(msg: dict) -> bool:
 
 # ---- «спасибо» to the bot: a reaction instead of an answer ----
 
-_THANKS = re.compile(r"(?:большое\s+|огромное\s+)?(?:спасибо|спс|пасиб[оа]?|благодарю|благодарствую|сенкс|мерси|"
-                     r"thx|thanks|thank\s+you)(?:\s+(?:большое|огромное|тебе|вам|бро|друг|дружище|нестор|бот))*")
+_THANKS = re.compile(r"(?:тебе\s+|вам\s+)?(?:большое\s+|огромное\s+)?(?:спасибо|спс|пасиб[оа]?|благодарю|благодарствую|"
+                     r"сенкс|мерси|thx|thanks|thank\s+you)(?:\s+(?:большое|огромное|тебе|вам|бро|друг|дружище|нестор|бот))*")
 _ACK = re.compile(r"(?:ок|окей|ok|okay|понял|поняла|ясно|понятно|принято|угу)")
+_GOING_ON = re.compile(r"^(?:(?:а|и|ну)\s+)+")     # «а, понятно», «ну ок», «и тебе спасибо»
 
 
 # Friendly emoji outside the reactions list: answered with 👌.
@@ -113,8 +114,8 @@ _FRIENDLY = ("🙂", "😊", "☺", "😉", "👋", "✅", "✔", "💪", "🫶"
 
 
 def acknowledgement(text: str | None) -> str | None:
-    """The reaction for a bare «спасибо», «ок» or a friendly emoji sent to the bot; None for
-    anything else (a question, «❓», «👎»): that goes to the model."""
+    """The reaction for a bare «спасибо», «ок» (also «а, понятно», «и тебе спасибо») or a friendly
+    emoji sent to the bot; None for anything else (a question, «❓», «👎»): that goes to the model."""
     raw = normalize(text or "")
     if raw and not re.search(r"[\w?¿‽？❓❔⁉]", raw):
         if re.fullmatch(r"[\s)]+", raw):       # «)))»: a smile
@@ -123,7 +124,7 @@ def acknowledgement(text: str | None) -> str | None:
         if mirrored is not None:
             return mirrored
         return "👌" if raw.startswith(_FRIENDLY) else None
-    words = re.sub(r"\s+", " ", re.sub(r"[^\w\s?-]", " ", raw)).strip().lower()
+    words = _GOING_ON.sub("", re.sub(r"\s+", " ", re.sub(r"[^\w\s?-]", " ", raw)).strip().lower())
     if _THANKS.fullmatch(words):
         return "❤"
     if _ACK.fullmatch(words):

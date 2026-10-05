@@ -1,5 +1,6 @@
 """The bot's own remarks (/chime on): when it looks, what the model reads, what the code lets through,
 how a remark is posted and stored, and «нестор, помолчи»."""
+import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from datetime import time as dtime
@@ -13,6 +14,7 @@ from aiogram.types import ReactionTypeEmoji
 
 from nestor import retention
 from nestor.bot import chime, markup, prompts
+from nestor.bot.answerer import _posts
 from nestor.bot.chime import ChimeConfig, Pick, parse, trim
 from nestor.bot.triggers import BotIdentity
 
@@ -96,6 +98,12 @@ def test_hours():
     ('{"reply_to": 2, "text": "Есть канал t.me/news"}', None),
     ('{"reply_to": 2, "text": "Загляни на www.example"}', None),
     ('{"reply_to": 2, "text": "Есть сайт пример.рф"}', None),
+    # The labels the model reads mean nothing in the chat; a signature is dropped.
+    ('{"reply_to": 3, "text": "Участник 2 прав: Хофманн синтезировал ЛСД в 1938 году."}', None),
+    ('{"reply_to": 3, "text": "Прав участник №2, это был 1938 год."}', None),
+    ('{"reply_to": 2, "text": "Нестор: Хофманн синтезировал ЛСД в 1938 году."}',
+     Pick(2, "Хофманн синтезировал ЛСД в 1938 году.")),
+    ('{"reply_to": 2, "text": "Нестор:"}', None),
     # Not an answer at all.
     ("Скажу: да", None), ("", None), (None, None), ("[1, 2]", None),
 ])
@@ -120,14 +128,15 @@ def test_asks_quiet(text):
 
 
 @pytest.mark.parametrize("text", ["помолчи про это, лучше расскажи", "хватит спорить", "хватит ли нам денег?",
-                                  "нестор, кто прав?", "молчи", "не встревай в их спор", "", None])
+                                  "нестор, кто прав?", "молчи", "не встревай в их спор", "", None,
+                                  "хватит?", "Нестор, хватит?", "хватит?!"])     # «is it enough?»
 def test_does_not_ask_quiet(text):
     assert not chime.asks_quiet(text, ME)
 
 
 def test_what_a_remark_may_answer():
     at = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
-    person = {"user_id": 222, "is_bot": False, "sent_at": at - timedelta(minutes=59)}
+    person = {"user_id": 222, "is_bot": False, "sender_chat_id": None, "sent_at": at - timedelta(minutes=59)}
     ok = {"bot_id": BOT_ID, "previous": [333], "now": at, "max_age": timedelta(minutes=60)}
     assert chime.targetable(person, **ok) and chime.targetable(person, **ok | {"previous": None})
     assert not chime.targetable(None, **ok)                       # deleted, or its author used /forget_me
@@ -135,6 +144,8 @@ def test_what_a_remark_may_answer():
     assert not chime.targetable(person | {"user_id": BOT_ID, "is_bot": True}, **ok)             # the bot's own
     assert not chime.targetable(person | {"user_id": 555, "is_bot": True}, **ok)                # another bot's
     assert not chime.targetable(person | {"user_id": None}, **ok)
+    assert not chime.targetable(person | {"user_id": 777000, "sender_chat_id": -1001000000777}, **ok)   # a channel's
+    assert not chime.targetable(person | {"user_id": 1087968824}, **ok)                                # an admin's
     assert not chime.targetable(person, **ok | {"previous": [222]})       # the person the last remark answered
 
 
@@ -277,6 +288,15 @@ async def test_it_looks_only_within_the_hours(make_env, conn):
     assert len(model.looks) == 1
 
 
+def channel_post(mid: int, at: datetime) -> dict:
+    """A post of the group's linked channel, as Telegram forwards it into the discussion group."""
+    return update("message", message(mid, "Новый пост канала", date=int(at.timestamp())) | {
+        "from": {"id": 777000, "is_bot": False, "first_name": "Telegram"}, "is_automatic_forward": True,
+        "sender_chat": {"id": -1001000000777, "type": "channel", "title": "Канал"},
+        "forward_origin": {"type": "channel", "date": int(at.timestamp()), "message_id": 5,
+                           "chat": {"id": -1001000000777, "type": "channel", "title": "Канал"}}})
+
+
 @pytest.mark.parametrize("people, looks", [(9, 0), (10, 1)])
 async def test_it_needs_people_talking_in_the_last_hour(make_env, conn, people, looks):
     model = Profile(SILENCE)
@@ -286,6 +306,7 @@ async def test_it_needs_people_talking_in_the_last_hour(make_env, conn, people, 
     await chat(feed, at - timedelta(minutes=61), 5, first=100)       # before the hour: not counted
     bot_user = {"id": 555, "is_bot": True, "first_name": "Другой бот"}
     await feed(update("message", message(200, "я тоже бот", date=int(at.timestamp()) - 30) | {"from": bot_user}))
+    await feed(channel_post(201, at - timedelta(seconds=20)))       # nor a channel's post
     await chat(feed, at, people)
     await look(feed, at)
     assert len(model.looks) == looks
@@ -414,11 +435,12 @@ async def test_an_error_or_a_timeout_is_silence(make_env, conn, fail, status):
     assert dict(row) == {"scenario": "chime_check", "status": status, "answer": None, "input_tokens": None}
 
 
-# Messages 1-3 of people, 4 the bot's own, 5 another bot's, 6-12 of people.
+# Messages 1-3 of people, 4 the bot's own, 5 another bot's, 6 the linked channel's post, 7-13 of people.
 @pytest.mark.parametrize("answer", [
     remark(4),                                  # the bot's own message
     remark(5),                                  # another bot's
-    remark(13), remark(0), '{"reply_to": "1", "text": "Ага"}',     # not a number it was shown
+    remark(6),                                  # the channel's
+    remark(14), remark(0), '{"reply_to": "1", "text": "Ага"}',     # not a number it was shown
     remark(1, "очень длинно " * 40),            # too long, nowhere to cut
     remark(1, "Смотри https://example.org"),   # a link
     remark(1, " "),
@@ -432,10 +454,44 @@ async def test_a_remark_the_code_refuses_is_silence(make_env, conn, answer):
     await feed.answerer.save_outgoing(message(4, "Кстати, вот ещё.", date=int(at.timestamp()) - 1500) | {"from": NESTOR})
     other = {"id": 555, "is_bot": True, "first_name": "Другой бот"}
     await feed(update("message", message(5, "Я тоже бот", date=int(at.timestamp()) - 1400) | {"from": other}))
-    await chat(feed, at, 7, first=6)
+    await feed(channel_post(6, at - timedelta(seconds=1300)))
+    await chat(feed, at, 7, first=7)
     await look(feed, at)
     assert bot.sent == [] and llm.calls == []
     assert [r["scenario"] for r in await conn.fetch("SELECT scenario FROM bot_requests")] == ["chime_check"]
+
+
+async def test_it_looks_as_of_when_it_starts(make_env, conn):
+    """The look may wait in the group's queue behind the news or the wisdom of the day: the hour, and the
+    age of the message it answers, count from when it starts, not from when it was queued."""
+    class Picks(Profile):       # answers the message written almost an hour before the tick, when shown it
+        async def complete(self, messages):
+            shown = messages[-1]["content"].split("\n\n")[0].splitlines()
+            n = next((i for i, line in enumerate(shown, 1) if line.endswith("почти час назад")), None)
+            self.chime = remark(n) if n else SILENCE
+            return await super().complete(messages)
+
+    model = Picks()
+    bot, _, feed = make_env(news_llm=model)
+    await chime_on(conn)
+    at = noon()
+    await feed(say(222, 1, "почти час назад", at - timedelta(minutes=59, seconds=59)))
+    await chat(feed, at, first=2)
+    feed.answerer._enqueue(_posts(CHAT_ID), lambda: asyncio.sleep(1.2))     # the news, still being written
+    await look(feed, at)
+    assert len(model.looks) == 1 and bot.sent == []
+    assert await conn.fetchval("SELECT scenario FROM bot_requests") == "chime_check"
+
+
+async def test_a_look_that_waits_past_the_hours_is_dropped(make_env, conn):
+    model = Profile(remark(1))
+    bot, _, feed = make_env(news_llm=model)
+    await chime_on(conn)
+    at = datetime.combine(datetime.now(MSK).date(), dtime(22, 59, 59), MSK)
+    await chat(feed, at)
+    feed.answerer._enqueue(_posts(CHAT_ID), lambda: asyncio.sleep(1.2))     # the wisdom of the day, being written
+    await look(feed, at)
+    assert model.calls == [] and bot.sent == []
 
 
 async def test_never_the_same_person_twice_in_a_row(make_env, conn):
@@ -578,6 +634,28 @@ async def test_chime_on_ends_the_quiet(make_env, conn):
     assert len(model.looks) == 1
 
 
+@pytest.mark.parametrize("replied", [False, True])
+async def test_quiet_without_a_comma_needs_no_check_where_address_is_on(make_env, conn, replied):
+    model = Profile(remark(2), address=json.dumps({"to_bot": False}))
+    bot, llm, feed = make_env(news_llm=model)
+    await posted(feed, conn)
+    await chime_on(conn, address=True)
+    kw = {"reply_to_message": message(2, "сообщение 2", uid=333)} if replied else {}    # under the remark's target
+    await feed(say(444, 30, "нестор помолчи", datetime.now(UTC), **kw))
+    assert model.calls == model.looks and llm.calls == [] and bot.reactions[-1] == (30, ["👌"])
+    assert await conn.fetchval("SELECT settings->>'chime_quiet' FROM chats") == datetime.now(MSK).date().isoformat()
+
+
+async def test_is_it_enough_is_a_question_not_quiet(make_env, conn):
+    bot, llm, feed = make_env()
+    await feed(say(222, 1, "нестор, сколько мяса брать на шашлык на пятерых?", datetime.now(UTC)))
+    answer = message(bot.sent[-1]["message_id"], "Ответ модели", uid=BOT_ID)
+    await feed(say(222, 2, "хватит?", datetime.now(UTC), reply_to_message=answer))
+    await feed(say(222, 3, "Нестор, хватит?", datetime.now(UTC)))
+    assert len(llm.calls) == 3 and [s["reply_to"] for s in bot.sent] == [1, 2, 3]
+    assert await conn.fetchval("SELECT settings->>'chime_quiet' FROM chats") is None
+
+
 async def test_quiet_says_it_in_words_where_the_chat_takes_no_such_reaction(make_env, conn):
     bot, llm, feed = make_env(news_llm=Profile(remark(2)))
     sent = await posted(feed, conn)
@@ -631,6 +709,70 @@ async def test_forget_me_of_the_targets_author_removes_the_remark(make_env, conn
     assert "Марли" not in str(await conn.fetchval("SELECT raw FROM messages WHERE message_id = 30"))
     row = await conn.fetchrow("SELECT answer, answer_msg_ids FROM bot_requests WHERE scenario = 'chime'")
     assert (row["answer"], row["answer_msg_ids"]) == (None, [sent["message_id"]])
+
+
+async def test_forget_me_of_a_forwarded_messages_author_removes_the_remark(make_env, conn):
+    """333 forwarded 888's words into the group; a remark on them may repeat them."""
+    _, _, feed = make_env(news_llm=Profile(remark(1)))
+    await chime_on(conn)
+    at = noon()
+    forwarded = {"type": "user", "date": 1_789_000_000, "sender_user": {"id": 888, "is_bot": False, "first_name": "Вася"}}
+    await feed(say(333, 1, "Марли умер в 1985", at - timedelta(minutes=30), forward_origin=forwarded))
+    await chat(feed, at, first=2)
+    await look(feed, at)
+    remark_id = feed.answerer.bot.sent[-1]["message_id"]
+    assert await conn.fetchval("SELECT quoted_user_ids FROM bot_requests WHERE scenario = 'chime'") == [333, 888]
+    await feed(say(888, 31, "/forget_me", datetime.now(UTC)))
+    row = await conn.fetchrow("SELECT answer, answer_msg_ids FROM bot_requests WHERE scenario = 'chime'")
+    assert (row["answer"], row["answer_msg_ids"]) == (None, [remark_id])
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE message_id = $1", remark_id) == 0
+
+
+async def test_a_remark_on_a_dispute_leaves_with_either_side(make_env, conn):
+    """A remark on «нет, раньше» may repeat the claim it answers: «Марли умер в 1985» counts as quoted too.
+    The next remark may still answer the other side: it was not the one answered."""
+    model = Profile(remark(2, "Марли умер в 1981-м, а не в 1985-м."))
+    bot, _, feed = make_env(news_llm=model)
+    await chime_on(conn)
+    at = noon()
+    await feed(say(444, 1, "Марли умер в 1985", at - timedelta(minutes=20)))
+    await feed(say(333, 2, "нет, раньше", at - timedelta(minutes=19),
+                   reply_to_message=message(1, "Марли умер в 1985", uid=444)))
+    await chat(feed, at, first=3, uids=(222, 555))
+    await look(feed, at)
+    remark_id = bot.sent[-1]["message_id"]
+    assert bot.sent[-1]["reply_to"] == 2
+    assert await conn.fetchval("SELECT quoted_user_ids FROM bot_requests WHERE scenario = 'chime'") == [333, 444]
+    await feed(say(444, 50, "Марли — это сила", at + timedelta(minutes=49)))
+    await chat(feed, at + timedelta(hours=1), first=100, uids=(222, 555))
+    model.chime = remark(1)         # 444's message of the new hour
+    await look(feed, at + timedelta(hours=1))
+    assert bot.sent[-1]["reply_to"] == 50
+    await feed(say(444, 60, "/forget_me", datetime.now(UTC)))
+    assert await conn.fetchval("SELECT count(answer) FROM bot_requests WHERE scenario = 'chime'") == 0
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE message_id = $1", remark_id) == 0
+
+
+async def test_the_bots_posts_are_shown_by_their_kind(make_env, conn):
+    """A /stats answer names people with their usernames: the model sees only that it was one. A /forget_me
+    of anyone it named takes it out of the archive."""
+    model = Profile(SILENCE)
+    bot, _, feed = make_env(news_llm=model)
+    await chime_on(conn)
+    at = noon()
+    await feed(say(555, 1, "всем привет", at - timedelta(minutes=50)))
+    await feed(say(222, 2, "/stats", at - timedelta(minutes=45)))
+    stats = bot.sent[-1]["message_id"]
+    await conn.execute("UPDATE messages SET sent_at = $1 WHERE message_id = $2", at - timedelta(minutes=44), stats)
+    await chat(feed, at, first=3)
+    await look(feed, at)
+    user = model.looks[0][1]["content"]
+    assert "3. Нестор: [статистика]" in user
+    for name in ("Петя", "Петров", "petya", "User555"):
+        assert name not in user
+    assert await conn.fetchval("SELECT quoted_user_ids FROM bot_requests WHERE scenario = 'stats'") == [222, 555]
+    await feed(say(555, 60, "/forget_me", datetime.now(UTC)))
+    assert await conn.fetchval("SELECT count(*) FROM messages WHERE message_id = $1", stats) == 0
 
 
 async def test_the_remark_leaves_the_archive_with_its_target(make_env, pool, conn):

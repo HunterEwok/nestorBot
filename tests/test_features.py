@@ -335,9 +335,10 @@ async def test_stats_names_the_longest_branches(make_env, conn):
     naming = llm.calls[0]
     assert naming[0]["content"] == prompts.TOPICS_SYSTEM and "Бюджет пуст" in naming[1]["content"]
     assert await conn.fetchval("SELECT input_tokens FROM bot_requests WHERE scenario = 'stats'") == 1000
-    # The model named the branch from its messages and may have kept their words: their authors
-    # go with the answer. The other branch was not shown to it.
-    assert await conn.fetchval("SELECT quoted_user_ids FROM bot_requests WHERE scenario = 'stats'") == [222, 333, 444]
+    # The activity names everyone it counts, the asker too, and the model named the branch from its
+    # messages and may have kept their words: all their authors go with the answer.
+    assert await conn.fetchval("SELECT quoted_user_ids FROM bot_requests WHERE scenario = 'stats'") == [111, 222, 333,
+                                                                                                         444]
 
     # Without a name from the model, a branch is called by its first words: its author's own,
     # so their /forget_me removes that /stats answer from the archive.
@@ -345,8 +346,8 @@ async def test_stats_names_the_longest_branches(make_env, conn):
     await feed(update("message", message(8, "/stats", date=ago())))
     assert "1. <a href=\"https://t.me/c/1000000001/1\">Налоги надо снизить</a>" in bot.sent[-1]["text"]
     stats_id = bot.sent[-1]["message_id"]
-    assert await conn.fetchval("SELECT quoted_user_ids FROM bot_requests WHERE answer_msg_ids = ARRAY[$1::bigint]",
-                               stats_id) == [222]
+    assert 222 in await conn.fetchval("SELECT quoted_user_ids FROM bot_requests WHERE answer_msg_ids = ARRAY[$1::bigint]",
+                                      stats_id)
     await feed(update("message", message(9, "/forget_me", uid=222, date=ago())))
     assert await conn.fetchval("SELECT count(*) FROM messages WHERE message_id = $1", stats_id) == 0
 

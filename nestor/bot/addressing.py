@@ -4,11 +4,11 @@ The clear cases are decided by code for free (nestor.bot.triggers.detect): a com
 a reply to the bot, the name at the start with a comma, or alone. In a group where an admin turned on
 /address, the doubtful ones are candidates: the name elsewhere in the message with a sign of
 an address («слушай, Нестор, а ты как думаешь?»), the name at the start without a comma
-(«нестор вчера тупил»), and «ты», a request or a question from someone the bot has just
-answered («а ты уверен?» a minute later). A candidate, with the few messages before it and
-without names, goes to the profile without tools for a yes or a no; a yes is answered as if the
-bot had been called by name. No profile, past the daily number of checks, or when the day's
-tokens run low: no check, and no answer. The code never guesses yes.
+(«нестор вчера тупил»), and the next message of someone the bot has just answered, with «ты»,
+a request or a question («а ты уверен?» a minute later). A candidate, with the few messages
+before it and without names, goes to the profile without tools for a yes or a no; a yes is
+answered as if the bot had been called by name. No profile, past the daily number of checks, or
+when the day's tokens run low: no check, and no answer. The code never guesses yes.
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ import asyncpg
 
 from . import context, prompts
 from .llm import LLM, Completion, extract_json
-from .reactions import eligible
+from .reactions import acknowledgement, eligible
 from .triggers import BotIdentity, Invocation, keyword_pattern, name_forms, speaks_to
 
 log = logging.getLogger("nestor.addressing")
@@ -47,11 +47,11 @@ def _keywords(me: BotIdentity, generic_keyword_enabled: bool) -> tuple[str, ...]
 
 def _set_off(text: str, start: int, end: int) -> bool:
     """The name at text[start:end] is said to someone: set off by commas («слушай, Нестор, а ...»,
-    «спасибо, нестор»), or at the very end before «?» or «!» («привет нестор!»)."""
+    «спасибо, нестор», «спасибо, нестор 🙏»), or at the very end before «?» or «!» («привет нестор!»)."""
     before, after = text[:start].rstrip(), text[end:].lstrip()
     if re.fullmatch(r"[?!]+\W*", after):
         return True
-    return (before.endswith(",") and (not after or after[0] in ",.!?…")) or \
+    return (before.endswith(",") and (not after or after[0] in ",.!?…" or not re.search(r"\w", after))) or \
         (after.startswith(",") and (not before or before[-1] in ".!?…"))
 
 
@@ -70,34 +70,60 @@ def candidate(msg: dict, me: BotIdentity, *, generic_keyword_enabled: bool = Tru
               window: bool = False) -> Invocation | None:
     """Whether a message that detect() did not take may still be addressed to the bot, for the
     model to decide; None when it is clearly not. window: the bot answered this person here a
-    moment ago. Only a person's own words: no bots, channels, forwards, commands or replies to
-    someone else."""
+    moment ago. Only a person's own words: no bots, channels, forwards or commands. A reply to
+    someone else is said to them, unless it starts with the name («нестор кто прав» under a
+    friend's message)."""
     text = msg.get("text") or msg.get("caption") or ""
-    if not eligible(msg) or _replies_to_someone(msg):
+    if not eligible(msg):
         return None
     keywords = _keywords(me, generic_keyword_enabled)
     names = re.compile(rf"(?<!\w)(?:{name_forms(keywords)})(?!\w)", re.IGNORECASE) if keywords else None
     found = list(names.finditer(text)) if names else []
     if keywords and keyword_pattern(keywords).match(text):      # «нестор вчера тупил»: maybe about it
         return Invocation("address", strip_name(text, names))
+    if _replies_to_someone(msg):
+        return None
     if found and (speaks_to(text) or any(_set_off(text, m.start(), m.end()) for m in found)):
         return Invocation("address", strip_name(text, names))
-    if window and (speaks_to(text) or _GOES_ON.match(text)):
+    # «а, понятно», «и тебе спасибо» right after an answer: a thanks, not a request.
+    if window and (speaks_to(text) or _GOES_ON.match(text)) and acknowledgement(text) is None:
         return Invocation("address", strip_name(text, names) if names else text.strip())
     return None
 
 
 def strip_name(text: str, names: re.Pattern) -> str:
     """The request without the name at its start or end and the marks around it:
-    «как думаешь, нестор?» -> «как думаешь?»; a name in the middle stays."""
-    text = re.sub(rf"^\s*(?:{names.pattern})[\s,:;!.…—–-]*", "", text, flags=re.IGNORECASE)
+    «как думаешь, нестор?» -> «как думаешь?», «нестор-то вчера тупил» -> «вчера тупил»; a name in
+    the middle stays."""
+    text = re.sub(rf"^\s*(?:{names.pattern})(?:-то(?!\w))?[\s,:;!.…—–-]*", "", text, flags=re.IGNORECASE)
     text = re.sub(rf"[\s,:;—–-]*(?:{names.pattern})(?=[\s?!.…]*$)", "", text, flags=re.IGNORECASE)
     return text.strip()
 
 
-def render(rows, bot_id: int) -> str:
+# The bot's posts that are not a conversation, shown by their kind and never word for word: they
+# name people («📊 Активность за 7 дней: 1. Петя Петров (@petya)…») and are long.
+POSTS = {"stats": "статистика", "summary": "пересказ", "catchup": "что пропустил", "digest": "дайджест",
+         "wisdom": "мудрость дня", "news": "новости"}
+
+
+async def bot_posts(conn, rows, bot_id: int) -> dict[tuple[int, int], str]:
+    """Which of the bot's messages among the rows are such posts: (chat_id, message_id) -> scenario."""
+    ours = [r for r in rows if r["user_id"] == bot_id]
+    if not ours:
+        return {}
+    found = await conn.fetch(
+        """SELECT b.chat_id, a.id, b.scenario FROM bot_requests b CROSS JOIN unnest(b.answer_msg_ids) AS a(id)
+           WHERE b.answer_msg_ids && $3::bigint[] AND b.scenario = ANY($1::text[]) AND b.chat_id = ANY($2::bigint[])
+             AND a.id = ANY($3::bigint[])""",
+        list(POSTS), list({r["chat_id"] for r in ours}), [r["message_id"] for r in ours])
+    return {(f["chat_id"], f["id"]): f["scenario"] for f in found}
+
+
+def render(rows, bot_id: int, *, posts: dict[tuple[int, int], str] | None = None, whole_last: bool = False) -> str:
     """The messages, numbered, oldest first, a label instead of each author: «Участник 1», ..., and
-    «Нестор» for the bot. A reply to one of them says which."""
+    «Нестор» for the bot. A reply to one of them says which. Each is cut to 300 characters; whole_last:
+    the last one, the message asked about, is shown whole (an address often ends a long message).
+    posts: the bot's posts among them (bot_posts), shown by their kind only."""
     labels: dict[int | None, str] = {}
     numbers = {(r["chat_id"], r["message_id"]): i for i, r in enumerate(rows, 1)}
     lines = []
@@ -105,7 +131,9 @@ def render(rows, bot_id: int) -> str:
         who = "Нестор" if r["user_id"] == bot_id else labels.setdefault(r["user_id"], f"Участник {len(labels) + 1}")
         target = numbers.get((r["chat_id"], r["reply_to_id"]))
         reply = f" (ответ на {target})" if target else ""
-        text = (r["text"] or f"[{r['kind']}]")[:300].replace("\n", " ⏎ ")
+        post = (posts or {}).get((r["chat_id"], r["message_id"])) if r["user_id"] == bot_id else None
+        text = f"[{POSTS[post]}]" if post else r["text"] or f"[{r['kind']}]"
+        text = (text if whole_last and i == len(rows) else text[:300]).replace("\n", " ⏎ ")
         lines.append(f"{i}. {who}{reply}: {text}")
     return "\n".join(lines)
 
@@ -141,12 +169,14 @@ class Addresser:
         self._answered: dict[tuple[int, int | None, int], float] = {}   # (chat, topic, person) -> unix time
         self._checks: dict[tuple[int, int], asyncio.Task] = {}          # (chat, person) -> the check in flight
         self._waiting: dict[tuple[int, int], tuple[dict, Invocation, int]] = {}
+        self._counting: dict[int, asyncio.Lock] = {}    # by chat: one check at a time counts the day's checks
+        self._in_flight: dict[int, int] = {}            # by chat: checks asked and not written down yet
 
     # ---- the conversation window ----
 
     def opened(self, chat_id: int, topic: int | None, user_id: int, at: float | None = None) -> None:
-        """The bot answered this person here (a delivered answer to their request): for
-        ADDRESS_WINDOW_MIN minutes their «а ты?» may be to the bot. Kept in memory only."""
+        """The bot answered this person here (a delivered answer to their request): their next message
+        within ADDRESS_WINDOW_MIN minutes, «а ты?», may be to the bot. Kept in memory only."""
         now = time.time() if at is None else at
         span = self.cfg.window_min * 60
         for key in [k for k, t in self._answered.items() if now - t > span]:
@@ -167,7 +197,10 @@ class Addresser:
         /forget_me of its author during the check still drops the answer."""
         if self.llm() is None:      # no profile without tools: candidates are ignored, never guessed
             return False
-        inv = candidate(msg, self.me, generic_keyword_enabled=generic_keyword_enabled, window=self.window(msg))
+        window = self.window(msg)
+        if window:      # only the person's next message: «понятно», or a word to a friend, closes it
+            del self._answered[(msg["chat"]["id"], _topic(msg), msg["from"]["id"])]
+        inv = candidate(msg, self.me, generic_keyword_enabled=generic_keyword_enabled, window=window)
         if inv is None:
             return False
         key = (msg["chat"]["id"], msg["from"]["id"])
@@ -206,14 +239,37 @@ class Addresser:
         """The model's yes: the candidate is addressed to the bot. No on any error or timeout."""
         chat_id = msg["chat"]["id"]
         llm = self.llm()
-        if llm is None or not await self.wanted(chat_id) or await self.checks_today(chat_id) >= self.cfg.daily_checks \
-                or not await self.may_spend():
+        if llm is None or not await self.wanted(chat_id):
+            return False
+        # Checks of different people run at once: those not written down yet count toward the day's too.
+        async with self._counting.setdefault(chat_id, asyncio.Lock()):
+            if await self.checks_today(chat_id) + self._in_flight.get(chat_id, 0) >= self.cfg.daily_checks \
+                    or not await self.may_spend():
+                return False
+            self._in_flight[chat_id] = self._in_flight.get(chat_id, 0) + 1
+        try:
+            completion = await self._ask(llm, msg)
+        finally:
+            self._in_flight[chat_id] -= 1
+        if completion is None or not parse(completion.text):
+            return False
+        # The model may take a while: a /pause, /address off, a deletion or the author's /forget_me
+        # meanwhile still counts.
+        if not await self.wanted(chat_id):
             return False
         async with self.pool.acquire() as conn:
+            return bool(await context.messages_by_id(conn, chat_id, [msg["message_id"]]))
+
+    async def _ask(self, llm: LLM, msg: dict) -> Completion | None:
+        """The model's answer on the candidate, written down; None when nothing was asked or the call failed."""
+        chat_id = msg["chat"]["id"]
+        async with self.pool.acquire() as conn:
             rows = await self._shown(conn, msg)
+            posts = await bot_posts(conn, rows, self.me.user_id)
         if not rows:
-            return False
-        user = prompts.ADDRESS_USER.format(messages=render(rows, self.me.user_id), n=len(rows))
+            return None
+        user = prompts.ADDRESS_USER.format(messages=render(rows, self.me.user_id, posts=posts, whole_last=True),
+                                           n=len(rows))
         started = time.monotonic()
         try:
             completion = await asyncio.wait_for(llm.complete([{"role": "system", "content": prompts.ADDRESS_SYSTEM},
@@ -224,16 +280,9 @@ class Addresser:
             # A failed call counts toward the day's checks too: a broken profile is not asked all day.
             await self.log_call(chat_id, Completion("", None, None, None), started,
                                 "timeout" if isinstance(e, asyncio.TimeoutError) else "error")
-            return False
+            return None
         await self.log_call(chat_id, completion, started, "ok")
-        if not parse(completion.text):
-            return False
-        # The model may take a while: a /pause, /address off, a deletion or the author's /forget_me
-        # meanwhile still counts.
-        if not await self.wanted(chat_id):
-            return False
-        async with self.pool.acquire() as conn:
-            return bool(await context.messages_by_id(conn, chat_id, [msg["message_id"]]))
+        return completion
 
     async def _shown(self, conn, msg: dict) -> list:
         """The candidate read back from the archive and the ADDRESS_CONTEXT messages before it in

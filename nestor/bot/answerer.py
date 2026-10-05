@@ -38,7 +38,7 @@ from ..watchdog.alerts import fmt_since, render_status
 from . import addressing, chime, context, daily, export, markup, music, prompts, reactions, reminders, routing
 from .llm import LLM, Completion
 from .markup import TELEGRAM_LIMIT, split_text
-from .triggers import BotIdentity, Invocation, detect
+from .triggers import URL, BotIdentity, Invocation, detect
 
 log = logging.getLogger("nestor.answerer")
 
@@ -55,16 +55,16 @@ _DIGEST_DAYS = re.compile(r"(\d+)(?:\s*(?:д|дн|день|дня|дней))?") 
 # each part, keeping the numbers of its key messages, and the digest is written from the notes.
 # Every call is its own row of bot_requests, so the daily token limit counts them all. Beyond
 # DIGEST_MAX_MESSAGES the period is thinned evenly over time (context.period_sample): 4 calls of
-# notes and the final one. The digests of all groups together take half of the day's tokens at most
-# (answers keep the rest), every call of notes included (_digest_room). Before its first call a
-# digest is measured roughly, DIGEST_CHARS_PER_TOKEN characters of the rendered messages per token
-# and DIGEST_CALL_TOKENS for each call's own prompt, answer and the agent's overhead, and thinned
-# further to fit in what is left of that half and of the day. When not even one call's worth fits
-# (DIGEST_CHUNK messages, or all when fewer), it is skipped and comes the next morning. A digest once
-# started finishes, as an answer does (the limit is soft): the tokens never stop its measured notes
-# or its final call (only /pause or /digest off do). New notes on parts that changed meanwhile were
-# not measured, so each is made only while it fits in what is left; else the attempt fails and keeps
-# its notes for a retry.
+# notes and the final one. The digests of all groups together take half of the day's tokens at most,
+# shared with the reactions, address checks and remarks (answers keep the rest), every call of notes
+# included (_digest_room). Before its first call a digest is measured roughly, DIGEST_CHARS_PER_TOKEN
+# characters of the rendered messages per token and DIGEST_CALL_TOKENS for each call's own prompt,
+# answer and the agent's overhead, and thinned further to fit in what is left of that half and of
+# the day. When not even one call's worth fits (DIGEST_CHUNK messages, or all when fewer), it is
+# skipped and comes the next morning. A digest once started finishes, as an answer does (the limit
+# is soft): the tokens never stop its measured notes or its final call (only /pause or /digest off
+# do). New notes on parts that changed meanwhile were not measured, so each is made only while it
+# fits in what is left; else the attempt fails and keeps its notes for a retry.
 DIGEST_CHUNK = 500
 DIGEST_MAX_MESSAGES = 2000
 DIGEST_CHARS_PER_TOKEN = 2.5
@@ -507,7 +507,7 @@ class Answerer:
         if emoji is None or _reply_target(msg, inv) is not None:
             return False
         replied = (msg.get("reply_to_message") or {}).get("text") or ""
-        if inv.replied_to_bot is not None and "?" in _LINKS.sub("", replied):   # a «?q=» inside a link is not one
+        if inv.replied_to_bot is not None and "?" in URL.sub("", replied):   # a «?q=» inside a link is not one
             return False
         allowed = await self.reactor.allowed(msg["chat"]["id"])
         emoji = next((e for e in (emoji, "👍", "👌", "❤") if e in allowed), None)
@@ -701,14 +701,16 @@ class Answerer:
 
     async def _digest_room(self, conn) -> tuple[int, int]:
         """Today's tokens, and how many of them the digests may still spend: the digests of all groups
-        together, every call of notes and every attempt included, take half of the daily limit at most
-        (answers keep the rest), and never more than the day has left."""
-        spent, digests = await conn.fetchrow(
-            "SELECT coalesce(sum(t), 0), coalesce(sum(t) FILTER (WHERE scenario IN ('digest', 'digest_notes')), 0) "
+        together, every call of notes and every attempt included, take half of the daily limit at most,
+        less what reactions, address checks and remarks spent today (answers keep the rest), and never
+        more than the day has left."""
+        spent, digests, extras = await conn.fetchrow(
+            "SELECT coalesce(sum(t), 0), coalesce(sum(t) FILTER (WHERE scenario IN ('digest', 'digest_notes')), 0), "
+            "       coalesce(sum(t) FILTER (WHERE scenario IN ('reaction', 'address', 'chime', 'chime_check')), 0) "
             "FROM (SELECT scenario, coalesce(input_tokens, 0) + coalesce(output_tokens, 0) AS t "
             "      FROM bot_requests WHERE created_at >= $1) r", self._day_start())
         limit = self.cfg.daily_token_limit
-        return spent, min(limit // 2 - digests, limit - spent)
+        return spent, min(limit // 2 - digests - extras, limit - spent)
 
     async def _log(self, conn, job: Job, status: str, **fields) -> int:
         """Queued requests log holding forget.ERASE_LOCK: a /forget_me of the asker then waits for
@@ -1022,13 +1024,14 @@ class Answerer:
         async with self.pool.acquire() as conn:
             ids = await context.chat_lineage(conn, msg["chat"]["id"])
             activity = await conn.fetch(
-                """SELECT u.first_name, u.last_name, u.username, count(*) AS n
+                """SELECT u.user_id, u.first_name, u.last_name, u.username, count(*) AS n
                    FROM messages m JOIN users u ON u.user_id = m.user_id
                    WHERE m.chat_id = ANY($1::bigint[]) AND m.kind <> 'service' AND NOT u.is_bot
                      AND m.sent_at > $2
                    GROUP BY u.user_id ORDER BY n DESC LIMIT 10""", ids, since)
             if not activity:
                 return Outgoing(prompts.STATS_EMPTY, html=True)
+            job.quoted |= {r["user_id"] for r in activity}      # it names them: their /forget_me takes it along
             found = await context.top_branches(conn, ids, None, since)
             branches = []
             for b in found:
@@ -1526,13 +1529,14 @@ class Answerer:
                     continue
                 self._looked[chat_id] = now
                 self._posting.add((chat_id, "chime"))
-                self._enqueue(_posts(chat_id), functools.partial(self._chime, chat_id, now))
+                self._enqueue(_posts(chat_id), functools.partial(self._chime, chat_id, now, time.monotonic()))
 
-    async def _chime(self, chat_id: int, now: datetime) -> None:
-        """A queued look (run_chimes); a failure is logged and waits for the next hour."""
+    async def _chime(self, chat_id: int, now: datetime, queued: float) -> None:
+        """A queued look (run_chimes); a failure is logged and waits for the next hour. It may wait
+        behind the news or the wisdom of the day: it looks as of when it starts."""
         status = "failed"
         try:
-            status = await self._remark(chat_id, now)
+            status = await self._remark(chat_id, now + timedelta(seconds=time.monotonic() - queued))
         except Exception as e:  # noqa: BLE001 - a remark is never worth a crash
             log.warning("remark failed", extra={"chat_id": chat_id, "error": type(e).__name__})
         finally:
@@ -1549,6 +1553,8 @@ class Answerer:
         if llm is None:     # no profile without tools: no remarks, never another profile
             return "no_profile"
         local, hour = now.astimezone(tz), now - timedelta(minutes=cfg.every_min)
+        if not chime.in_hours(local.time(), cfg.hours):    # it waited in the queue past CHIME_HOURS
+            return "late"
         async with self.pool.acquire() as conn:
             if not await self._chime_wanted(conn, chat_id, local.date()):
                 return "off"
@@ -1563,18 +1569,20 @@ class Answerer:
             if made >= cfg.daily:
                 return "enough"
             # This chat only: a message of the basic group it moved from cannot be answered here.
-            if await context.count_since(conn, [chat_id], None, hour, except_user=self.me.user_id) < cfg.min_messages:
+            if await context.count_since(conn, [chat_id], None, hour, except_user=self.me.user_id,
+                                         people_only=True) < cfg.min_messages:
                 return "quiet_chat"
             rows = await context.period_messages(conn, [chat_id], None, hour, limit=cfg.window)
             previous = await conn.fetchval(       # whom the last remark answered: not the same person twice
-                "SELECT quoted_user_ids FROM bot_requests WHERE chat_id = $1 AND scenario = 'chime' AND status = 'ok' "
-                "ORDER BY created_at DESC LIMIT 1", chat_id)
+                "SELECT quoted_user_ids[1:1] FROM bot_requests WHERE chat_id = $1 AND scenario = 'chime' "
+                "AND status = 'ok' ORDER BY created_at DESC LIMIT 1", chat_id)
+            posts = await addressing.bot_posts(conn, rows, self.me.user_id)
         if not await self._bot_is_member(chat_id):
             return "not_member"
         started = time.monotonic()
         prompt = [{"role": "system", "content": prompts.CHIME_SYSTEM},
                   {"role": "user", "content": prompts.CHIME_USER.format(
-                      messages=addressing.render(rows, self.me.user_id), n=len(rows))}]
+                      messages=addressing.render(rows, self.me.user_id, posts=posts), n=len(rows))}]
         try:
             completion = await asyncio.wait_for(llm.complete(prompt), cfg.timeout_s)
         except Exception as e:  # noqa: BLE001 - Hermes down or slow: silence
@@ -1584,7 +1592,7 @@ class Answerer:
                                           status="timeout" if isinstance(e, asyncio.TimeoutError) else "error",
                                           keep_text=False)
             return "error"
-        pick, target = chime.parse(completion.text, len(rows)), None
+        pick, target, sources = chime.parse(completion.text, len(rows)), None, []
         if pick is not None:
             chosen = rows[pick.n - 1]
             async with self.pool.acquire() as conn:
@@ -1596,6 +1604,9 @@ class Answerer:
                     if found and chime.targetable(found[0], bot_id=self.me.user_id, previous=previous, now=at,
                                                   max_age=timedelta(minutes=cfg.every_min)):
                         target = found[0]
+                        # A remark on a dispute may repeat the claim the target answers: that message counts too.
+                        sources = [target] + (await context.messages_by_id(conn, chat_id, [target["reply_to_id"]])
+                                              if target["reply_to_id"] is not None else [])
         if target is None:      # the model's silence, or a remark the code refused: no text is kept
             async with self.pool.acquire() as conn:
                 await self._log_scheduled(conn, chat_id, "chime_check", completion, [], started, keep_text=False)
@@ -1608,12 +1619,16 @@ class Answerer:
                 await self._log_scheduled(conn, chat_id, "chime_check", completion, [], started, status="error",
                                           keep_text=False)
             return "failed"
-        # Logged as an answer to the target's author: /forget_me and the purge take it with their message.
-        quoted = sorted({target["user_id"], target["forwarded_from"]} - {None})
+        # Logged as an answer to the target's author, and to the author of the message it replies to: /forget_me
+        # and the purge take it with either message. The target's author comes first: the next remark is to
+        # someone else (previous).
+        quoted = list(dict.fromkeys(u for r in sources for u in (r["user_id"], r["forwarded_from"])
+                                    if u not in (None, self.me.user_id)))
         async with self.pool.acquire() as conn, conn.transaction():
             await forget.erase_lock(conn)       # it may erase: the lock comes before the insert's row locks
             rid = await self._log_scheduled(conn, chat_id, "chime", replace(completion, text=pick.text), [sent],
-                                            started, quoted_user_ids=quoted, oldest_source_at=target["stored_at"])
+                                            started, quoted_user_ids=quoted,
+                                            oldest_source_at=min(r["stored_at"] for r in sources))
             await self._scrub_if_opted_out(conn, rid, quoted)
         return "posted"
 
@@ -1740,9 +1755,6 @@ def _oldest(times) -> datetime | None:
 def _out(completion: Completion, refs: dict[int, markup.Ref] | None = None) -> Outgoing:
     """A model answer: its Markdown becomes Telegram formatting."""
     return Outgoing(completion.text or "Мне нечего ответить по этим данным.", completion, markdown=True, refs=refs)
-
-
-_LINKS = re.compile(r"https?://\S+?(?=[.,;:!?)»\"']*(?:\s|$))")      # an address, without its trailing punctuation
 
 
 def _quoted(refs: dict[int, markup.Ref] | None, more: Collection[int] = ()) -> list[int] | None:
