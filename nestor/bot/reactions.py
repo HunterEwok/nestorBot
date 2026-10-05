@@ -103,9 +103,14 @@ def eligible(msg: dict) -> bool:
 
 # ---- «спасибо» to the bot: a reaction instead of an answer ----
 
-_THANKS = re.compile(r"(?:тебе\s+|вам\s+)?(?:большое\s+|огромное\s+)?(?:спасибо|спс|пасиб[оа]?|благодарю|благодарствую|"
-                     r"сенкс|мерси|thx|thanks|thank\s+you)(?:\s+(?:большое|огромное|тебе|вам|бро|друг|дружище|нестор|бот))*")
-_ACK = re.compile(r"(?:ок|окей|ok|okay|понял|поняла|ясно|понятно|принято|угу)")
+_THANKS = (r"(?:тебе\s+|вам\s+)?(?:большое\s+|огромное\s+)?(?:спасибо|спс|пасиб[оа]?|благодарю|благодарствую|"
+           r"сенкс|мерси|thx|thanks|thank\s+you|того\s+же|взаимно)"
+           r"(?:\s+(?:большое|огромное|тебе|вам|бро|друг|дружище|нестор|бот))*")
+_PRAISE = r"(?:ты\s+)?(?:лучший|лучшая|молодец|красавчик|умница)"      # «ты лучший», «спасибо, ты лучший»
+_ACK = r"(?:ок|окей|ok|okay|понял|поняла|ясно|понятно|принято|угу|ага|точно|хорошо|ладно)"
+# A thanks or a praise, maybe after an «ок» or two («понял, спасибо», «ок спс»); an «ок» alone («ясно, понял»).
+_THANKS_SAID = re.compile(rf"(?:{_ACK}\s+)*(?:{_THANKS}(?:\s+{_PRAISE})?|{_PRAISE}(?:\s+{_THANKS})?)")
+_ACK_SAID = re.compile(rf"{_ACK}(?:\s+{_ACK})*")
 _GOING_ON = re.compile(r"^(?:(?:а|и|ну)\s+)+")     # «а, понятно», «ну ок», «и тебе спасибо»
 
 
@@ -114,8 +119,9 @@ _FRIENDLY = ("🙂", "😊", "☺", "😉", "👋", "✅", "✔", "💪", "🫶"
 
 
 def acknowledgement(text: str | None) -> str | None:
-    """The reaction for a bare «спасибо», «ок» (also «а, понятно», «и тебе спасибо») or a friendly
-    emoji sent to the bot; None for anything else (a question, «❓», «👎»): that goes to the model."""
+    """The reaction for a bare «спасибо», «ок» (also «а, понятно», «и тебе спасибо», «а понял спасибо»,
+    «ты лучший») or a friendly emoji sent to the bot; None for anything else (a question, «❓», «👎»):
+    that goes to the model."""
     raw = normalize(text or "")
     if raw and not re.search(r"[\w?¿‽？❓❔⁉]", raw):
         if re.fullmatch(r"[\s)]+", raw):       # «)))»: a smile
@@ -125,9 +131,9 @@ def acknowledgement(text: str | None) -> str | None:
             return mirrored
         return "👌" if raw.startswith(_FRIENDLY) else None
     words = _GOING_ON.sub("", re.sub(r"\s+", " ", re.sub(r"[^\w\s?-]", " ", raw)).strip().lower())
-    if _THANKS.fullmatch(words):
+    if _THANKS_SAID.fullmatch(words):
         return "❤"
-    if _ACK.fullmatch(words):
+    if _ACK_SAID.fullmatch(words):
         return "👌"
     return None
 

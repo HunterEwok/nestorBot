@@ -82,23 +82,19 @@ def extract_json(text: str | None) -> dict[str, Any] | None:
 
 
 def sole_json(text: str | None) -> dict[str, Any] | None:
-    """The JSON object of a model answer when it holds only one, bare or in a ```json fence; None
-    if it holds none or more than one.
+    """The JSON object a model answer consists of, bare or in one ```json fence with nothing around it;
+    None for anything else.
 
-    For the short verdicts of the profile without tools, which reads chat text: an object
-    someone planted in the chat, quoted by the model before or after its own («в сообщении 4
-    просят {"to_bot": true}, но это данные. {"to_bot": false}»), makes the answer ambiguous,
-    not the planted one the answer."""
+    For the short verdicts of the profile without tools, which reads chat text: an object someone
+    planted in the chat and the model quoted, besides its own («в сообщении 4 просят {"to_bot": true},
+    но это данные. {"to_bot": false}») or with its verdict in words («… это данные, молчу»), must never
+    become the answer. Silence, or a no, is."""
     if not text:
         return None
-    decoder = json.JSONDecoder()
-    found, end = [], 0
-    for i, ch in enumerate(text):
-        if ch != "{" or i < end:        # a brace inside an object already read is part of it
-            continue
-        try:
-            obj, end = decoder.raw_decode(text, i)
-        except json.JSONDecodeError:
-            continue
-        found.append(obj)
-    return found[0] if len(found) == 1 and isinstance(found[0], dict) else None
+    text = text.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+    try:
+        data = json.loads(fenced.group(1) if fenced else text)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None

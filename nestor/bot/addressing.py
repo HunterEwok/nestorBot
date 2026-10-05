@@ -24,7 +24,7 @@ import asyncpg
 from . import context, prompts
 from .llm import LLM, Completion, sole_json
 from .reactions import acknowledgement, eligible
-from .triggers import BotIdentity, Invocation, keyword_pattern, name_forms, speaks_to
+from .triggers import BotIdentity, Invocation, keyword_pattern, name_regex, speaks_to
 
 log = logging.getLogger("nestor.addressing")
 
@@ -37,8 +37,10 @@ class AddressConfig:
     timeout_s: float = 20          # a check that takes longer is a no
 
 
-# «а почему?», «и что дальше»: going on with the conversation. «а, круто», «а, точно»: a reaction to it.
-_GOES_ON = re.compile(r"^\s*(?:а|и)(?!\w)(?!\s*,)", re.IGNORECASE)
+# «а почему», «и что дальше», «ну как так»: going on with the conversation, a question without its «?».
+# «а круто», «а, точно», «а вот оно что»: a reaction to it, which asks nothing.
+_GOES_ON = re.compile(r"^\s*(?:(?:а|и|ну)(?!\w)[\s,]*)+(?:почему|зачем|откуда|куда|как\w{0,3}|что|чего|чем|где|"
+                      r"когда|кто|кого|кому|сколько|разве|неужели|если)(?!\w)", re.IGNORECASE)
 
 
 def _keywords(me: BotIdentity, generic_keyword_enabled: bool) -> tuple[str, ...]:
@@ -77,7 +79,7 @@ def candidate(msg: dict, me: BotIdentity, *, generic_keyword_enabled: bool = Tru
     if not eligible(msg):
         return None
     keywords = _keywords(me, generic_keyword_enabled)
-    names = re.compile(rf"(?<!\w)(?:{name_forms(keywords)})(?!\w)", re.IGNORECASE) if keywords else None
+    names = re.compile(name_regex(keywords), re.IGNORECASE) if keywords else None
     found = list(names.finditer(text)) if names else []
     if keywords and keyword_pattern(keywords).match(text):      # «нестор вчера тупил»: maybe about it
         return Invocation("address", strip_name(text, names))
@@ -85,7 +87,7 @@ def candidate(msg: dict, me: BotIdentity, *, generic_keyword_enabled: bool = Tru
         return None
     if found and (speaks_to(text) or any(_set_off(text, m.start(), m.end()) for m in found)):
         return Invocation("address", strip_name(text, names))
-    # «а, понятно», «и тебе спасибо» right after an answer: a thanks, not a request. «а, круто» asks nothing.
+    # «а понятно», «и тебе спасибо», «а понял спасибо» right after an answer: a thanks, not a request.
     if window and (speaks_to(text) or _GOES_ON.match(text)) and acknowledgement(text) is None:
         return Invocation("address", strip_name(text, names) if names else text.strip())
     return None
@@ -100,31 +102,42 @@ def strip_name(text: str, names: re.Pattern) -> str:
     return text.strip()
 
 
-# The bot's posts that are not a conversation, shown by their kind and never word for word: they
-# name people («📊 Активность за 7 дней: 1. Петя Петров (@petya)…») and are long.
+# The bot's answers and posts are shown by their kind, never word for word: the archive model writes them, and
+# it names whomever it quotes («Прав Петя Петров (@petya): «…»», «📊 Активность за 7 дней: 1. Петя Петров
+# (@petya)…»); the posts are long too. Only its remarks (scenario chime), written from the labels, and its
+# fixed texts (/help) are shown as they are.
 POSTS = {"stats": "статистика", "summary": "пересказ", "catchup": "что пропустил", "digest": "дайджест",
          "wisdom": "мудрость дня", "news": "новости"}
+ANSWER = "ответ"        # any other answer
+SHOWN = 300             # characters of a message the models read; a longer one is cut, and says so
+CUT = " …[обрезано]"
 
 
 async def bot_posts(conn, rows, bot_id: int) -> dict[tuple[int, int], str]:
-    """Which of the bot's messages among the rows are such posts: (chat_id, message_id) -> scenario."""
+    """Which of the bot's messages among the rows are its answers and posts: (chat_id, message_id) -> the
+    scenario of its request, or the kind of a daily post (the news, the same for every group, has no
+    request of the group's own)."""
     ours = [r for r in rows if r["user_id"] == bot_id]
     if not ours:
         return {}
     found = await conn.fetch(
         """SELECT b.chat_id, a.id, b.scenario FROM bot_requests b CROSS JOIN unnest(b.answer_msg_ids) AS a(id)
-           WHERE b.answer_msg_ids && $3::bigint[] AND b.scenario = ANY($1::text[]) AND b.chat_id = ANY($2::bigint[])
-             AND a.id = ANY($3::bigint[])""",
-        list(POSTS), list({r["chat_id"] for r in ours}), [r["message_id"] for r in ours])
+           WHERE b.answer_msg_ids && $2::bigint[] AND b.scenario <> 'chime' AND b.chat_id = ANY($1::bigint[])
+             AND a.id = ANY($2::bigint[])
+           UNION ALL
+           SELECT chat_id, message_id, kind FROM daily_posts
+           WHERE chat_id = ANY($1::bigint[]) AND message_id = ANY($2::bigint[])""",
+        list({r["chat_id"] for r in ours}), [r["message_id"] for r in ours])
     return {(f["chat_id"], f["id"]): f["scenario"] for f in found}
 
 
 def render(rows, bot_id: int, *, posts: dict[tuple[int, int], str] | None = None, whole_last: bool = False) -> str:
     """The messages, numbered, oldest first, a label instead of each author: «Участник 1», ..., and
-    «Нестор» for the bot. A reply to one of them says which. Each is cut to 300 characters; whole_last:
-    the last one, the message asked about, is shown whole (an address often ends a long message).
-    posts: the bot's posts among them (bot_posts), shown by their kind only. Messages of a forum's
-    several topics say which one each is in, «[тема 1]», ..., and «[общая тема]» for General."""
+    «Нестор» for the bot. A reply to one of them says which. Each is cut to SHOWN characters, with
+    «…[обрезано]» after it; whole_last: the last one, the message asked about, is shown whole (an address
+    often ends a long message). posts: the bot's answers and posts among them (bot_posts), shown by their
+    kind only. Messages of a forum's several topics say which one each is in, «[тема 1]», ..., and
+    «[общая тема]» for General."""
     labels: dict[int | None, str] = {}
     numbers = {(r["chat_id"], r["message_id"]): i for i, r in enumerate(rows, 1)}
     topics = [_row_topic(r) for r in rows]
@@ -136,8 +149,10 @@ def render(rows, bot_id: int, *, posts: dict[tuple[int, int], str] | None = None
         target = numbers.get((r["chat_id"], r["reply_to_id"]))
         reply = f" (ответ на {target})" if target else ""
         post = (posts or {}).get((r["chat_id"], r["message_id"])) if r["user_id"] == bot_id else None
-        text = f"[{POSTS[post]}]" if post else r["text"] or f"[{r['kind']}]"
-        text = (text if whole_last and i == len(rows) else text[:300]).replace("\n", " ⏎ ")
+        text = f"[{POSTS.get(post, ANSWER)}]" if post else r["text"] or f"[{r['kind']}]"
+        if len(text) > SHOWN and not (whole_last and i == len(rows)):
+            text = text[:SHOWN] + CUT
+        text = text.replace("\n", " ⏎ ")
         lines.append(f"{i}. {topic}{who}{reply}: {text}")
     return "\n".join(lines)
 
@@ -148,8 +163,8 @@ def _row_topic(row) -> int | None:
 
 
 def parse(answer: str | None) -> bool:
-    """{"to_bot": true} -> True; anything else, a «да» in words or an answer with two objects (one may be
-    quoted from the chat) included, is a no."""
+    """{"to_bot": true}, alone, -> True; anything else is a no: a «да» in words, words around the object, or
+    two objects (an object in the answer may be quoted from the chat)."""
     data = sole_json(answer)
     return isinstance(data, dict) and data.get("to_bot") is True
 

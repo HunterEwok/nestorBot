@@ -1622,15 +1622,23 @@ class Answerer:
                 if await self._chime_wanted(conn, chat_id, local.date()):
                     found = await context.messages_by_id(conn, chat_id, [chosen["message_id"]])
                     at = now + timedelta(seconds=time.monotonic() - started)
+                    # The model read the message as it was then, and only its first SHOWN characters: a long one
+                    # may end on what it never saw (bad news after a funny start), an edited one say something else.
                     if found and chime.targetable(found[0], bot_id=self.me.user_id, previous=previous, now=at,
                                                   max_age=timedelta(minutes=cfg.every_min)) \
+                            and found[0]["text"] == chosen["text"] and len(chosen["text"] or "") <= addressing.SHOWN \
                             and not await self._to_the_bot(conn, chat_id, found[0]):
                         target = found[0]
-                        # A remark on a dispute may repeat the claim the target answers: that message counts too,
-                        # as the model was shown it, also when it is gone since (its author's /forget_me meanwhile).
+                        # A remark may repeat any message the model was shown: the claim the target answers, or one
+                        # of a dispute that never used Telegram's replies. They all count, also when they are gone
+                        # since (their author's /forget_me meanwhile). The claim is read back if it was not shown.
                         claim = target["reply_to_id"]
-                        claimed = await context.messages_by_id(conn, chat_id, [claim]) if claim is not None else []
-                        sources = [target, *(claimed or [r for r in rows if r["message_id"] == claim])]
+                        claimed = await context.messages_by_id(conn, chat_id, [claim]) \
+                            if claim is not None and claim not in {r["message_id"] for r in rows} else []
+                        again = {r["message_id"]: r for r in await context.messages_by_id(
+                            conn, chat_id, [r["message_id"] for r in rows])}     # with forwarded_from
+                        sources = [target, *claimed, *(again.get(r["message_id"], r) for r in rows
+                                                       if r["user_id"] != self.me.user_id)]
         if target is None:      # the model's silence, or a remark the code refused: no text is kept
             async with self.pool.acquire() as conn:
                 await self._log_scheduled(conn, chat_id, "chime_check", completion, [], started, keep_text=False)
@@ -1643,9 +1651,9 @@ class Answerer:
                 await self._log_scheduled(conn, chat_id, "chime_check", completion, [], started, status="error",
                                           keep_text=False)
             return "failed"
-        # Logged as an answer to the target's author, and to the author of the message it replies to: /forget_me
-        # and the purge take it with either message. The target's author comes first: the next remark is to
-        # someone else (previous).
+        # Logged as an answer to the target's author and to everyone whose words the model was shown: /forget_me
+        # and the purge take it with any of their messages. The target's author comes first: the next remark is
+        # to someone else (previous).
         quoted = list(dict.fromkeys(u for r in sources for u in (r["user_id"], r.get("forwarded_from"))
                                     if u not in (None, self.me.user_id)))
         async with self.pool.acquire() as conn, conn.transaction():
@@ -1658,11 +1666,12 @@ class Answerer:
 
     async def _to_the_bot(self, conn, chat_id: int, row) -> bool:
         """A request to the bot, still being checked, queued or answered, or answered or refused already;
-        a reply to the bot; a message that names it. The bot answers those itself, or leaves talk about it
+        a command (/help, /chime on: answered without a request of its own, or meant for another bot); a
+        reply to the bot; a message that names it. The bot answers those itself, or leaves talk about it
         alone: a remark on one would be a second reply, or an answer after all."""
         mid = row["message_id"]
         if (chat_id, mid) in self._asked or self.addresser.asking(chat_id, mid) \
-                or chime.names_bot(row["text"], self.me):
+                or (row["text"] or "").lstrip().startswith("/") or chime.names_bot(row["text"], self.me):
             return True
         return await conn.fetchval(
             "SELECT EXISTS (SELECT 1 FROM bot_requests WHERE chat_id = $1 AND trigger_msg_id = $2) "

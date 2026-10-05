@@ -62,17 +62,19 @@ def speaks_to(text: str) -> bool:
     return "?" in text or _SPEAKS_TO.search(text) is not None
 
 
-# «помолчи», «замолчи уже», «хватит», «не встревай»: the whole request asks the bot to keep quiet
-# (nestor.bot.chime).
-_QUIET = re.compile(r"(?:ну\s+|да\s+|вс[её]\s+)?(?:помолчи|замолчи|хватит|не\s+встревай)"
-                    r"(?:\s+(?:пожалуйста|пж|плиз|уже|сегодня|пока|а))*")
+# «помолчи», «замолчи уже», «хватит», «не встревай», «пожалуйста, помолчи», «помолчи, а?», «да помолчи ты»:
+# the whole request asks the bot to keep quiet (nestor.bot.chime).
+_QUIET = re.compile(r"(?:(?:ну|да|вс[её]|ладно|давай|пожалуйста|пж|плиз|плз)\s+)*"
+                    r"(помолчи|замолчи|хватит|не\s+встревай)"
+                    r"((?:\s+(?:пожалуйста|пж|плиз|плз|уже|сегодня|пока|а|ты|немного|чуть\s+чуть|чуточку|"
+                    r"до\s+завтра|ладно|давай))*)")
 
 
 def quiet(text: str) -> bool:
-    """Whether the text, the bot's name taken out, asks it to keep quiet. «хватит?» is a question."""
-    if "?" in text:
-        return False
-    return _QUIET.fullmatch(" ".join(re.sub(r"[^\w\s]", " ", text.lower()).split())) is not None
+    """Whether the text, the bot's name taken out, asks it to keep quiet. «хватит?» alone is a question
+    («is it enough?»); «помолчи, а?» and «хватит уже, а?» are not."""
+    m = _QUIET.fullmatch(" ".join(re.sub(r"[^\w\s]", " ", text.lower()).split()))
+    return m is not None and not (m.group(1) == "хватит" and not m.group(2) and "?" in text)
 
 
 def name_forms(keywords: tuple[str, ...]) -> str:
@@ -85,6 +87,12 @@ def name_forms(keywords: tuple[str, ...]) -> str:
             word += r"(?:а|у|ом|е|ушк(?:а|и|е|у|ой|о)|чик(?:а|у|ом|е)?)?"
         forms.append(word)
     return "|".join(forms)
+
+
+def name_regex(keywords: tuple[str, ...]) -> str:
+    """A regex of the bot's names (name_forms) as whole words: not the end of «чат-бот» or «телеграм-бота»,
+    nor the start of «Нестор-летописец»; «нестор-то», «бот-ка» are the name and a particle."""
+    return rf"(?<![\w-])(?:{name_forms(keywords)})(?!\w)(?!-(?!(?:то|ка|таки)(?!\w))\w)"
 
 
 def detect(msg: dict, me: BotIdentity, *, generic_keyword_enabled: bool = True,

@@ -18,7 +18,7 @@ from datetime import time as dtime
 
 from .. import forget
 from .llm import sole_json
-from .triggers import BotIdentity, name_forms, quiet
+from .triggers import BotIdentity, name_regex, quiet
 
 MAX_CHARS = 300         # a remark is one or two sentences
 MIN_CUT = 20            # an overlong remark cut shorter than this is not worth saying
@@ -42,13 +42,13 @@ def in_hours(at: dtime, hours: tuple[dtime, dtime]) -> bool:
 def asks_quiet(text: str | None, me: BotIdentity) -> bool:
     """Whether a request to the bot asks it to keep quiet («нестор, помолчи», «замолчи уже», «хватит»,
     «не встревай», with or without the name): then no remarks until the end of the day."""
-    return quiet(re.sub(rf"(?<!\w)(?:{name_forms(me.keywords)})(?!\w)", " ", (text or "").lower()))
+    return quiet(re.sub(name_regex(me.keywords), " ", (text or "").lower()))
 
 
 def names_bot(text: str | None, me: BotIdentity) -> bool:
     """Whether a message names the bot anywhere, in any case form or by its @username: a call, which
     gets an answer anyway, or talk about it, which the bot leaves alone. A remark answers neither."""
-    return re.search(rf"(?<!\w)(?:{name_forms(me.keywords)}|@{re.escape(me.username)})(?!\w)", text or "",
+    return re.search(rf"{name_regex(me.keywords)}|(?<!\w)@{re.escape(me.username)}(?!\w)", text or "",
                      re.IGNORECASE) is not None
 
 
@@ -73,8 +73,19 @@ class Pick:
 
 
 # What the model reads besides the words (nestor.bot.addressing.render) means nothing in the chat: the
-# labels instead of names, «Участник 2» or «участница 3», the numbers of the messages and «(ответ на 3)».
-_LABEL = re.compile(r"участни[кц]\w*\s*№?\s*\d|сообщени\w*\s*№?\s*\d|№\s*\d|\(\s*ответ\s+на\s+\d", re.IGNORECASE)
+# labels instead of names («Участник 2», «участнику-3», «третий участник», «участник три»), the numbers of
+# the messages («сообщение 3», «в сообщении номер 3», «в 3-м сообщении», «#3», «№3», «(ответ на 3)») and of
+# the topics («[тема 2]», «в теме 2», «в общей теме»). Years and amounts («в 1943-м», «первый синтез») pass.
+_ORDINAL = (r"(?:перв|втор|трет|четв[её]рт|пят|шест|седьм|восьм|девят|десят)"
+            r"(?:ый|ой|ий|ая|ое|ого|ому|ым|ом|ую|ей|ья|ье|ьего|ьему|ьим|ьем|ью|ьей)")
+_NUMBER = r"(?:один|одна|два|две|три|четыре|пять|шесть|семь|восемь|девять|десять)(?!\w)"
+_LABEL = re.compile(
+    r"участни[кц]\w*\W{0,3}(?:номер\s*|№\s*)?(?:\d|" + _NUMBER + r")|"
+    r"сообщени\w*\W{0,3}(?:номер\s*|№\s*|#\s*)?\d|\d+\s*-?\s*(?:[а-яё]{1,3}\s+)?сообщени|"
+    r"(?<!\w)" + _ORDINAL + r"\s+(?:участни[кц]|сообщени)|"
+    r"№\s*\d|(?<![\w&#])#\s*\d|\(\s*ответ\s+на\s+\d|"
+    r"(?<!\w)тем[аеуыо]й?\W{0,3}(?:номер\s*|№\s*)?\d|\[\s*(?:тема|общая\s+тема)|(?<!\w)в\s+общей\s+теме",
+    re.IGNORECASE)
 # «Нестор: …» or «Нестор (ответ на 3): …», as the model reads its own.
 _SIGNED = re.compile(r"^\s*нестор\s*(?:\(\s*ответ\s+на\s+\d+\s*\)\s*)?(?::|—|–|-(?!\w))\s*", re.IGNORECASE)
 
@@ -82,8 +93,8 @@ _SIGNED = re.compile(r"^\s*нестор\s*(?:\(\s*ответ\s+на\s+\d+\s*\)\s
 def parse(answer: str | None, count: int) -> Pick | None:
     """{"reply_to": N, "text": "…"} -> Pick. {"reply_to": null}, a number that was not shown, an empty
     text, one too long to cut, a link, a label («Участник 2 прав») or a message's number, an answer
-    with two objects (one may be quoted from the chat), anything else: None, the bot stays silent.
-    A «Нестор:» before the text is dropped."""
+    with words around its object or with two objects (an object in it may be quoted from the chat),
+    anything else: None, the bot stays silent. A «Нестор:» before the text is dropped."""
     data = sole_json(answer)
     if not isinstance(data, dict):
         return None
