@@ -582,12 +582,15 @@ async def test_scheduler_keeps_going_after_a_failing_step():
         async def run_daily_posts(self):
             calls.append("daily")
 
+        async def run_chimes(self):
+            calls.append("chimes")
+
     task = asyncio.create_task(Scheduler(Answerer(), tick_s=0.01).run())
     await asyncio.sleep(0.05)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert calls.count("daily") >= 2 and calls.count("reminders") >= 2
+    assert calls.count("daily") >= 2 and calls.count("reminders") >= 2 and calls.count("chimes") >= 2
 
 
 async def test_follow_ups_to_a_verdict_or_a_song_go_with_the_quoted_author(make_env, conn):

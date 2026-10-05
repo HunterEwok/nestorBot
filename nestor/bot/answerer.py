@@ -2,11 +2,12 @@
 time (FR-14), conversation continuation (FR-15), scenarios SC-1..SC-6, audit log.
 
 Besides answers, the bot speaks on its own only when someone asked for it: reminders,
-the group digest and the wisdom of the day (started by nestor.bot.scheduler), and the
-/export file in a private chat. Scheduled posts wait in a queue of their own, so they never
-hold up a group's answers. Where an admin turned on /address, a message that may be addressed
-to the bot without its name is checked first (nestor.bot.addressing) and, on a yes, answered
-like any other request.
+the group digest and the wisdom of the day (started by nestor.bot.scheduler), the /export
+file in a private chat, and where an admin turned on /chime, a rare remark of its own
+(nestor.bot.chime). Scheduled posts wait in a queue of their own, so they never hold up a
+group's answers. Where an admin turned on /address, a message that may be addressed to the
+bot without its name is checked first (nestor.bot.addressing) and, on a yes, answered like
+any other request.
 """
 from __future__ import annotations
 
@@ -19,7 +20,7 @@ import logging
 import re
 import secrets
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time as dtime, timedelta, timezone
 from typing import Awaitable, Callable, Collection
 from zoneinfo import ZoneInfo
@@ -34,7 +35,7 @@ from aiogram.types import (BufferedInputFile, InlineKeyboardMarkup, LinkPreviewO
 from .. import forget, promises
 from ..collector.app import dump
 from ..watchdog.alerts import fmt_since, render_status
-from . import addressing, context, daily, export, markup, music, prompts, reactions, reminders, routing
+from . import addressing, chime, context, daily, export, markup, music, prompts, reactions, reminders, routing
 from .llm import LLM, Completion
 from .markup import TELEGRAM_LIMIT, split_text
 from .triggers import BotIdentity, Invocation, detect
@@ -105,6 +106,7 @@ class AnswerConfig:
     reaction_chat_ids: frozenset[int] = frozenset()  # reactions on by default; /reactions on|off overrides
     reactions: reactions.ReactionConfig = reactions.ReactionConfig()
     address: addressing.AddressConfig = field(default_factory=addressing.AddressConfig)   # /address, off by default
+    chime: chime.ChimeConfig = field(default_factory=chime.ChimeConfig)     # /chime, off by default
     alert_chat_id: int | None = None    # ALERT_CHAT_ID: /status answers there only, to its admins; None: nowhere
 
 
@@ -186,6 +188,7 @@ class Answerer:
         self._posting: set[tuple[int, str]] = set()     # (chat_id, kind) of the posts queued or running
         self._digest_parts: dict[int, _DigestParts] = {}    # by chat_id: a digest not posted yet
         self._forgotten: dict[int, int] = {}   # user_id -> when their last /forget_me came, as Job.order
+        self._looked: dict[int, datetime | None] = {}   # chat_id -> its last look for a remark (run_chimes)
 
     # ---- entry points, called by the collector ----
 
@@ -215,6 +218,9 @@ class Answerer:
     async def _invoke(self, msg: dict, inv: Invocation, order: int) -> None:
         """A request to the bot: queued as a Job, or a reaction for a bare «спасибо». order: when the
         message came (Job.order)."""
+        if chime.asks_quiet(inv.text, self.me):    # «нестор, помолчи»: no remarks today, no model needed
+            await self._quiet(msg)
+            return
         if await self._acknowledged(msg, inv):    # «спасибо», «ок»: a reaction says it, no model needed
             return
         think, question = routing.split_think(inv.text)
@@ -278,9 +284,13 @@ class Answerer:
         if cmd in ("help", "start"):
             await self._say(msg, prompts.HELP.format(username=self.me.username))
         elif cmd == "privacy":
+            hours = self.cfg.chime.hours
             await self._say(msg, prompts.PRIVACY.format(retention=promises.RETENTION_MONTHS,
                                                         backup_weeks=promises.BACKUP_WEEKS,
-                                                        address_context=self.cfg.address.context))
+                                                        address_context=self.cfg.address.context,
+                                                        chime_from=hours[0].strftime("%H:%M"),
+                                                        chime_to=hours[1].strftime("%H:%M"),
+                                                        chime_window=self.cfg.chime.window))
         elif cmd in ("forget_me", "export") and _shared_sender(msg):
             await self._say(msg, prompts.PERSONAL_ONLY, save=False)
         elif cmd == "forget_me":
@@ -302,14 +312,14 @@ class Answerer:
             await self._unremind(msg, inv.args)
         elif cmd == "status":
             await self._status(msg)
-        elif cmd in ("pause", "resume", "bot_word", "digest", "wisdom", "news", "reactions", "address"):
+        elif cmd in ("pause", "resume", "bot_word", "digest", "wisdom", "news", "reactions", "address", "chime"):
             if not await self._is_admin(msg):
                 await self._say(msg, prompts.ADMINS_ONLY)
                 return
             if cmd == "news" and inv.args.strip().lower() in ("status", "статус"):
                 await self._say(msg, await self._news_status())
                 return
-            if cmd in ("digest", "wisdom", "news", "reactions", "address"):
+            if cmd in ("digest", "wisdom", "news", "reactions", "address", "chime"):
                 await self._toggle(msg, cmd, inv.args)
                 return
             async with self.pool.acquire() as conn:
@@ -345,7 +355,7 @@ class Answerer:
         await self._say(msg, text, save=False)
 
     async def _toggle(self, msg: dict, key: str, args: str) -> None:
-        """/digest, /wisdom, /news, /reactions, /address on|off; without an argument shows the current state.
+        """/digest, /wisdom, /news, /reactions, /address, /chime on|off; without an argument shows the current state.
         /digest N also sets the group's digest period, in days, and switches the digest on."""
         chat_id, arg = msg["chat"]["id"], args.strip().lower()
         change = {key: arg not in _OFF} if arg else {}
@@ -374,6 +384,11 @@ class Answerer:
                                                   per_hour=self.cfg.reactions.per_hour)
         elif key == "address":      # /address on is also the announcement to the group
             text = prompts.ADDRESS_ON if self._address_on(settings) else prompts.ADDRESS_OFF
+        elif key == "chime":        # and so is /chime on
+            per_day, hours = self.cfg.chime.daily, self.cfg.chime.hours
+            text = (prompts.CHIME_ON.format(daily=per_day, times=context.plural(per_day, ("раза", "раз", "раз")),
+                                            start=hours[0].strftime("%H:%M"), end=hours[1].strftime("%H:%M"))
+                    if self._chime_on(settings) else prompts.CHIME_OFF)
         else:
             on = self._wisdom_on(chat_id, settings)
             text = prompts.WISDOM_STATE.format(state="включена" if on else "выключена",
@@ -401,6 +416,11 @@ class Answerer:
     def _address_on(settings: dict) -> bool:
         """/address on: off by default in every group."""
         return bool((settings or {}).get("address", False))
+
+    @staticmethod
+    def _chime_on(settings: dict) -> bool:
+        """/chime on: off by default in every group."""
+        return bool((settings or {}).get("chime", False))
 
     def _post_on(self, chat_id: int, kind: str, settings: dict) -> bool:
         """Whether the group has this scheduled post on."""
@@ -1166,7 +1186,8 @@ class Answerer:
         history: list[dict] = []
         depth = 0
         while parent and depth < 3:
-            history[:0] = [{"role": "user", "content": parent["question"] or "(вопрос удалён)"},
+            asked = prompts.CHIME_TURN if parent["scenario"] == "chime" else "(вопрос удалён)"    # nobody asked a remark
+            history[:0] = [{"role": "user", "content": parent["question"] or asked},
                            {"role": "assistant", "content": parent["answer"] or "(ответ удалён)"}]
             job.quoted |= set(parent["quoted_user_ids"] or [])     # a follow-up may repeat the quotes
             job.saw(at=parent["oldest_source_at"])
@@ -1475,6 +1496,134 @@ class Answerer:
                 line += f" — {prompts.NEWS_STATUS_STALE}"
             lines.append(line)
         return "\n".join(lines[:1] + [html.escape(line) for line in lines[1:]])
+
+    # ---- the bot's own remarks (nestor.bot.chime) ----
+
+    async def run_chimes(self, now: datetime | None = None) -> None:
+        """Called by the scheduler every tick: within CHIME_HOURS, once an hour per group with /chime on,
+        queue a look at its last hour (_chime). A look that finds the chat quiet counts as well."""
+        now = now or datetime.now(UTC)
+        cfg = self.cfg.chime
+        if not chime.in_hours(now.astimezone(self.cfg.tz).time(), cfg.hours):
+            return
+        async with self.pool.acquire() as conn:
+            chats = await conn.fetch(
+                "SELECT chat_id, settings FROM chats WHERE enabled AND migrated_to_chat_id IS NULL "
+                "AND chat_id = ANY($1::bigint[])", list(self.cfg.allowed_chat_ids))
+            for chat in chats:
+                chat_id = chat["chat_id"]
+                if not self._chime_on(chat["settings"] or {}) or (chat_id, "chime") in self._posting:
+                    continue
+                if chat_id not in self._looked:     # since the start: the last look the log knows of
+                    self._looked[chat_id] = await conn.fetchval(
+                        "SELECT max(created_at) FROM bot_requests WHERE chat_id = $1 "
+                        "AND scenario IN ('chime', 'chime_check')", chat_id)
+                last = self._looked[chat_id]
+                if last is not None and now - last < timedelta(minutes=cfg.every_min):
+                    continue
+                self._looked[chat_id] = now
+                self._posting.add((chat_id, "chime"))
+                self._enqueue(_posts(chat_id), functools.partial(self._chime, chat_id, now))
+
+    async def _chime(self, chat_id: int, now: datetime) -> None:
+        """A queued look (run_chimes); a failure is logged and waits for the next hour."""
+        status = "failed"
+        try:
+            status = await self._remark(chat_id, now)
+        except Exception as e:  # noqa: BLE001 - a remark is never worth a crash
+            log.warning("remark failed", extra={"chat_id": chat_id, "error": type(e).__name__})
+        finally:
+            self._posting.discard((chat_id, "chime"))
+        log.info("remark", extra={"chat_id": chat_id, "status": status})
+
+    async def _remark(self, chat_id: int, now: datetime) -> str:
+        """A look at the group's last hour, as of `now`: a remark in reply to one person's message, or
+        silence, which is what the model chooses most hours. Everything is checked here, when the look
+        starts: /pause, /chime off or «нестор, помолчи» since it was queued stop it. Returns what came
+        of it, for the log."""
+        cfg, tz = self.cfg.chime, self.cfg.tz
+        llm = self.router.llm("chime")
+        if llm is None:     # no profile without tools: no remarks, never another profile
+            return "no_profile"
+        local, hour = now.astimezone(tz), now - timedelta(minutes=cfg.every_min)
+        async with self.pool.acquire() as conn:
+            if not await self._chime_wanted(conn, chat_id, local.date()):
+                return "off"
+            if await self._tokens_today(conn) >= self.cfg.daily_token_limit // 2:     # answers come first
+                return "no_tokens"
+            made = await conn.fetchrow(
+                "SELECT count(*) FILTER (WHERE created_at >= $2) AS today, max(created_at) AS last "
+                "FROM bot_requests WHERE chat_id = $1 AND scenario = 'chime' AND status = 'ok'",
+                chat_id, local.replace(hour=0, minute=0, second=0, microsecond=0))
+            if made["today"] >= cfg.daily or (made["last"] is not None and made["last"] > hour):
+                return "enough"
+            # This chat only: a message of the basic group it moved from cannot be answered here.
+            if await context.count_since(conn, [chat_id], None, hour, except_user=self.me.user_id) < cfg.min_messages:
+                return "quiet_chat"
+            rows = await context.period_messages(conn, [chat_id], None, hour, limit=cfg.window)
+            previous = await conn.fetchval(       # whom the last remark answered: not the same person twice
+                "SELECT quoted_user_ids FROM bot_requests WHERE chat_id = $1 AND scenario = 'chime' AND status = 'ok' "
+                "ORDER BY created_at DESC LIMIT 1", chat_id)
+        if not await self._bot_is_member(chat_id):
+            return "not_member"
+        started = time.monotonic()
+        prompt = [{"role": "system", "content": prompts.CHIME_SYSTEM},
+                  {"role": "user", "content": prompts.CHIME_USER.format(
+                      messages=addressing.render(rows, self.me.user_id), n=len(rows))}]
+        try:
+            completion = await asyncio.wait_for(llm.complete(prompt), cfg.timeout_s)
+        except Exception as e:  # noqa: BLE001 - Hermes down or slow: silence
+            log.warning("remark model failed", extra={"chat_id": chat_id, "error": type(e).__name__})
+            async with self.pool.acquire() as conn:
+                await self._log_scheduled(conn, chat_id, "chime_check", Completion("", None, None, None), [], started,
+                                          status="timeout" if isinstance(e, asyncio.TimeoutError) else "error",
+                                          keep_text=False)
+            return "error"
+        pick, target = chime.parse(completion.text, len(rows)), None
+        if pick is not None:
+            chosen = rows[pick.n - 1]
+            async with self.pool.acquire() as conn:
+                # The model may take a while: a /pause, /chime off, «помолчи», a deletion or the author's
+                # /forget_me meanwhile still counts.
+                if await self._chime_wanted(conn, chat_id, local.date()):
+                    found = await context.messages_by_id(conn, chat_id, [chosen["message_id"]])
+                    at = now + timedelta(seconds=time.monotonic() - started)
+                    if found and chime.targetable(found[0], bot_id=self.me.user_id, previous=previous, now=at,
+                                                  max_age=timedelta(minutes=cfg.every_min)):
+                        target = found[0]
+        if target is None:      # the model's silence, or a remark the code refused: no text is kept
+            async with self.pool.acquire() as conn:
+                await self._log_scheduled(conn, chat_id, "chime_check", completion, [], started, keep_text=False)
+            return "silent"
+        sent = await self._send(chat_id, pick.text, reply_to=target["message_id"])
+        # Logged as an answer to the target's author: /forget_me and the purge take it with their message.
+        quoted = sorted({target["user_id"], target["forwarded_from"]} - {None})
+        async with self.pool.acquire() as conn, conn.transaction():
+            await forget.erase_lock(conn)       # it may erase: the lock comes before the insert's row locks
+            rid = await self._log_scheduled(conn, chat_id, "chime", replace(completion, text=pick.text), [sent],
+                                            started, status="ok" if sent else "error", quoted_user_ids=quoted,
+                                            oldest_source_at=target["stored_at"])
+            await self._scrub_if_opted_out(conn, rid, quoted)
+        return "posted" if sent else "failed"
+
+    async def _chime_wanted(self, conn, chat_id: int, day: date) -> bool:
+        """/chime on, not paused, not moved to a supergroup, and nobody said «нестор, помолчи» on this day."""
+        row = await conn.fetchrow("SELECT enabled, migrated_to_chat_id, settings FROM chats WHERE chat_id = $1",
+                                  chat_id)
+        settings = (row["settings"] or {}) if row is not None else {}
+        return (row is not None and row["enabled"] and row["migrated_to_chat_id"] is None
+                and self._chime_on(settings) and settings.get("chime_quiet") != day.isoformat())
+
+    async def _quiet(self, msg: dict) -> None:
+        """«нестор, помолчи»: no remarks in this group until the end of the local day; the answers go on.
+        A 👌 says it, or one line where the chat takes no such reaction."""
+        chat_id = msg["chat"]["id"]
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE chats SET settings = settings || jsonb_build_object('chime_quiet', $2::text) WHERE chat_id = $1",
+                chat_id, datetime.now(self.cfg.tz).date().isoformat())
+        if "👌" not in await self.reactor.allowed(chat_id) or not await self._put_reaction(msg, "👌"):
+            await self._say(msg, prompts.CHIME_QUIET)
 
     async def _log_scheduled(self, conn, chat_id: int, scenario: str, completion: Completion,
                              sent: list[Message | None], started: float, status: str = "ok",

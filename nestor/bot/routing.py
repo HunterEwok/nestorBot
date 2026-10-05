@@ -6,8 +6,8 @@ A profile is fixed by what it can reach and by its model (set in its config.yaml
 - web:   internet search, no archive, a cheap model;
 - smart: internet search, no archive, a bigger model; optional;
 - news:  no tools at all, a cheap model, for sorting public news items, for picking
-         reactions to chat messages and for telling whether a message is addressed to the
-         bot (nothing to search with, nothing to read); optional.
+         reactions to chat messages, for telling whether a message is addressed to the bot
+         and for the bot's own rare remarks (nothing to search with, nothing to read); optional.
 
 Tasks that read the archive may only go to group/deep, tasks that search the internet only
 to web/smart: that split is what keeps chat text out of search queries, so a route that
@@ -24,7 +24,7 @@ from .llm import LLM
 ARCHIVE = ("group", "deep")
 WEB = ("web", "smart")
 PUBLIC = ("news", "web", "smart")   # public news items only: any profile without the archive
-NO_WEB = ("news", "group")          # chat text without the internet: reactions, address checks
+NO_WEB = ("news", "group")          # chat text without the internet: reactions, address checks, remarks
 BIG = frozenset({"deep", "smart"})
 
 # task -> (profiles it may use, default profile)
@@ -44,9 +44,10 @@ TASKS: dict[str, tuple[tuple[str, ...], str]] = {
     "news": (PUBLIC, "smart"),           # the evening news digest
     "react": (NO_WEB, "news"),           # reactions to emotional messages; no `news` profile: the code decides
     "address": (NO_WEB, "news"),         # is a doubtful message addressed to the bot; no `news` profile: not asked
+    "chime": (NO_WEB, "news"),           # the bot's own remarks (/chime on); no `news` profile: none
 }
 # Tasks the code can do without (or decide itself): they never move to another profile.
-NO_FALLBACK = frozenset({"react", "address"})
+NO_FALLBACK = frozenset({"react", "address", "chime"})
 FALLBACK = {"deep": ("group",), "smart": ("web",), "news": ("web", "smart"), "group": (), "web": ()}
 
 
@@ -73,8 +74,9 @@ class Router:
 
     def profile(self, task: str) -> str | None:
         """The configured profile for a task, or its fallback; None if none of them is set up.
-        Reactions and address checks never fall back: without their profile the code picks
-        reactions for free, and a message that is not clearly addressed to the bot stays unanswered."""
+        Reactions, address checks and remarks never fall back: without their profile the code picks
+        reactions for free, a message that is not clearly addressed to the bot stays unanswered, and
+        the bot makes no remarks."""
         allowed, default = TASKS[task]
         wanted = self.routes.get(task, default)
         for name in (wanted, *(FALLBACK.get(wanted, ()) if task not in NO_FALLBACK else ())):

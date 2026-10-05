@@ -57,6 +57,13 @@ class Settings:
     address_window_min: int = 5
     address_context: int = 4
     address_daily_checks: int = 150
+    # The bot's own remarks (/chime on, nestor.bot.chime): once an hour within these local hours, when people
+    # wrote at least this many messages in the last hour, the model reads this many of them; at most this
+    # many remarks per group per day.
+    chime_hours: tuple[time, time] = (time(10), time(23))
+    chime_min_messages: int = 10
+    chime_window: int = 40
+    chime_daily: int = 3
     bot_keywords: tuple[str, ...] = ("нестор", "бот")
     rate_limit: int = 5
     rate_window_min: int = 10
@@ -133,6 +140,18 @@ def _parse_quiet(name: str, default: str) -> tuple[time, time] | None:
         raise SystemExit(f"{name} must look like 23:00-08:00 or off, got {value!r}") from None
     if start == end:
         raise SystemExit(f"{name} must look like 23:00-08:00 or off, got {value!r}")
+    return start, end
+
+
+def _parse_hours(name: str, default: str) -> tuple[time, time]:
+    """HH:MM-HH:MM within one day: from the first, before the second."""
+    value = _env(name, default)
+    try:
+        start, end = (time.fromisoformat(part.strip()) for part in value.split("-"))
+    except ValueError:
+        raise SystemExit(f"{name} must look like 10:00-23:00, got {value!r}") from None
+    if start >= end:
+        raise SystemExit(f"{name} must look like 10:00-23:00, the start before the end, got {value!r}")
     return start, end
 
 
@@ -226,6 +245,10 @@ def load_settings() -> Settings:
             address_window_min=_int_in("ADDRESS_WINDOW_MIN", 5, 1, 60, "minutes"),
             address_context=_int_in("ADDRESS_CONTEXT", 4, 0, 20, "messages"),
             address_daily_checks=_int_in("ADDRESS_DAILY_CHECKS", 150, 0, 2000, "checks"),
+            chime_hours=_parse_hours("CHIME_HOURS", "10:00-23:00"),
+            chime_min_messages=_int_in("CHIME_MIN_MESSAGES", 10, 1, 500, "messages"),
+            chime_window=_int_in("CHIME_WINDOW", 40, 1, 100, "messages"),
+            chime_daily=_int_in("CHIME_DAILY", 3, 0, 24, "remarks"),
             bot_keywords=tuple(w.strip().lower() for w in _env("BOT_KEYWORDS", "нестор,бот").split(",")
                                if w.strip()),
             rate_limit=_int("RATE_LIMIT_PER_USER", 5),

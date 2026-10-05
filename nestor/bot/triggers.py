@@ -8,7 +8,7 @@ from dataclasses import dataclass
 # it is in neither HELP nor the BotFather list.
 COMMANDS = {"help", "privacy", "forget_me", "summary", "stats", "pause", "resume", "bot_word", "start",
             "catchup", "export", "reminders", "unremind", "digest", "wisdom", "news", "reactions", "address",
-            "status"}
+            "chime", "status"}
 
 
 @dataclass(frozen=True)

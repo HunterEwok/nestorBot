@@ -85,3 +85,15 @@ def test_address_checks_use_the_profile_without_tools_and_never_fall_back(monkey
     # Not even if `news` fell back to the archive profile one day.
     monkeypatch.setitem(routing.FALLBACK, "news", ("group",))
     assert Router({"group": "G"}).llm("address") is None and Router({"group": "G"}).llm("react") is None
+
+
+def test_remarks_use_the_profile_without_tools_and_never_fall_back(monkeypatch):
+    assert Router({"group": "G", "news": "N"}).llm("chime") == "N"
+    # Without `news` there are no remarks: no move to the archive or the internet profiles.
+    assert Router({"group": "G", "deep": "D", "web": "W", "smart": "S"}).llm("chime") is None
+    assert Router({"group": "G", "news": "N"}, parse_routes("chime:group")).llm("chime") == "G"
+    for value in ("chime:web", "chime:smart", "chime:deep"):
+        with pytest.raises(ValueError):
+            parse_routes(value)
+    monkeypatch.setitem(routing.FALLBACK, "news", ("group",))
+    assert Router({"group": "G"}).llm("chime") is None

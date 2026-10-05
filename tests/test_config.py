@@ -23,7 +23,8 @@ NAMES = ("ALLOWED_CHAT_IDS", "MODEL_ROUTES", "MUSIC_DAILY_LIMIT", "MUSIC_PLAYER_
          "NEWS_MAX_TOPICS", "NEWS_CONTACT_EMAIL", "NEWS_TELEGRAM_CHANNELS", "WISDOM_TIME", "DIGEST_TIME",
          "DIGEST_EVERY_DAYS", "TIMEZONE",
          "RETENTION_TIME", "ALERT_CHAT_ID", "ALERT_DAILY_AT", "ALERT_QUIET", "ALERT_DISK_MIN_GB", "ALERT_MAX_MEMBERS",
-         "BACKUP_STATUS_FILE", "ADDRESS_WINDOW_MIN", "ADDRESS_CONTEXT", "ADDRESS_DAILY_CHECKS")
+         "BACKUP_STATUS_FILE", "ADDRESS_WINDOW_MIN", "ADDRESS_CONTEXT", "ADDRESS_DAILY_CHECKS", "CHIME_HOURS",
+         "CHIME_MIN_MESSAGES", "CHIME_WINDOW", "CHIME_DAILY")
 
 
 @pytest.fixture
@@ -99,6 +100,35 @@ def test_addressing_settings(env):
                                ("ADDRESS_CONTEXT", "21", "from 0 to 20, got 21"),
                                ("ADDRESS_DAILY_CHECKS", "2001", "ADDRESS_DAILY_CHECKS must be a number of checks"),
                                ("ADDRESS_DAILY_CHECKS", "1e3", "ADDRESS_DAILY_CHECKS must be a whole number")):
+        good = config._env(name)
+        env.setenv(name, bad)
+        with pytest.raises(SystemExit, match=message):
+            config.load_settings()
+        env.setenv(name, good)
+    config.load_settings()
+
+
+def test_chime_settings(env):
+    s = config.load_settings()
+    assert (s.chime_hours, s.chime_min_messages, s.chime_window, s.chime_daily) == ((time(10), time(23)), 10, 40, 3)
+    example = dotenv_values(Path(__file__).parent.parent / ".env.example")
+    assert [example[n] for n in ("CHIME_HOURS", "CHIME_MIN_MESSAGES", "CHIME_WINDOW", "CHIME_DAILY")] == [
+        "10:00-23:00", "10", "40", "3"]
+    env.setenv("CHIME_HOURS", "09:30 - 22:00   # по Москве")
+    env.setenv("CHIME_MIN_MESSAGES", "1")
+    env.setenv("CHIME_WINDOW", "100")
+    env.setenv("CHIME_DAILY", "0")
+    s = config.load_settings()
+    assert (s.chime_hours, s.chime_min_messages, s.chime_window, s.chime_daily) == (
+        (time(9, 30), time(22)), 1, 100, 0)
+    for name, bad, message in (("CHIME_HOURS", "10:00", "CHIME_HOURS must look like 10:00-23:00, got '10:00'"),
+                               ("CHIME_HOURS", "23:00-10:00", "the start before the end, got '23:00-10:00'"),
+                               ("CHIME_HOURS", "10:00-10:00", "the start before the end"),
+                               ("CHIME_HOURS", "днём", "CHIME_HOURS must look like 10:00-23:00"),
+                               ("CHIME_MIN_MESSAGES", "0", "CHIME_MIN_MESSAGES must be a number of messages from 1 to 500"),
+                               ("CHIME_WINDOW", "101", "CHIME_WINDOW must be a number of messages from 1 to 100"),
+                               ("CHIME_DAILY", "25", "CHIME_DAILY must be a number of remarks from 0 to 24, got 25"),
+                               ("CHIME_DAILY", "три", "CHIME_DAILY must be a whole number")):
         good = config._env(name)
         env.setenv(name, bad)
         with pytest.raises(SystemExit, match=message):
