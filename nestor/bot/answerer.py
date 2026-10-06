@@ -179,7 +179,7 @@ class Answerer:
                                          log_call=self._log_reaction, cfg=cfg.reactions)
         self.addresser = addressing.Addresser(pool, lambda: self.router.llm("address"), me,
                                               wanted=self._address_wanted, checks_today=self._address_checks_today,
-                                              may_spend=self._may_spend_on_extras, log_call=self._log_address,
+                                              may_spend=self._may_check_address, log_call=self._log_address,
                                               answer=self._invoke, declined=self._not_addressed, cfg=cfg.address)
         # A queue per group for its answers and one for its other scheduled posts, and _DIGESTS for the
         # digests of all groups.
@@ -472,9 +472,15 @@ class Answerer:
                 chat_id, scenario, self._day_start())
 
     async def _may_spend_on_extras(self) -> bool:
-        """Reactions and address checks stop asking the model at half the daily tokens: answers come first."""
+        """Reactions stop asking the model at half the daily tokens: answers come first."""
         async with self.pool.acquire() as conn:
             return await self._tokens_today(conn) < self.cfg.daily_token_limit // 2
+
+    async def _may_check_address(self) -> bool:
+        """Address checks go on as long as the bot answers at all: a check is small, ADDRESS_DAILY_CHECKS bounds
+        them, and without them a call in one's own words goes unanswered on every busy afternoon."""
+        async with self.pool.acquire() as conn:
+            return await self._tokens_today(conn) < self.cfg.daily_token_limit
 
     async def _log_reaction(self, chat_id: int, completion: Completion, started: float, status: str) -> None:
         async with self.pool.acquire() as conn:

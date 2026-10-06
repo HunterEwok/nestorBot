@@ -308,10 +308,17 @@ class Addresser:
             return False
         # Checks of different people run at once: those not written down yet count toward the day's too.
         async with self._counting.setdefault(chat_id, asyncio.Lock()):
-            if await self.checks_today(chat_id) + self._in_flight.get(chat_id, 0) >= self.cfg.daily_checks \
-                    or not await self.may_spend():
-                return False
-            self._in_flight[chat_id] = self._in_flight.get(chat_id, 0) + 1
+            if await self.checks_today(chat_id) + self._in_flight.get(chat_id, 0) >= self.cfg.daily_checks:
+                skipped = "daily_checks"
+            elif not await self.may_spend():
+                skipped = "daily_tokens"
+            else:
+                skipped = None
+                self._in_flight[chat_id] = self._in_flight.get(chat_id, 0) + 1
+        if skipped:
+            # Nothing is asked and nothing written down: the journal says why, so the silence shows.
+            log.info("address check skipped", extra={"chat_id": chat_id, "reason": skipped})
+            return False
         try:
             yes = await self._ask(llm, msg, window)
         finally:
