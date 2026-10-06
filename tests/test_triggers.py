@@ -64,7 +64,8 @@ def test_classify_and_period():
     assert classify("оцени тезисы Пети") == "theses"
     assert classify("кто из них прав?") == "who_is_right"
     assert classify("о чём говорили сегодня") == "summary"
-    assert classify("подведи итоги недели") == classify("а о чем спорили?") == "summary"
+    for question in ("подведи итоги недели", "а о чем спорили?", "дай итоговую сводку за неделю", "по итогу дня что было?"):
+        assert classify(question) == "summary", question
     # The letters of «о чём» and «итог» inside other words are a plain question.
     for question in ("почему Петя обиделся?", "а почему?", "почём сейчас бензин?", "в итоге едем или нет?"):
         assert classify(question) == "other", question

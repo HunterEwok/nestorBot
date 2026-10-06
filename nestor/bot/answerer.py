@@ -56,7 +56,7 @@ _DIGEST_DAYS = re.compile(r"(\d+)(?:\s*(?:д|дн|день|дня|дней))?") 
 # Every call is its own row of bot_requests, so the daily token limit counts them all. Beyond
 # DIGEST_MAX_MESSAGES the period is thinned evenly over time (context.period_sample): 4 calls of
 # notes and the final one. The digests of all groups together take half of the day's tokens at most,
-# shared with the reactions, address checks and remarks (answers keep the rest), every call of notes
+# shared with the reactions and remarks (answers and address checks keep the rest), every call of notes
 # included (_digest_room). Before its first call a digest is measured roughly, DIGEST_CHARS_PER_TOKEN
 # characters of the rendered messages per token and DIGEST_CALL_TOKENS for each call's own prompt,
 # answer and the agent's overhead, and thinned further to fit in what is left of that half and of
@@ -723,11 +723,11 @@ class Answerer:
     async def _digest_room(self, conn) -> tuple[int, int]:
         """Today's tokens, and how many of them the digests may still spend: the digests of all groups
         together, every call of notes and every attempt included, take half of the daily limit at most,
-        less what reactions, address checks and remarks spent today (answers keep the rest), and never
-        more than the day has left."""
+        less what reactions and remarks spent today (answers and address checks, which go on to the end of
+        the day, keep the rest), and never more than the day has left."""
         spent, digests, extras = await conn.fetchrow(
             "SELECT coalesce(sum(t), 0), coalesce(sum(t) FILTER (WHERE scenario IN ('digest', 'digest_notes')), 0), "
-            "       coalesce(sum(t) FILTER (WHERE scenario IN ('reaction', 'address', 'chime', 'chime_check')), 0) "
+            "       coalesce(sum(t) FILTER (WHERE scenario IN ('reaction', 'chime', 'chime_check')), 0) "
             "FROM (SELECT scenario, coalesce(input_tokens, 0) + coalesce(output_tokens, 0) AS t "
             "      FROM bot_requests WHERE created_at >= $1) r", self._day_start())
         limit = self.cfg.daily_token_limit

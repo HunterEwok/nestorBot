@@ -11,6 +11,7 @@ import pytest
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import SendMessage
 
+from nestor import logs
 from nestor.bot import markup, prompts
 from nestor.bot.addressing import AddressConfig, Addresser, candidate, parse, render
 from nestor.bot.addressing import verdict as model_verdict
@@ -655,8 +656,10 @@ async def test_without_the_profile_nothing_is_asked_or_guessed(make_env, conn):
 
 
 def skipped(caplog) -> list[tuple[int, str]]:
-    """The journal's «address check skipped» lines: chat and reason, never a word of the chat."""
-    return [(r.chat_id, r.reason) for r in caplog.records if r.getMessage() == "address check skipped"]
+    """The journal's «address check skipped» lines: chat and reason, and nothing else, never a word of the chat."""
+    records = [r for r in caplog.records if r.getMessage() == "address check skipped"]
+    assert all({k for k in vars(r) if k not in logs._STD_ATTRS} == {"chat_id", "reason"} for r in records)
+    return [(r.chat_id, r.reason) for r in records]
 
 
 async def test_the_daily_checks_per_chat(make_env, conn, caplog):
@@ -698,10 +701,10 @@ async def test_checks_of_several_people_at_once_keep_the_daily_number(make_env, 
 async def test_checks_go_on_past_half_the_days_tokens(make_env, conn):
     """Unlike the reactions: a call in one's own words is answered as long as a call by name is."""
     checker = Checker(YES)
-    bot, llm, feed = make_env(news_llm=checker, daily_token_limit=20_000)
+    bot, llm, feed = make_env(news_llm=checker, daily_token_limit=40_000)
     await address_on(conn)
     await conn.execute("INSERT INTO bot_requests (chat_id, scenario, input_tokens, status) "
-                       "VALUES ($1, 'x', 11000, 'ok')", CHAT_ID)       # past half; each call here is 1200
+                       "VALUES ($1, 'x', 31000, 'ok')", CHAT_ID)       # past three quarters; each call here is 1200
     await feed(say(222, 1, "слушай, Нестор, а ты как думаешь?"))
     assert len(checker.checks) == 1 and len(llm.calls) == 1 and bot.sent[-1]["reply_to"] == 1
     await feed(say(222, 2, "а ты уверен?", date=now() + 1))      # the conversation window too
@@ -718,7 +721,6 @@ async def test_no_checks_past_the_days_tokens(make_env, conn, caplog):
     await feed(say(222, 1, "слушай, Нестор, а ты как думаешь?"))
     assert checker.calls == [] and llm.calls == [] and bot.sent == []
     assert skipped(caplog) == [(CHAT_ID, "daily_tokens")]
-    assert "думаешь" not in caplog.text
     await feed(say(222, 2, "нестор, а теперь?"))            # a call by name hears why
     assert llm.calls == [] and bot.sent[-1]["text"] == prompts.RATE_LIMITED_DAY
 
