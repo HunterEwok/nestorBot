@@ -13,6 +13,7 @@ from aiogram.methods import SendMessage
 
 from nestor import logs
 from nestor.bot import markup, prompts
+from nestor.bot.answerer import ADDRESS_CHECK_TOKENS
 from nestor.bot.addressing import AddressConfig, Addresser, candidate, parse, render
 from nestor.bot.addressing import verdict as model_verdict
 from nestor.bot.chime import ChimeConfig
@@ -709,6 +710,22 @@ async def test_checks_go_on_past_half_the_days_tokens(make_env, conn):
     assert len(checker.checks) == 1 and len(llm.calls) == 1 and bot.sent[-1]["reply_to"] == 1
     await feed(say(222, 2, "а ты уверен?", date=now() + 1))      # the conversation window too
     assert len(checker.checks) == 2 and len(llm.calls) == 2 and bot.sent[-1]["reply_to"] == 2
+
+
+async def test_a_check_leaves_room_for_its_answer(make_env, conn, caplog):
+    """A check starts only while a yes would still be answered: as a call by name made at that moment would be."""
+    caplog.set_level(logging.INFO, logger="nestor.addressing")
+    checker = Checker(YES)
+    bot, llm, feed = make_env(news_llm=checker, daily_token_limit=40_000)
+    await address_on(conn)
+    await conn.execute("INSERT INTO bot_requests (chat_id, scenario, input_tokens, status) VALUES ($1, 'x', $2, 'ok')",
+                       CHAT_ID, 40_000 - ADDRESS_CHECK_TOKENS - 1)
+    await feed(say(222, 1, "слушай, Нестор, а ты как думаешь?"))          # its check crosses nothing
+    assert len(checker.checks) == 1 and len(llm.calls) == 1 and bot.sent[-1]["reply_to"] == 1
+    await feed(say(333, 2, "слушай, Нестор, а ты что скажешь?"))         # less than a check's room is left
+    assert len(checker.checks) == 1 and skipped(caplog) == [(CHAT_ID, "daily_tokens")]
+    await feed(say(333, 3, "нестор, а ты что скажешь?"))                 # a call by name is still answered
+    assert len(llm.calls) == 2 and bot.sent[-1]["reply_to"] == 3
 
 
 async def test_no_checks_past_the_days_tokens(make_env, conn, caplog):

@@ -76,6 +76,10 @@ DIGEST_ROUNDS = 3       # rounds of notes: the first, then twice at most on the 
 # from its answers and from the digests.
 _DIGESTS = "digests"
 _QueueKey = int | str | tuple[str, int]     # a group's answers, _DIGESTS, or _posts(chat_id)
+# About the most an address check takes (a few short messages and a one-word verdict: some 1 700 tokens):
+# a check starts only while the day has room for it, so its yes finds the day open, as a call by name made
+# at that moment would (_may_check_address, _limit_reason).
+ADDRESS_CHECK_TOKENS = 3000
 
 
 def _posts(chat_id: int) -> tuple[str, int]:
@@ -478,9 +482,10 @@ class Answerer:
 
     async def _may_check_address(self) -> bool:
         """Address checks go on as long as the bot answers at all: a check is small, ADDRESS_DAILY_CHECKS bounds
-        them, and without them a call in one's own words goes unanswered on every busy afternoon."""
+        them, and without them a call in one's own words goes unanswered on every busy afternoon. The last
+        ADDRESS_CHECK_TOKENS of the day are left for the answer to a yes."""
         async with self.pool.acquire() as conn:
-            return await self._tokens_today(conn) < self.cfg.daily_token_limit
+            return await self._tokens_today(conn) < self.cfg.daily_token_limit - ADDRESS_CHECK_TOKENS
 
     async def _log_reaction(self, chat_id: int, completion: Completion, started: float, status: str) -> None:
         async with self.pool.acquire() as conn:
