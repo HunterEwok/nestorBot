@@ -1,7 +1,7 @@
 import pytest
 from aiohttp import web
 
-from nestor.bot.llm import HermesClient, LLMError
+from nestor.bot.llm import HermesClient, LLMError, extract_json, leading_json, sole_json
 
 
 @pytest.fixture
@@ -39,3 +39,10 @@ async def test_http_error_does_not_leak_body(hermes):
     url, _ = hermes
     with pytest.raises(LLMError, match="HTTP 500"):
         await HermesClient(url, "secret").complete([{"role": "user", "content": "fail"}])
+
+
+@pytest.mark.parametrize("answer", ["[" * 5000, '{"a": ' + "[" * 5000, '{"to_bot": ' + "1" * 5000 + "}",
+                                    '{"to_bot": true, "n": ' + "9" * 4301 + "} зовёт"],
+                         ids=["brackets", "brackets-in-object", "long-number", "long-number-then-words"])
+def test_json_that_json_will_not_read_is_no_object(answer):
+    assert extract_json(answer) is None and sole_json(answer) is None and leading_json(answer) is None

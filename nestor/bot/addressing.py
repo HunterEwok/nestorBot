@@ -17,13 +17,14 @@ import asyncio
 import logging
 import re
 import time
+import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 import asyncpg
 
 from . import context, prompts
-from .llm import LLM, Completion, sole_json
+from .llm import LLM, Completion, leading_json, sole_json
 from .reactions import acknowledgement, eligible, thanks
 from .triggers import (
     MARK,
@@ -167,11 +168,25 @@ def _row_topic(row) -> int | None:
     return row.get("thread_id") if row.get("is_topic_message") else None
 
 
-def parse(answer: str | None) -> bool:
-    """{"to_bot": true}, alone, -> True; anything else is a no: a «да» in words, words around the object, or
-    two objects (an object in the answer may be quoted from the chat)."""
-    data = sole_json(answer)
-    return isinstance(data, dict) and data.get("to_bot") is True
+def verdict(answer: str | None, *, strict: bool = True) -> bool | None:
+    """The model's yes or no: {"to_bot": true} or {"to_bot": false}; None for anything else, a «да» in words,
+    words before the object or two objects (an object in the answer may be quoted from the chat).
+    strict: the object alone (sole_json), for a chat with a «{» in it, where an object may be planted;
+    else words after it are its reasons (leading_json), «{"to_bot": true} Автор зовёт Нестора по имени».
+    No verdict is a no."""
+    data = sole_json(answer) if strict else leading_json(answer)
+    value = data.get("to_bot") if isinstance(data, dict) else None
+    return value if isinstance(value, bool) else None
+
+
+def parse(answer: str | None, *, strict: bool = True) -> bool:
+    """Whether the answer is the model's yes (verdict)."""
+    return verdict(answer, strict=strict) is True
+
+
+def _braced(text: str) -> bool:
+    """Whether the text has a curly brace, «{» or a look-alike a model may type back as one: «｛», «❴», «⦃»."""
+    return any("CURLY BRACKET" in unicodedata.name(ch, "") for ch in set(text))
 
 
 Wanted = Callable[[int], Awaitable[bool]]
@@ -298,10 +313,10 @@ class Addresser:
                 return False
             self._in_flight[chat_id] = self._in_flight.get(chat_id, 0) + 1
         try:
-            completion = await self._ask(llm, msg, window)
+            yes = await self._ask(llm, msg, window)
         finally:
             self._in_flight[chat_id] -= 1
-        if completion is None or not parse(completion.text):
+        if not yes:
             return False
         # The model may take a while: a /pause, /address off, a deletion, an edit or the author's /forget_me
         # meanwhile still counts.
@@ -311,10 +326,11 @@ class Addresser:
             found = await context.messages_by_id(conn, chat_id, [msg["message_id"]])
         return bool(found) and _as_sent(found[0], msg)
 
-    async def _ask(self, llm: LLM, msg: dict, window: bool = False) -> Completion | None:
-        """The model's answer on the candidate, written down; None when nothing was asked or the call failed.
-        window: a line says the bot has just answered its author (no words of the chat: the bot's answer
-        and the request are often further back than the messages shown)."""
+    async def _ask(self, llm: LLM, msg: dict, window: bool = False) -> bool | None:
+        """The model's verdict on the candidate, its call written down: status ok, or unparsed for an answer
+        that is no verdict (neither the answer nor the verdict is kept). None when nothing was asked, the call
+        failed or the answer is no verdict. window: a line says the bot has just answered its author (no
+        words of the chat: the bot's answer and the request are often further back than the messages shown)."""
         chat_id = msg["chat"]["id"]
         async with self.pool.acquire() as conn:
             rows = await self._shown(conn, msg)
@@ -322,8 +338,8 @@ class Addresser:
         if not rows:
             return None
         note = prompts.ADDRESS_WINDOW.format(n=len(rows), minutes=f"{self.cfg.window_min:g}") if window else ""
-        user = prompts.ADDRESS_USER.format(messages=render(rows, self.me.user_id, posts=posts, whole_last=True),
-                                           window=note, n=len(rows))
+        shown = render(rows, self.me.user_id, posts=posts, whole_last=True)
+        user = prompts.ADDRESS_USER.format(messages=shown, window=note, n=len(rows))
         started = time.monotonic()
         try:
             completion = await asyncio.wait_for(llm.complete([{"role": "system", "content": prompts.ADDRESS_SYSTEM},
@@ -335,8 +351,14 @@ class Addresser:
             await self.log_call(chat_id, Completion("", None, None, None), started,
                                 "timeout" if isinstance(e, asyncio.TimeoutError) else "error")
             return None
-        await self.log_call(chat_id, completion, started, "ok")
-        return completion
+        # The reasons a model may add after its verdict are read as such only while nothing in the chat
+        # looks like an object it might have quoted.
+        try:
+            yes = verdict(completion.text, strict=_braced(shown))
+        except Exception:  # noqa: BLE001 - whatever the answer, the paid call is written down
+            yes = None
+        await self.log_call(chat_id, completion, started, "ok" if yes is not None else "unparsed")
+        return yes
 
     async def _shown(self, conn, msg: dict) -> list:
         """The candidate read back from the archive and the ADDRESS_CONTEXT messages before it in

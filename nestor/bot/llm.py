@@ -57,6 +57,9 @@ class HermesClient:
 
 
 _FENCE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S)
+# What json raises on text it cannot read: not JSON (JSONDecodeError, a ValueError), a number of more than
+# 4300 digits (ValueError), brackets about a thousand deep (RecursionError). None of it is an object.
+_UNREADABLE = (ValueError, RecursionError)
 
 
 def extract_json(text: str | None) -> dict[str, Any] | None:
@@ -74,7 +77,7 @@ def extract_json(text: str | None) -> dict[str, Any] | None:
     for start in starts:
         try:
             obj, _ = decoder.raw_decode(text[start:])
-        except json.JSONDecodeError:
+        except _UNREADABLE:
             continue
         if isinstance(obj, dict):
             return obj
@@ -95,6 +98,29 @@ def sole_json(text: str | None) -> dict[str, Any] | None:
     fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
     try:
         data = json.loads(fenced.group(1) if fenced else text)
-    except json.JSONDecodeError:
+    except _UNREADABLE:
         return None
     return data if isinstance(data, dict) else None
+
+
+def leading_json(text: str | None) -> dict[str, Any] | None:
+    """The JSON object a model answer starts with, bare or in a ```json fence, and only words after it:
+    the verdict first, then the reasons a model adds now and then however it is asked («```json
+    {"to_bot": true} ``` Автор зовёт Нестора по имени»). None when anything comes before the object, or
+    when a «{» follows it (a second object, maybe quoted from the chat).
+
+    It is no defence against an object planted in the chat that the model quotes first and then refuses
+    in words: use it only when the chat the model read has no «{», and sole_json otherwise."""
+    if not text:
+        return None
+    text = text.strip()
+    try:
+        fenced = re.match(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+        if fenced:
+            data, rest = json.loads(fenced.group(1)), text[fenced.end():]
+        else:
+            data, end = json.JSONDecoder().raw_decode(text)
+            rest = text[end:]
+    except _UNREADABLE:
+        return None
+    return data if isinstance(data, dict) and "{" not in rest else None
