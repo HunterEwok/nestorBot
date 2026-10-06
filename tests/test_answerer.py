@@ -11,7 +11,7 @@ from aiogram.exceptions import TelegramForbiddenError
 from aiogram.types import Message, Update
 
 from nestor import forget, retention
-from nestor.bot import prompts
+from nestor.bot import context, prompts
 from nestor.bot.answerer import AnswerConfig, Answerer
 from nestor.bot.llm import Completion
 from nestor.bot.triggers import BotIdentity
@@ -281,6 +281,7 @@ async def test_reply_target_thread_is_in_context(make_env):
     await feed(update("message", message(2, "нестор", reply_to_message=message(1, "Тезис: Земля плоская", uid=222))))
     user = llm.calls[0][-1]["content"]
     assert "ответ на сообщение #1" in user and "Оцени тезисы в сообщении" in user
+    assert "Стиль собеседника" not in user          # the theses review keeps its format
 
 
 async def test_rate_limit_per_user(make_env, conn):
@@ -464,7 +465,7 @@ async def test_model_markdown_is_sent_as_telegram_formatting(make_env, conn):
         '• Петя: <a href="https://t.me/c/1000000001/1">«беру палатку»</a>\n'
         "• Вася: «гитару»\n"                 # an author who opted out: no quote of theirs, no link
         "• кто-то: «удалено»")
-    assert "Стиль собеседника: пишет коротко." in llm.calls[0][-1]["content"]
+    assert context.SHORT_STYLE in llm.calls[0][-1]["content"]
     req = await conn.fetchrow("SELECT answer, quoted_user_ids FROM bot_requests")
     assert (req["answer"], req["quoted_user_ids"]) == (answer, [222])
 
@@ -625,12 +626,17 @@ async def test_refused_formatting_is_sent_as_plain_text(make_env, conn):
     assert await conn.fetchval("SELECT status FROM bot_requests") == "ok"
 
 
-async def test_long_writers_get_room_for_longer_answers(make_env):
+async def test_long_writers_get_short_answers_unless_they_think(make_env):
     bot, llm, feed = make_env()
     for i in range(1, 4):
         await feed(update("message", message(i, "очень подробное рассуждение " * 12, uid=111)))
     await feed(update("message", message(4, "нестор, а ты что думаешь?", uid=111)))
-    assert "Стиль собеседника: пишет развёрнуто." in llm.calls[0][-1]["content"]
+    plain = llm.calls[0][-1]["content"]
+    assert context.SHORT_STYLE in plain and "пишет развёрнуто" not in plain
+    # «подумай» keeps the length matched to the asker (no `deep` profile here: it falls back to `group`).
+    await feed(update("message", message(5, "нестор, подумай, а ты что думаешь?", uid=111)))
+    think = llm.calls[1][-1]["content"]
+    assert "Стиль собеседника: пишет развёрнуто." in think and context.SHORT_STYLE not in think
 
 
 async def test_a_bare_number_from_an_archive_tool_is_not_linked_but_goes_with_its_author(make_env, conn):

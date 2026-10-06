@@ -249,9 +249,17 @@ async def typical_length(conn, chat_ids: list[int], user_id: int, limit: int = 3
         chat_ids, user_id, limit)
 
 
+# A question in the chat without «подумай»: 1–2 sentences however long the asker writes (the owner's rule
+# for a messenger). Only a length, no chat text: it goes to the web profiles too.
+SHORT_STYLE = ("Стиль собеседника: переписка в мессенджере. Ответь в 1–2 предложениях, даже если тема большая; "
+               "длиннее — только если он сам просит подробностей, шагов или списка, а на вопрос из нескольких "
+               "частей — по предложению на часть. Пересказа переписки, «кто прав» и оценки тезисов это не касается: "
+               "у них свой формат.")
+
+
 def style_hint(typical: int | None, question: str) -> str:
-    """One line for the prompt: how long the asker writes, so the answer can match it. Only
-    a length, no chat text: it may go to the web profiles too."""
+    """One line for a «подумай» question: how long the asker writes, so the answer can match it.
+    Only a length, no chat text: it may go to the web profiles too."""
     size = max(typical or 0, len(question or ""))
     if size < 80:
         return "Стиль собеседника: пишет коротко. Ответь в 1–3 предложениях, если он не просит подробностей."
@@ -313,7 +321,9 @@ def render(rows, tz: ZoneInfo, *, title: str) -> str:
 _SCENARIOS = (
     ("who_is_right", re.compile(r"кто\s+(из\s+\w+\s+)?прав", re.I)),
     ("theses", re.compile(r"тезис|аргумент|оцени|разбери", re.I)),
-    ("summary", re.compile(r"о\s*ч[её]м|кратко|итог|содержание|саммари|summary|что\s+обсуждали", re.I)),
+    # «о чём», not the «очем» of «почему»; «итоги», «по итогу», «итоговая», not «в итоге»
+    ("summary", re.compile(r"(?<!\w)о\s*ч[её]м|кратко|(?<!\w)итог(?!е(?!\w))|содержание|саммари|summary|"
+                           r"что\s+обсуждали", re.I)),
     ("search", re.compile(r"кто\s+(и\s+когда\s+)?(говорил|писал)|найди|поиск|когда\s+(говорили|писали)", re.I)),
 )
 

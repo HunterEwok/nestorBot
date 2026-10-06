@@ -2,6 +2,7 @@
 tools, the conversation window after an answer, the caps, and what is shown and stored."""
 import asyncio
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from datetime import time as dtime
 from zoneinfo import ZoneInfo
@@ -10,7 +11,9 @@ import pytest
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import SendMessage
 
+from nestor import logs
 from nestor.bot import markup, prompts
+from nestor.bot.answerer import ADDRESS_CHECK_TOKENS
 from nestor.bot.addressing import AddressConfig, Addresser, candidate, parse, render
 from nestor.bot.addressing import verdict as model_verdict
 from nestor.bot.chime import ChimeConfig
@@ -653,7 +656,15 @@ async def test_without_the_profile_nothing_is_asked_or_guessed(make_env, conn):
     assert llm.calls[0][0]["content"] == prompts.ADDRESS_SYSTEM and len(llm.calls) == 2
 
 
-async def test_the_daily_checks_per_chat(make_env, conn):
+def skipped(caplog) -> list[tuple[int, str]]:
+    """The journal's «address check skipped» lines: chat and reason, and nothing else, never a word of the chat."""
+    records = [r for r in caplog.records if r.getMessage() == "address check skipped"]
+    assert all({k for k in vars(r) if k not in logs._STD_ATTRS} == {"chat_id", "reason"} for r in records)
+    return [(r.chat_id, r.reason) for r in records]
+
+
+async def test_the_daily_checks_per_chat(make_env, conn, caplog):
+    caplog.set_level(logging.INFO, logger="nestor.addressing")
     checker = Checker(NO)
     _, _, feed = make_env(news_llm=checker, address=AddressConfig(daily_checks=2))
     await address_on(conn)
@@ -669,6 +680,7 @@ async def test_the_daily_checks_per_chat(make_env, conn):
     assert len(checker.checks) == 2
     assert await conn.fetchval("SELECT count(*) FROM bot_requests WHERE scenario = 'address' AND chat_id = $1",
                                CHAT_ID) == 5
+    assert skipped(caplog) == [(CHAT_ID, "daily_checks")] * 2
 
 
 async def test_checks_of_several_people_at_once_keep_the_daily_number(make_env, conn):
@@ -687,16 +699,64 @@ async def test_checks_of_several_people_at_once_keep_the_daily_number(make_env, 
     assert await conn.fetchval("SELECT count(*) FROM bot_requests WHERE scenario = 'address'") == 3
 
 
-async def test_no_checks_past_half_the_days_tokens(make_env, conn):
+async def test_checks_go_on_past_half_the_days_tokens(make_env, conn):
+    """Unlike the reactions: a call in one's own words is answered as long as a call by name is."""
+    checker = Checker(YES)
+    bot, llm, feed = make_env(news_llm=checker, daily_token_limit=40_000)
+    await address_on(conn)
+    await conn.execute("INSERT INTO bot_requests (chat_id, scenario, input_tokens, status) "
+                       "VALUES ($1, 'x', 31000, 'ok')", CHAT_ID)       # past three quarters; each call here is 1200
+    await feed(say(222, 1, "слушай, Нестор, а ты как думаешь?"))
+    assert len(checker.checks) == 1 and len(llm.calls) == 1 and bot.sent[-1]["reply_to"] == 1
+    await feed(say(222, 2, "а ты уверен?", date=now() + 1))      # the conversation window too
+    assert len(checker.checks) == 2 and len(llm.calls) == 2 and bot.sent[-1]["reply_to"] == 2
+
+
+async def test_a_check_leaves_room_for_its_answer(make_env, conn, caplog):
+    """A check starts only while a yes would still be answered: as a call by name made at that moment would be."""
+    caplog.set_level(logging.INFO, logger="nestor.addressing")
+    checker = Checker(YES)
+    bot, llm, feed = make_env(news_llm=checker, daily_token_limit=40_000)
+    await address_on(conn)
+    await conn.execute("INSERT INTO bot_requests (chat_id, scenario, input_tokens, status) VALUES ($1, 'x', $2, 'ok')",
+                       CHAT_ID, 40_000 - ADDRESS_CHECK_TOKENS - 1)
+    await feed(say(222, 1, "слушай, Нестор, а ты как думаешь?"))          # its check crosses nothing
+    assert len(checker.checks) == 1 and len(llm.calls) == 1 and bot.sent[-1]["reply_to"] == 1
+    await feed(say(333, 2, "слушай, Нестор, а ты что скажешь?"))         # less than a check's room is left
+    assert len(checker.checks) == 1 and skipped(caplog) == [(CHAT_ID, "daily_tokens")]
+    await feed(say(333, 3, "нестор, а ты что скажешь?"))                 # a call by name is still answered
+    assert len(llm.calls) == 2 and bot.sent[-1]["reply_to"] == 3
+
+
+async def test_checks_running_at_once_keep_room_for_their_answers(make_env, conn, caplog):
+    """Several people near the end of the day: a check still running holds its room too."""
+    caplog.set_level(logging.INFO, logger="nestor.addressing")
+    checker = Checker(NO, delay=0.2)
+    _, _, feed = make_env(news_llm=checker, daily_token_limit=40_000)
+    await address_on(conn)
+    await conn.execute("INSERT INTO bot_requests (chat_id, scenario, input_tokens, status) VALUES ($1, 'x', $2, 'ok')",
+                       CHAT_ID, 40_000 - 2 * ADDRESS_CHECK_TOKENS)       # room for one check, not for two
+    answerer = feed.answerer
+    for i, uid in enumerate((222, 333), 1):          # the second while the first check still runs
+        msg = message(i, "слушай, Нестор, а ты как думаешь?", uid=uid, date=now())
+        await answerer.save_outgoing(msg)
+        await answerer.on_message(msg, paused=False)
+    await answerer.drain()
+    assert len(checker.checks) == 1 and skipped(caplog) == [(CHAT_ID, "daily_tokens")]
+
+
+async def test_no_checks_past_the_days_tokens(make_env, conn, caplog):
+    caplog.set_level(logging.INFO, logger="nestor.addressing")
     checker = Checker(YES)
     bot, llm, feed = make_env(news_llm=checker, daily_token_limit=10_000)
     await address_on(conn)
     await conn.execute("INSERT INTO bot_requests (chat_id, scenario, input_tokens, status) "
-                       "VALUES ($1, 'x', 5000, 'ok')", CHAT_ID)
+                       "VALUES ($1, 'x', 10000, 'ok')", CHAT_ID)
     await feed(say(222, 1, "слушай, Нестор, а ты как думаешь?"))
     assert checker.calls == [] and llm.calls == [] and bot.sent == []
-    await feed(say(222, 2, "нестор, а теперь?"))            # a call by name is still answered
-    assert len(llm.calls) == 1
+    assert skipped(caplog) == [(CHAT_ID, "daily_tokens")]
+    await feed(say(222, 2, "нестор, а теперь?"))            # a call by name hears why
+    assert llm.calls == [] and bot.sent[-1]["text"] == prompts.RATE_LIMITED_DAY
 
 
 @pytest.mark.parametrize("on", [True, False])

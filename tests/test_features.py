@@ -12,7 +12,7 @@ from aiogram.methods import SendMessage
 
 from nestor import forget
 from nestor.bot import markup, prompts, reminders
-from nestor.bot.context import classify
+from nestor.bot.context import SHORT_STYLE, classify
 from nestor.bot.scheduler import Scheduler
 from nestor.mcp import tools
 
@@ -262,6 +262,7 @@ async def test_factcheck_sends_only_the_replied_message(make_env, conn):
     sent = "\n".join(m["content"] for m in web.calls[0])
     assert "«Земля плоская, это доказано»" in sent and "Вопрос участника: проверь" in sent
     assert "секретный план" not in sent and "User222" not in sent
+    assert "Стиль собеседника" not in web.calls[0][-1]["content"]      # a fact-check keeps its own format
     # The verdict restates their claim: /forget_me of its author removes the verdict too.
     assert await conn.fetchrow("SELECT scenario, quoted_user_ids FROM bot_requests") == ("factcheck", [222])
 
@@ -270,6 +271,7 @@ async def test_factcheck_sends_only_the_replied_message(make_env, conn):
     follow = web.calls[1]
     assert follow[0]["content"] == prompts.WEB_SYSTEM and "«Земля плоская, это доказано»" in follow[1]["content"]
     assert follow[2]["content"].startswith("Неверно") and llm.calls == []
+    assert SHORT_STYLE in follow[-1]["content"]      # a follow-up question is a plain one: 1–2 sentences
 
     # Only the quoted part, if the asker quoted.
     await feed(update("message", message(5, "нестор, это правда?", uid=444, reply_to_message=claim,

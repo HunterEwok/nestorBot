@@ -424,8 +424,8 @@ async def test_the_digests_of_all_groups_take_half_of_the_day_together(make_env,
     assert await conn.fetchval("SELECT count(*) FROM daily_posts WHERE status = 'skipped'") == 3
 
 
-@pytest.mark.parametrize("scenario", ["reaction", "address", "chime", "chime_check"])
-async def test_reactions_checks_and_remarks_share_the_digests_half(make_env, conn, scenario):
+@pytest.mark.parametrize("scenario", ["reaction", "chime", "chime_check"])
+async def test_reactions_and_remarks_share_the_digests_half(make_env, conn, scenario):
     """They spent half of the day before the digest came: it waits for the next morning, answers keep the rest."""
     bot, llm, feed = make_env(PartsLLM(tokens=(14_000, 1000)), daily_token_limit=30_000)
     since, until = daily.digest_bounds(DAY, 7, TZ)
@@ -437,6 +437,18 @@ async def test_reactions_checks_and_remarks_share_the_digests_half(make_env, con
     assert llm.calls == [] and await conn.fetchval("SELECT status FROM daily_posts") == "skipped"
     await feed(update("message", message(1, "нестор, как дела?", uid=300)))
     assert bot.sent[-1]["text"] == "Ответ модели"
+
+
+async def test_address_checks_leave_the_digests_half_alone(make_env, conn):
+    """Address checks go on to the end of the day, as answers do: they take nothing from the digests' half."""
+    _, llm, feed = make_env(PartsLLM(tokens=(14_000, 1000)), daily_token_limit=30_000)
+    since, until = daily.digest_bounds(DAY, 7, TZ)
+    await write(conn, spread(since, until, 20))
+    await digest_on(conn, digest_days=7)
+    await conn.execute("INSERT INTO bot_requests (chat_id, scenario, input_tokens, output_tokens, status) "
+                       "VALUES ($1, 'address', 15000, 0, 'ok')", CHAT_ID)
+    await run(feed, at(DAY, 9, 30))
+    assert len(llm.calls) == 1 and await conn.fetchval("SELECT status FROM daily_posts") == "posted"
 
 
 async def test_new_notes_on_parts_that_changed_must_fit_in_the_half(make_env, conn):

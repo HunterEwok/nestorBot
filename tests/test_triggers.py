@@ -1,8 +1,9 @@
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+from nestor.bot import prompts
 from nestor.bot.answerer import split_text
-from nestor.bot.context import classify, message_link, period_start
+from nestor.bot.context import SHORT_STYLE, classify, message_link, period_start, style_hint
 from nestor.bot.triggers import BotIdentity, detect
 
 from .factories import message
@@ -63,6 +64,11 @@ def test_classify_and_period():
     assert classify("оцени тезисы Пети") == "theses"
     assert classify("кто из них прав?") == "who_is_right"
     assert classify("о чём говорили сегодня") == "summary"
+    for question in ("подведи итоги недели", "а о чем спорили?", "дай итоговую сводку за неделю", "по итогу дня что было?"):
+        assert classify(question) == "summary", question
+    # The letters of «о чём» and «итог» inside other words are a plain question.
+    for question in ("почему Петя обиделся?", "а почему?", "почём сейчас бензин?", "в итоге едем или нет?"):
+        assert classify(question) == "other", question
     assert classify("кто и когда говорил про отпуск") == "search"
     assert classify("какая погода в Кирове?") == "web"
     assert classify("курс доллара сегодня") == "web"
@@ -73,6 +79,24 @@ def test_classify_and_period():
     assert period_start("неделя", now, tz) == datetime(2026, 9, 26, 12, 0, tzinfo=timezone.utc)
     assert period_start("за 3 часа", now, tz) == datetime(2026, 10, 3, 9, 0, tzinfo=timezone.utc)
     assert period_start("", now, tz).astimezone(tz).hour == 0
+
+
+def test_answer_length_lines():
+    # A plain question: 1–2 sentences whoever asks. «подумай»: the old brackets, by how the asker writes.
+    assert SHORT_STYLE.startswith("Стиль собеседника: ") and "Ответь в 1–2 предложениях" in SHORT_STYLE
+    assert style_hint(None, "кто прав?") == ("Стиль собеседника: пишет коротко. "
+                                             "Ответь в 1–3 предложениях, если он не просит подробностей.")
+    assert style_hint(120, "?") == "Стиль собеседника: пишет средними сообщениями. Ответ — до 4–6 предложений."
+    assert style_hint(None, "x" * 300) == "Стиль собеседника: пишет развёрнуто. Можно ответить подробнее, но без воды."
+    # Asking for details, steps or a list still gets them: the short line is a default, not a cut.
+    assert all("просит подробностей" in p for p in (SHORT_STYLE, prompts.BREVITY))
+    # The rule is in every prompt that answers a question, and not in the ones with a fixed format.
+    assert all(prompts.BREVITY in p for p in (prompts.SYSTEM, prompts.WEB_SYSTEM, prompts.FACTCHECK_SYSTEM))
+    assert all(s in prompts.BREVITY for s in ("1–2 предложения", "«Стиль собеседника»", "«кто прав»",
+                                              "«что я пропустил»", "проверки фактов"))
+    assert prompts.BREVITY not in prompts.MUSIC_SYSTEM + prompts.DIGEST_SYSTEM + prompts.WISDOM_SYSTEM
+    assert "{" not in SHORT_STYLE + prompts.BREVITY
+    prompts.SYSTEM.format(ticket="t", web_marker=prompts.WEB_MARKER)
 
 
 def test_links():

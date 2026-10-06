@@ -56,7 +56,7 @@ _DIGEST_DAYS = re.compile(r"(\d+)(?:\s*(?:д|дн|день|дня|дней))?") 
 # Every call is its own row of bot_requests, so the daily token limit counts them all. Beyond
 # DIGEST_MAX_MESSAGES the period is thinned evenly over time (context.period_sample): 4 calls of
 # notes and the final one. The digests of all groups together take half of the day's tokens at most,
-# shared with the reactions, address checks and remarks (answers keep the rest), every call of notes
+# shared with the reactions and remarks (answers and address checks keep the rest), every call of notes
 # included (_digest_room). Before its first call a digest is measured roughly, DIGEST_CHARS_PER_TOKEN
 # characters of the rendered messages per token and DIGEST_CALL_TOKENS for each call's own prompt,
 # answer and the agent's overhead, and thinned further to fit in what is left of that half and of
@@ -76,6 +76,10 @@ DIGEST_ROUNDS = 3       # rounds of notes: the first, then twice at most on the 
 # from its answers and from the digests.
 _DIGESTS = "digests"
 _QueueKey = int | str | tuple[str, int]     # a group's answers, _DIGESTS, or _posts(chat_id)
+# About the most an address check takes (a few short messages and a one-word verdict: some 1 700 tokens):
+# a check starts only while the day has room for it, so its yes finds the day open, as a call by name made
+# at that moment would (_may_check_address, _limit_reason).
+ADDRESS_CHECK_TOKENS = 3000
 
 
 def _posts(chat_id: int) -> tuple[str, int]:
@@ -179,7 +183,7 @@ class Answerer:
                                          log_call=self._log_reaction, cfg=cfg.reactions)
         self.addresser = addressing.Addresser(pool, lambda: self.router.llm("address"), me,
                                               wanted=self._address_wanted, checks_today=self._address_checks_today,
-                                              may_spend=self._may_spend_on_extras, log_call=self._log_address,
+                                              may_spend=self._may_check_address, log_call=self._log_address,
                                               answer=self._invoke, declined=self._not_addressed, cfg=cfg.address)
         # A queue per group for its answers and one for its other scheduled posts, and _DIGESTS for the
         # digests of all groups.
@@ -472,9 +476,18 @@ class Answerer:
                 chat_id, scenario, self._day_start())
 
     async def _may_spend_on_extras(self) -> bool:
-        """Reactions and address checks stop asking the model at half the daily tokens: answers come first."""
+        """Reactions stop asking the model at half the daily tokens: answers come first."""
         async with self.pool.acquire() as conn:
             return await self._tokens_today(conn) < self.cfg.daily_token_limit // 2
+
+    async def _may_check_address(self, running: int = 0) -> bool:
+        """Address checks go on as long as the bot answers at all: a check is small, ADDRESS_DAILY_CHECKS bounds
+        them, and without them a call in one's own words goes unanswered on every busy afternoon. Room for
+        this check and for those still running (their tokens not written down yet) is kept, ADDRESS_CHECK_TOKENS
+        each, so that the answer to a yes finds the day open."""
+        async with self.pool.acquire() as conn:
+            spent = await self._tokens_today(conn)
+        return spent < self.cfg.daily_token_limit - ADDRESS_CHECK_TOKENS * (running + 1)
 
     async def _log_reaction(self, chat_id: int, completion: Completion, started: float, status: str) -> None:
         async with self.pool.acquire() as conn:
@@ -717,11 +730,11 @@ class Answerer:
     async def _digest_room(self, conn) -> tuple[int, int]:
         """Today's tokens, and how many of them the digests may still spend: the digests of all groups
         together, every call of notes and every attempt included, take half of the daily limit at most,
-        less what reactions, address checks and remarks spent today (answers keep the rest), and never
-        more than the day has left."""
+        less what reactions and remarks spent today (answers and address checks, which go on to the end of
+        the day, keep the rest), and never more than the day has left."""
         spent, digests, extras = await conn.fetchrow(
             "SELECT coalesce(sum(t), 0), coalesce(sum(t) FILTER (WHERE scenario IN ('digest', 'digest_notes')), 0), "
-            "       coalesce(sum(t) FILTER (WHERE scenario IN ('reaction', 'address', 'chime', 'chime_check')), 0) "
+            "       coalesce(sum(t) FILTER (WHERE scenario IN ('reaction', 'chime', 'chime_check')), 0) "
             "FROM (SELECT scenario, coalesce(input_tokens, 0) + coalesce(output_tokens, 0) AS t "
             "      FROM bot_requests WHERE created_at >= $1) r", self._day_start())
         limit = self.cfg.daily_token_limit
@@ -1149,11 +1162,16 @@ class Answerer:
                         pass
 
     async def _style(self, conn, job: Job) -> str:
-        """How long the asker usually writes here, as one line for the prompt: answers match it.
-        Only for free questions: summaries, catch-ups, theses and searches keep their own format.
-        Only a length, never chat text, so the web profiles may get it too."""
+        """How long the answer may be, as one line for the prompt. Only for free questions: summaries,
+        catch-ups, theses, searches and fact-checks keep their own format. A plain question gets 1–2
+        sentences whoever asks; after «подумай» the length follows how the asker writes here. Only a
+        length, never chat text, so the web profiles may get it too."""
         if job.scenario not in ("other", "web"):
             return ""
+        if not job.question.strip() and _reply_target(job.msg, job.inv) is not None:
+            return ""       # a bare «нестор» under someone's message: _build_prompt asks for the theses review
+        if not job.think:
+            return context.SHORT_STYLE
         ids = await context.chat_lineage(conn, job.msg["chat"]["id"])
         return context.style_hint(await context.typical_length(conn, ids, job.msg["from"]["id"]), job.question)
 
