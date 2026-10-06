@@ -98,3 +98,26 @@ def sole_json(text: str | None) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
     return data if isinstance(data, dict) else None
+
+
+def leading_json(text: str | None) -> dict[str, Any] | None:
+    """The JSON object a model answer starts with, bare or in a ```json fence, and only words after it:
+    the verdict first, then the reasons a model adds now and then however it is asked («```json
+    {"to_bot": true} ``` Автор зовёт Нестора по имени»). None when anything comes before the object, or
+    when a «{» follows it (a second object, maybe quoted from the chat).
+
+    It is no defence against an object planted in the chat that the model quotes first and then refuses
+    in words: use it only when the chat the model read has no «{», and sole_json otherwise."""
+    if not text:
+        return None
+    text = text.strip()
+    try:
+        fenced = re.match(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+        if fenced:
+            data, rest = json.loads(fenced.group(1)), text[fenced.end():]
+        else:
+            data, end = json.JSONDecoder().raw_decode(text)
+            rest = text[end:]
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) and "{" not in rest else None
