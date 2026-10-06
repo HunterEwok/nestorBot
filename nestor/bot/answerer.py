@@ -480,12 +480,14 @@ class Answerer:
         async with self.pool.acquire() as conn:
             return await self._tokens_today(conn) < self.cfg.daily_token_limit // 2
 
-    async def _may_check_address(self) -> bool:
+    async def _may_check_address(self, running: int = 0) -> bool:
         """Address checks go on as long as the bot answers at all: a check is small, ADDRESS_DAILY_CHECKS bounds
-        them, and without them a call in one's own words goes unanswered on every busy afternoon. The last
-        ADDRESS_CHECK_TOKENS of the day are left for the answer to a yes."""
+        them, and without them a call in one's own words goes unanswered on every busy afternoon. Room for
+        this check and for those still running (their tokens not written down yet) is kept, ADDRESS_CHECK_TOKENS
+        each, so that the answer to a yes finds the day open."""
         async with self.pool.acquire() as conn:
-            return await self._tokens_today(conn) < self.cfg.daily_token_limit - ADDRESS_CHECK_TOKENS
+            spent = await self._tokens_today(conn)
+        return spent < self.cfg.daily_token_limit - ADDRESS_CHECK_TOKENS * (running + 1)
 
     async def _log_reaction(self, chat_id: int, completion: Completion, started: float, status: str) -> None:
         async with self.pool.acquire() as conn:

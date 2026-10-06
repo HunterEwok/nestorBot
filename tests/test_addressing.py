@@ -728,6 +728,23 @@ async def test_a_check_leaves_room_for_its_answer(make_env, conn, caplog):
     assert len(llm.calls) == 2 and bot.sent[-1]["reply_to"] == 3
 
 
+async def test_checks_running_at_once_keep_room_for_their_answers(make_env, conn, caplog):
+    """Several people near the end of the day: a check still running holds its room too."""
+    caplog.set_level(logging.INFO, logger="nestor.addressing")
+    checker = Checker(NO, delay=0.2)
+    _, _, feed = make_env(news_llm=checker, daily_token_limit=40_000)
+    await address_on(conn)
+    await conn.execute("INSERT INTO bot_requests (chat_id, scenario, input_tokens, status) VALUES ($1, 'x', $2, 'ok')",
+                       CHAT_ID, 40_000 - 2 * ADDRESS_CHECK_TOKENS)       # room for one check, not for two
+    answerer = feed.answerer
+    for i, uid in enumerate((222, 333), 1):          # the second while the first check still runs
+        msg = message(i, "слушай, Нестор, а ты как думаешь?", uid=uid, date=now())
+        await answerer.save_outgoing(msg)
+        await answerer.on_message(msg, paused=False)
+    await answerer.drain()
+    assert len(checker.checks) == 1 and skipped(caplog) == [(CHAT_ID, "daily_tokens")]
+
+
 async def test_no_checks_past_the_days_tokens(make_env, conn, caplog):
     caplog.set_level(logging.INFO, logger="nestor.addressing")
     checker = Checker(YES)
