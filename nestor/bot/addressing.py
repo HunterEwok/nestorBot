@@ -17,6 +17,7 @@ import asyncio
 import logging
 import re
 import time
+import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
@@ -183,6 +184,11 @@ def parse(answer: str | None, *, strict: bool = True) -> bool:
     return verdict(answer, strict=strict) is True
 
 
+def _braced(text: str) -> bool:
+    """Whether the text has a curly brace, «{» or a look-alike a model may type back as one: «｛», «❴», «⦃»."""
+    return any("CURLY BRACKET" in unicodedata.name(ch, "") for ch in set(text))
+
+
 Wanted = Callable[[int], Awaitable[bool]]
 ChecksToday = Callable[[int], Awaitable[int]]
 MaySpend = Callable[[], Awaitable[bool]]
@@ -347,7 +353,10 @@ class Addresser:
             return None
         # The reasons a model may add after its verdict are read as such only while nothing in the chat
         # looks like an object it might have quoted.
-        yes = verdict(completion.text, strict="{" in shown)
+        try:
+            yes = verdict(completion.text, strict=_braced(shown))
+        except Exception:  # noqa: BLE001 - whatever the answer, the paid call is written down
+            yes = None
         await self.log_call(chat_id, completion, started, "ok" if yes is not None else "unparsed")
         return yes
 
