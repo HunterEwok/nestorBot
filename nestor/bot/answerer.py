@@ -1149,11 +1149,16 @@ class Answerer:
                         pass
 
     async def _style(self, conn, job: Job) -> str:
-        """How long the asker usually writes here, as one line for the prompt: answers match it.
-        Only for free questions: summaries, catch-ups, theses and searches keep their own format.
-        Only a length, never chat text, so the web profiles may get it too."""
+        """How long the answer may be, as one line for the prompt. Only for free questions: summaries,
+        catch-ups, theses, searches and fact-checks keep their own format. A plain question gets 1–2
+        sentences whoever asks; after «подумай» the length follows how the asker writes here. Only a
+        length, never chat text, so the web profiles may get it too."""
         if job.scenario not in ("other", "web"):
             return ""
+        if not job.question.strip() and _reply_target(job.msg, job.inv) is not None:
+            return ""       # a bare «нестор» under someone's message: _build_prompt asks for the theses review
+        if not job.think:
+            return context.SHORT_STYLE
         ids = await context.chat_lineage(conn, job.msg["chat"]["id"])
         return context.style_hint(await context.typical_length(conn, ids, job.msg["from"]["id"]), job.question)
 

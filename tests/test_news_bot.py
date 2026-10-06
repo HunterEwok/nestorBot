@@ -5,7 +5,7 @@ import re
 from datetime import datetime, time as dtime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from nestor.bot import markup, prompts
+from nestor.bot import context, markup, prompts
 from nestor.news.model import FetchResult
 
 from .factories import CHAT_ID, message, update
@@ -157,6 +157,7 @@ async def test_think_goes_to_the_bigger_models(make_env, conn):
     await feed(update("message", message(5, "нестор, подумай: какая погода в Таллине?", date=ago())))
     assert len(smart.calls) == 1 and web.calls == []
     assert "Вопрос: какая погода в Таллине?\nСтиль собеседника:" in smart.calls[0][-1]["content"]
+    assert context.SHORT_STYLE not in smart.calls[0][-1]["content"]      # «подумай»: the length follows the asker
     rows = [tuple(r) for r in await conn.fetch(
         "SELECT trigger_msg_id, scenario, profile FROM bot_requests ORDER BY id")]
     assert rows == [(2, "who_is_right", "deep"), (3, "summary", None), (4, "summary", "deep"), (5, "web", "smart")]
@@ -184,6 +185,7 @@ async def test_bare_think_reply_reconsiders_a_web_answer_on_the_bigger_model(mak
     smart = ScriptedLLM("Если подумать, к вечеру +5", profile="smart")
     bot, llm, feed = make_env(web=web, smart=smart)
     await feed(update("message", message(1, "нестор, какая погода в Таллине?", date=ago(minutes=2))))
+    assert "Вопрос: какая погода в Таллине?\n" + context.SHORT_STYLE in web.calls[0][-1]["content"]
     answer = {"message_id": bot.sent[-1]["message_id"], "date": ago(minutes=1),
               "chat": {"id": CHAT_ID, "type": "supergroup"}, "from": {"id": BOT_ID, "is_bot": True, "first_name": "Н"},
               "text": "В Таллине +8"}
