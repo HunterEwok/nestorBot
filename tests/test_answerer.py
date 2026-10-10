@@ -390,6 +390,16 @@ async def test_forget_me_works_while_paused(make_env, conn):
     assert await conn.fetchval("SELECT count(*) FROM messages WHERE user_id = 222") == 0
 
 
+async def test_owner_uses_admin_commands_without_being_admin(make_env, conn):
+    bot, llm, feed = make_env(admins={111}, owner_ids=frozenset({333}))
+    await feed(update("message", message(1, "/pause", uid=222)))
+    assert bot.sent[-1]["text"] == prompts.ADMINS_ONLY
+    await feed(update("message", message(2, "/pause", uid=333)))
+    assert bot.sent[-1]["text"] == prompts.PAUSED
+    await feed(update("message", message(3, "/resume", uid=333)))
+    assert bot.sent[-1]["text"] == prompts.RESUMED
+
+
 async def test_pause_requires_admin_and_stops_archiving(make_env, conn):
     bot, llm, feed = make_env(admins={111})
     await feed(update("message", message(1, "/pause", uid=222)))

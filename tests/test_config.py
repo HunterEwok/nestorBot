@@ -24,7 +24,7 @@ NAMES = ("ALLOWED_CHAT_IDS", "MODEL_ROUTES", "MUSIC_DAILY_LIMIT", "MUSIC_PLAYER_
          "DIGEST_EVERY_DAYS", "TIMEZONE",
          "RETENTION_TIME", "ALERT_CHAT_ID", "ALERT_DAILY_AT", "ALERT_QUIET", "ALERT_DISK_MIN_GB", "ALERT_MAX_MEMBERS",
          "BACKUP_STATUS_FILE", "ADDRESS_WINDOW_MIN", "ADDRESS_CONTEXT", "ADDRESS_DAILY_CHECKS", "CHIME_HOURS",
-         "CHIME_MIN_MESSAGES", "CHIME_WINDOW", "CHIME_DAILY")
+         "CHIME_MIN_MESSAGES", "CHIME_WINDOW", "CHIME_DAILY", "OWNER_IDS")
 
 
 @pytest.fixture
@@ -63,6 +63,12 @@ def test_defaults_and_bad_values(env):
     env.setenv("MODEL_ROUTES", "theses:web")
     with pytest.raises(SystemExit, match="MODEL_ROUTES"):
         config.load_settings()
+
+
+def test_owner_ids(env):
+    assert config.load_settings().owner_ids == frozenset()
+    env.setenv("OWNER_IDS", "288040123, 7  # владелец")
+    assert config.load_settings().owner_ids == frozenset({288040123, 7})
 
 
 def test_digest_every_days(env):

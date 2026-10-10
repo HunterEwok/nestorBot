@@ -73,6 +73,8 @@ class Settings:
     retention_time: time = time(3, 30)
     # Alerts of nestor.watchdog go to this group (it must be in ALLOWED_CHAT_IDS); None: no alerts.
     alert_chat_id: int | None = None
+    # People who may use the admin commands in every allowed group without being its admin (the owner).
+    owner_ids: frozenset[int] = frozenset()
     alert_daily_at: time | None = time(9, 30)           # the silent daily summary, local time; None: off
     alert_quiet: tuple[time, time] | None = (time(23), time(8))   # alerts arrive without sound; None: never quiet
     alert_disk_min_gb: int = 5          # free space on the Pi's card below this is a warning
@@ -266,6 +268,7 @@ def load_settings() -> Settings:
             timezone=_timezone(),
             retention_time=_parse_time("RETENTION_TIME", "03:30"),
             alert_chat_id=_parse_id("ALERT_CHAT_ID"),
+            owner_ids=_parse_ids(_env("OWNER_IDS")),
             alert_daily_at=_parse_optional_time("ALERT_DAILY_AT", "09:30"),
             alert_quiet=_parse_quiet("ALERT_QUIET", "23:00-08:00"),
             alert_disk_min_gb=_int("ALERT_DISK_MIN_GB", 5),

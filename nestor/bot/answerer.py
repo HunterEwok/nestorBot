@@ -112,6 +112,7 @@ class AnswerConfig:
     address: addressing.AddressConfig = field(default_factory=addressing.AddressConfig)   # /address, off by default
     chime: chime.ChimeConfig = field(default_factory=chime.ChimeConfig)     # /chime, off by default
     alert_chat_id: int | None = None    # ALERT_CHAT_ID: /status answers there only, to its admins; None: nowhere
+    owner_ids: frozenset[int] = frozenset()   # OWNER_IDS: count as admins in every group
 
 
 @dataclass
@@ -542,6 +543,8 @@ class Answerer:
         return emoji is not None and await self._put_reaction(msg, emoji)
 
     async def _is_admin(self, msg: dict) -> bool:
+        if msg["from"]["id"] in self.cfg.owner_ids:
+            return True
         if msg["from"]["id"] == ANONYMOUS_ADMIN_ID and (msg.get("sender_chat") or {}).get("id") == msg["chat"]["id"]:
             return True
         try:
