@@ -1,4 +1,4 @@
-# Dependabot: weekly check of Python dependencies from pyproject.toml and of the GitHub Actions CI uses.
+# Dependabot: weekly check of Python dependencies from pyproject.toml.
 # Docs: https://docs.github.com/code-security/dependabot/working-with-dependabot/dependabot-options-reference
 #
 # Not covered on purpose:
@@ -21,13 +21,3 @@ updates:
     commit-message:
       prefix: "deps"
 
-  # The actions in .github/workflows (checkout, setup-python): a new major version gets its own PR.
-  - package-ecosystem: "github-actions"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-      day: "monday"
-      time: "09:00"
-      timezone: "Europe/Moscow"
-    commit-message:
-      prefix: "ci"
