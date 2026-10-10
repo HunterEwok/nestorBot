@@ -68,6 +68,7 @@ class TrendsService:
         self._lock = asyncio.Lock()         # one read of the charts at a time
         self._pick_lock = asyncio.Lock()    # one recommendation at a time
         self._cleaned: date | None = None
+        self._retried = False               # the first read after a start ignores the pauses (see collect)
 
     async def run(self) -> None:
         from ..collector.app import _TRANSIENT
@@ -87,19 +88,24 @@ class TrendsService:
     def _today(self, now: datetime) -> date:
         return now.astimezone(self.tz).date()
 
-    def due(self, state, now: datetime) -> bool:
+    def due(self, state, now: datetime, retry: bool = False) -> bool:
+        """retry: a chart that failed is read again now, whatever pause its failure set."""
         if state is None:
             return True
         if state["last_ok_day"] == self._today(now):
             return False
-        return state["next_run_at"] is None or state["next_run_at"] <= now
+        return retry or state["next_run_at"] is None or state["next_run_at"] <= now
 
-    async def collect(self, now: datetime) -> dict[str, str]:
-        """Read the charts not read today. Returns key -> status."""
+    async def collect(self, now: datetime, *, retry: bool = False) -> dict[str, str]:
+        """Read the charts not read today. Returns key -> status.
+
+        retry (/music now), and the first read after a start: the failed charts too, before their pause is over.
+        A restart is how a setting changes (MUSIC_YANDEX_PROXY after a 451), so it should not wait a day."""
         async with self._lock:
+            retry, self._retried = retry or not self._retried, True
             async with self.pool.acquire() as conn:
                 states = await store.states(conn)
-            todo = [c for c in self.charts if self.due(states.get(c.key), now)]
+            todo = [c for c in self.charts if self.due(states.get(c.key), now, retry)]
             if not todo:
                 return {}
             async with self.http_factory(self.contact) as http:
@@ -158,7 +164,7 @@ class TrendsService:
                 if made is not None:
                     return _post(made)
             now = datetime.now(timezone.utc)
-            await self.collect(now)
+            await self.collect(now, retry=force)
             async with self.pool.acquire() as conn:
                 if await self._over_limit(conn, now):
                     return None

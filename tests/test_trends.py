@@ -283,6 +283,19 @@ async def test_charts_are_read_once_a_day_and_a_failure_backs_off(pool, conn):
     assert "lastfm" not in charts.calls       # no key, not read at all
 
 
+async def test_a_restart_and_music_now_retry_a_refused_chart(pool, conn):
+    # Yandex refused (451) before MUSIC_YANDEX_PROXY was set: the pause lasts a day.
+    charts = Charts(yandex=HttpError(451, "x"), apple=rising_yandex())
+    assert (await make_trends(pool, charts).collect(NOW))["yandex_ru"] == "http_451"
+    charts.charts["yandex"] = rising_yandex()
+    # The collector restarted with the proxy: its first read asks Yandex again at once.
+    restarted = make_trends(pool, charts)
+    assert await restarted.collect(NOW + timedelta(minutes=5)) == {"yandex_ru": "ok", "shazam_ru": "empty"}
+    # Later reads of the same process keep the pauses; /music now does not wait for them.
+    assert await restarted.collect(NOW + timedelta(minutes=10)) == {}
+    assert await restarted.collect(NOW + timedelta(minutes=10), retry=True) == {"shazam_ru": "empty"}
+
+
 async def test_recommendation_checks_writes_and_builds_the_card(pool, conn):
     charts = Charts(yandex=rising_yandex())
     service = make_trends(pool, charts)
