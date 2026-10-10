@@ -50,6 +50,13 @@ class Settings:
     news_min_score: int = 7              # significance 1-10 a story needs to make the digest
     news_contact_email: str = ""        # for NCBI's email= and the User-Agent of the news fetcher
     news_telegram_channels: tuple[str, ...] = ("psychedelicsocietyvienna",)
+    # Rising Russian artists (nestor.trends): groups that get the weekly post by default (/music on|off),
+    # its weekday (0 Monday .. 6 Sunday) and local time.
+    music_chat_ids: frozenset[int] = frozenset()
+    music_day: int = 4
+    music_time: time = time(19, 0)
+    music_max_listeners: int = 300_000   # Last.fm listeners above which an artist counts as known; 0: no limit
+    lastfm_api_key: str = ""             # optional: the Last.fm chart and listener counts
     # Groups where the bot puts reactions on emotional messages; group admins switch it with /reactions on|off.
     reaction_chat_ids: frozenset[int] = frozenset()
     # Addressing in one's own words (/address on, nestor.bot.addressing): for this many minutes after
@@ -215,6 +222,17 @@ def _digest_every_days() -> int:
     return _int_in("DIGEST_EVERY_DAYS", 30, 1, DIGEST_MAX_DAYS, "days")
 
 
+_WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def _weekday() -> int:
+    """MUSIC_DAY: mon, tue, wed, thu, fri, sat or sun."""
+    value = _env("MUSIC_DAY", "fri").lower()[:3]
+    if value not in _WEEKDAYS:
+        raise SystemExit(f"MUSIC_DAY must be one of {', '.join(_WEEKDAYS)}, got {value!r}")
+    return _WEEKDAYS.index(value)
+
+
 def _player_app() -> str:
     value = _env("MUSIC_PLAYER_APP")
     if value and not re.fullmatch(r"[A-Za-z0-9_]{3,30}", value):
@@ -254,6 +272,11 @@ def load_settings() -> Settings:
             news_min_score=_int_in("NEWS_MIN_SCORE", 7, 1, 10, "points"),
             news_contact_email=_env("NEWS_CONTACT_EMAIL"),
             news_telegram_channels=_channels(),
+            music_chat_ids=_parse_ids(_env("MUSIC_CHAT_IDS")),
+            music_day=_weekday(),
+            music_time=_parse_time("MUSIC_TIME", "19:00"),
+            music_max_listeners=_int_in("MUSIC_MAX_LISTENERS", 300_000, 0, 1_000_000_000, "listeners"),
+            lastfm_api_key=_env("LASTFM_API_KEY"),
             reaction_chat_ids=_parse_ids(_env("REACTION_CHAT_IDS")),
             address_window_min=_int_in("ADDRESS_WINDOW_MIN", 5, 1, 60, "minutes"),
             address_context=_int_in("ADDRESS_CONTEXT", 4, 0, 20, "messages"),

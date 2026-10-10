@@ -45,6 +45,7 @@ log = logging.getLogger("nestor.answerer")
 ANONYMOUS_ADMIN_ID = 1087968824  # GroupAnonymousBot: an admin posting as the group (one of forget.SHARED_IDS)
 STATUS_STALE_AFTER = timedelta(minutes=15)     # the watchdog runs every 5 minutes
 _OFF = ("off", "выкл", "0", "нет", "no")
+MUSIC_NOW_EVERY_S = 3600        # /music now: once an hour per group
 _ORDER = itertools.count()      # orders requests and /forget_me commands (Answerer._overtaken)
 _ON = ("on", "вкл", "да", "yes")
 _DIGEST_DAYS = re.compile(r"(\d+)(?:\s*(?:д|дн|день|дня|дней))?")       # /digest 30, /digest 7 дней
@@ -108,6 +109,9 @@ class AnswerConfig:
     news_time: dtime = dtime(20, 0)
     news_max_topics: int = 2
     news_min_score: int = 7             # significance 1-10 a story needs to make the digest
+    music_chat_ids: frozenset[int] = frozenset()     # rising artists on by default; /music on|off overrides
+    music_day: int = 4                  # weekday of the rising artists post, 0 Monday
+    music_time: dtime = dtime(19, 0)
     reaction_chat_ids: frozenset[int] = frozenset()  # reactions on by default; /reactions on|off overrides
     reactions: reactions.ReactionConfig = reactions.ReactionConfig()
     address: addressing.AddressConfig = field(default_factory=addressing.AddressConfig)   # /address, off by default
@@ -178,6 +182,8 @@ class Answerer:
         self.router = routing.Router({"group": llm, "deep": deep_llm, "web": web_llm, "smart": smart_llm,
                                       "news": news_llm}, routes)
         self.news = news                # nestor.news.service.NewsService, None without the news digest
+        self.trends = None              # nestor.trends.service.TrendsService, None without /music
+        self._music_asked: dict[int, float] = {}    # chat_id -> monotonic time of its last /music now
         self.checker = checker or music.HttpChecker()
         self.save_outgoing = save_outgoing
         self.reactor = reactions.Reactor(bot, pool, lambda: self.router.llm("react"), wanted=self._reactions_wanted,
@@ -330,9 +336,13 @@ class Answerer:
             await self._unremind(msg, inv.args)
         elif cmd == "status":
             await self._status(msg)
-        elif cmd in ("pause", "resume", "bot_word", "digest", "wisdom", "news", "reactions", "address", "chime"):
+        elif cmd in ("pause", "resume", "bot_word", "digest", "wisdom", "news", "reactions", "address", "chime",
+                     "music"):
             if not await self._is_admin(msg):
                 await self._say(msg, prompts.ADMINS_ONLY)
+                return
+            if cmd == "music":
+                await self._music_command(msg, inv.args)
                 return
             if cmd == "news" and inv.args.strip().lower() in ("status", "статус"):
                 await self._say(msg, await self._news_status())
@@ -399,6 +409,12 @@ class Answerer:
             on = self._news_on(chat_id, settings)
             text = prompts.NEWS_STATE.format(state="включена" if on else "выключена",
                                              time=self.cfg.news_time.strftime("%H:%M"), topics=self.cfg.news_max_topics)
+        elif key == "music":
+            on = self._music_on(chat_id, settings)
+            lastfm = ", Last.fm" if self.trends is not None and self.trends.lastfm_key else ""
+            text = prompts.MUSIC_TRENDS_STATE.format(state="включены" if on else "выключены",
+                                                     when=prompts.MUSIC_DAYS[self.cfg.music_day],
+                                                     time=self.cfg.music_time.strftime("%H:%M"), lastfm=lastfm)
         elif key == "reactions":
             on = self._reactions_on(chat_id, settings)
             text = prompts.REACTIONS_STATE.format(state="включены" if on else "выключены",
@@ -429,6 +445,10 @@ class Answerer:
         value = (settings or {}).get("news")
         return bool(value) if value is not None else chat_id in self.cfg.news_chat_ids
 
+    def _music_on(self, chat_id: int, settings: dict) -> bool:
+        value = (settings or {}).get("music")
+        return bool(value) if value is not None else chat_id in self.cfg.music_chat_ids
+
     def _reactions_on(self, chat_id: int, settings: dict) -> bool:
         value = (settings or {}).get("reactions")
         return bool(value) if value is not None else chat_id in self.cfg.reaction_chat_ids
@@ -449,6 +469,8 @@ class Answerer:
             return bool((settings or {}).get("digest"))
         if kind == "wisdom":
             return self._wisdom_on(chat_id, settings)
+        if kind == "music":
+            return self.trends is not None and self._music_on(chat_id, settings)
         return self.news is not None and self._news_on(chat_id, settings)
 
     async def _still_wanted(self, conn, chat_id: int, kind: str) -> bool:
@@ -1265,10 +1287,12 @@ class Answerer:
             chats = await conn.fetch(
                 "SELECT chat_id, settings FROM chats WHERE enabled AND migrated_to_chat_id IS NULL "
                 "AND chat_id = ANY($1::bigint[])", list(self.cfg.allowed_chat_ids))
+            posts = [("digest", self.cfg.digest_time), ("wisdom", self.cfg.wisdom_time), ("news", self.cfg.news_time)]
+            if local.weekday() == self.cfg.music_day:
+                posts.append(("music", self.cfg.music_time))
             for chat in chats:
                 chat_id, settings = chat["chat_id"], chat["settings"] or {}
-                for kind, when in (("digest", self.cfg.digest_time), ("wisdom", self.cfg.wisdom_time),
-                                   ("news", self.cfg.news_time)):
+                for kind, when in posts:
                     if not self._post_on(chat_id, kind, settings) or local.time() < when:
                         continue
                     if kind == "digest" and not await daily.digest_due(conn, chat_id, local.date(),
@@ -1284,7 +1308,7 @@ class Answerer:
                                       functools.partial(self._daily_post, chat_id, kind, local.date(), post_id))
 
     async def _daily_post(self, chat_id: int, kind: str, day: date, post_id: int) -> None:
-        make = {"digest": self._digest, "wisdom": self._wisdom, "news": self._news}[kind]
+        make = {"digest": self._digest, "wisdom": self._wisdom, "news": self._news, "music": self._music_post}[kind]
         try:
             try:
                 async with self.pool.acquire() as conn:
@@ -1551,6 +1575,119 @@ class Answerer:
         if quiet:
             lines.append(prompts.NEWS_STATUS_QUIET)
         return "\n".join(lines[:1] + [html.escape(line) for line in lines[1:]])
+
+    # ---- rising Russian artists (nestor.trends, /music) ----
+
+    async def _music_command(self, msg: dict, args: str) -> None:
+        """/music on|off|now|status|known <name>; without an argument shows the current state."""
+        word, _, rest = args.strip().partition(" ")
+        word = word.lower()
+        if word in ("status", "статус"):
+            await self._say(msg, await self._music_status())
+        elif word in ("now", "сейчас"):
+            await self._music_now(msg)
+        elif word in ("known", "известен", "известна", "известны"):
+            name = rest.strip()[:100]
+            if not name:
+                await self._say(msg, prompts.MUSIC_TRENDS_USAGE)
+                return
+            from ..trends import store as trends_store
+
+            async with self.pool.acquire() as conn:
+                stored = await trends_store.mark_known(conn, name)
+            await self._say(msg, prompts.MUSIC_TRENDS_KNOWN.format(name=html.escape(stored)) if stored
+                            else prompts.MUSIC_TRENDS_USAGE)
+        elif word in ("", *_ON, *_OFF):
+            await self._toggle(msg, "music", word)
+        else:
+            await self._say(msg, prompts.MUSIC_TRENDS_USAGE)
+
+    async def _recommend(self, day: date, *, force: bool):
+        return await self.trends.recommend(
+            day, check_llm=self.router.llm("music_check"), write_llm=self.router.llm("music_trends"),
+            checker=self.checker, player=music.player_link(self.me.username, self.cfg.music_player_app),
+            timeout_s=self._timeout("music_trends"), force=force)
+
+    async def _music_now(self, msg: dict) -> None:
+        """/music now: a search right away, at most once an hour per group, in the group's queue of posts."""
+        chat_id = msg["chat"]["id"]
+        if self.trends is None or self.router.llm("music_trends") is None:
+            await self._say(msg, prompts.MUSIC_TRENDS_OFF)
+            return
+        last = self._music_asked.get(chat_id)
+        wait = MUSIC_NOW_EVERY_S - (time.monotonic() - last) if last is not None else 0
+        if wait > 0:
+            await self._say(msg, prompts.MUSIC_TRENDS_TOO_SOON.format(minutes=max(1, round(wait / 60))))
+            return
+        self._music_asked[chat_id] = time.monotonic()
+        await self._say(msg, prompts.MUSIC_TRENDS_SEARCHING)
+        self._enqueue(_posts(chat_id), functools.partial(self._music_now_run, msg))
+
+    async def _music_now_run(self, msg: dict) -> None:
+        from ..trends.service import NotEnoughMusic
+
+        chat_id = msg["chat"]["id"]
+        try:
+            post = await self._recommend(datetime.now(UTC).astimezone(self.cfg.tz).date(), force=True)
+        except NotEnoughMusic:
+            self._music_asked.pop(chat_id, None)
+            await self._say(msg, prompts.MUSIC_TRENDS_WAIT)
+            return
+        except Exception as e:  # noqa: BLE001 - Hermes down or timed out: say so, the next try may work
+            log.warning("music search failed", extra={"chat_id": chat_id, "error": type(e).__name__})
+            self._music_asked.pop(chat_id, None)
+            await self._say(msg, prompts.ERROR)
+            return
+        if post is None:
+            self._music_asked.pop(chat_id, None)
+            await self._say(msg, prompts.MUSIC_TRENDS_LIMIT)
+        elif not post.html:
+            await self._say(msg, prompts.MUSIC_TRENDS_NONE)
+        else:
+            await self._send(chat_id, post.html, reply_to=msg["message_id"], html=True, preview_url=post.preview_url,
+                             keyboard=post.keyboard, plain=post.plain)
+
+    async def _music_post(self, chat_id: int, day: date) -> tuple[str, dict]:
+        """The weekly post: made once a day from the charts (nestor.trends), the same for every group."""
+        if self.trends is None or self.router.llm("music_trends") is None or not await self._bot_is_member(chat_id):
+            return "skipped", {}
+        from ..trends.service import NotEnoughMusic
+
+        try:
+            post = await self._recommend(day, force=False)
+        except NotEnoughMusic:      # no chart read yet: a later tick tries again
+            return "waiting", {}
+        if post is None or not post.html:     # the token limit, or nobody new this week
+            return "skipped", {}
+        sent = await self._send(chat_id, post.html, html=True, preview_url=post.preview_url, keyboard=post.keyboard,
+                                plain=post.plain)
+        if sent is None:
+            return "failed", {}
+        return "posted", {"message_id": sent.message_id}
+
+    async def music_wanted(self) -> bool:
+        """Whether any group gets the weekly post: until then no chart is read."""
+        async with self.pool.acquire() as conn:
+            chats = await conn.fetch(
+                "SELECT chat_id, settings FROM chats WHERE enabled AND migrated_to_chat_id IS NULL "
+                "AND chat_id = ANY($1::bigint[])", list(self.cfg.allowed_chat_ids))
+        return any(self._music_on(c["chat_id"], c["settings"] or {}) for c in chats)
+
+    async def _music_status(self) -> str:
+        """/music status: when each chart was read, its size and status."""
+        if self.trends is None:
+            return prompts.MUSIC_TRENDS_OFF
+        async with self.pool.acquire() as conn:
+            charts, counts = await self.trends.status(conn)
+        lines = []
+        for chart, st in charts:
+            if st is None or st["last_run_at"] is None:
+                lines.append(f"{chart.name}: {prompts.MUSIC_STATUS_NEVER}")
+                continue
+            when = st["last_run_at"].astimezone(self.cfg.tz).strftime("%d.%m %H:%M")
+            lines.append(f"{chart.name}: {when}, {st['size'] or 0}, {st['status']}")
+        return "\n".join([prompts.MUSIC_STATUS_HEADER, *(html.escape(line) for line in lines),
+                          prompts.MUSIC_STATUS_FOOTER.format(**dict(counts))])
 
     # ---- the bot's own remarks (nestor.bot.chime) ----
 
