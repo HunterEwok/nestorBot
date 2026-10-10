@@ -1104,7 +1104,7 @@ async def test_restore_into_a_fresh_database_replays_optouts_and_purges(
         assert await db.fetchval("SELECT answer FROM bot_requests") is None   # the answer that quoted X is scrubbed
         assert await db.fetchval("SELECT count(*) FROM messages WHERE message_id = 900") == 0
         assert await db.fetchval("SELECT count(*) FROM messages WHERE message_id = 4") == 0   # outlived 12 months
-        assert await db.fetchval("SELECT count(*) FROM schema_migrations") == 8
+        assert await db.fetchval("SELECT count(*) FROM schema_migrations") == 9
         # What the dump held is still there, as the owner sees it, and the reader's views came along.
         assert await db.fetchval("SELECT count(*) FROM reader.messages") == 3
     finally:
