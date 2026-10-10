@@ -7,6 +7,7 @@ Shazam endpoints, from what they returned when this was written: check them on t
 from __future__ import annotations
 
 import csv
+import html
 import io
 import re
 import unicodedata
@@ -27,6 +28,12 @@ class Entry:
     shift: int | None = None    # places gained since the chart's previous edition, when it says so
     is_new: bool = False        # a new entry, or a fresh release
     url: str | None = None
+
+
+@dataclass(frozen=True)
+class Options:
+    lastfm_key: str = ""        # LASTFM_API_KEY
+    yandex_proxy: str = ""      # MUSIC_YANDEX_PROXY: Yandex serves its chart only to Russian addresses
 
 
 @dataclass(frozen=True)
@@ -58,7 +65,8 @@ def artist_key(artist: str) -> str:
 
 
 def _text(value: Any, limit: int = 200) -> str:
-    return re.sub(r"\s+", " ", value).strip()[:limit] if isinstance(value, str) else ""
+    """Apple's feed and Shazam's CSV send names HTML-escaped («Xcho &amp; МОТ»)."""
+    return re.sub(r"\s+", " ", html.unescape(value)).strip()[:limit] if isinstance(value, str) else ""
 
 
 def _fresh(released: Any, today: date) -> bool:
@@ -76,7 +84,7 @@ def _entry(position: Any, artist: Any, title: Any, **kw) -> Entry | None:
     return Entry(position, artist, title, **kw)
 
 
-async def apple(http: Http, now: datetime, key: str = "") -> list[Entry]:
+async def apple(http: Http, now: datetime, opts: Options = Options()) -> list[Entry]:
     """Apple's marketing feed of the most played songs in the Russian storefront: no shifts, release dates."""
     data = (await http.get("https://rss.marketingtools.apple.com/api/v2/ru/music/most-played/100/songs.json")).json()
     results = (data.get("feed") or {}).get("results")
@@ -88,11 +96,11 @@ async def apple(http: Http, now: datetime, key: str = "") -> list[Entry]:
     return [e for e in out if e]
 
 
-async def yandex(http: Http, now: datetime, key: str = "") -> list[Entry]:
+async def yandex(http: Http, now: datetime, opts: Options = Options()) -> list[Entry]:
     """The chart of Russia from Yandex Music's own app API (unofficial, no token): position, the move since
     the previous chart (progress up/down/same/new and shift) and the track id."""
     data = (await http.get("https://api.music.yandex.net/landing3/chart/russia",
-                           headers={"Accept": "application/json"})).json()
+                           headers={"Accept": "application/json"}, proxy=opts.yandex_proxy or None)).json()
     tracks = (((data.get("result") or {}).get("chart") or {}).get("tracks"))
     if not isinstance(tracks, list):
         raise ValueError("no result.chart.tracks")
@@ -112,7 +120,7 @@ async def yandex(http: Http, now: datetime, key: str = "") -> list[Entry]:
     return out
 
 
-async def shazam(http: Http, now: datetime, key: str = "") -> list[Entry]:
+async def shazam(http: Http, now: datetime, opts: Options = Options()) -> list[Entry]:
     """Shazam's top 200 of Russia as the CSV its chart page offers for download: rank, artist, title.
     A few lines of title come before the table."""
     text = (await http.get("https://www.shazam.com/services/charts/csv/top-200/russia")).text()
@@ -130,12 +138,12 @@ async def shazam(http: Http, now: datetime, key: str = "") -> list[Entry]:
 LASTFM = "https://ws.audioscrobbler.com/2.0/"
 
 
-async def lastfm(http: Http, now: datetime, key: str = "") -> list[Entry]:
+async def lastfm(http: Http, now: datetime, opts: Options = Options()) -> list[Entry]:
     """Last.fm's weekly top tracks of Russia (geo.getTopTracks), with an API key."""
-    if not key:
+    if not opts.lastfm_key:
         raise ValueError("LASTFM_API_KEY is not set")
     data = (await http.get(LASTFM, params={"method": "geo.gettoptracks", "country": "Russian Federation",
-                                           "limit": 100, "api_key": key, "format": "json"})).json()
+                                           "limit": 100, "api_key": opts.lastfm_key, "format": "json"})).json()
     tracks = ((data.get("tracks") or {}).get("track"))
     if not isinstance(tracks, list):
         raise ValueError(f"no tracks.track: {_text(data.get('message'), 80)}")
@@ -157,6 +165,6 @@ async def lastfm_listeners(http: Http, key: str, artist: str) -> int | None:
     return int(value) if str(value or "").isdigit() else None
 
 
-ADAPTERS: dict[str, Callable[[Http, datetime, str], Awaitable[list[Entry]]]] = {
+ADAPTERS: dict[str, Callable[[Http, datetime, Options], Awaitable[list[Entry]]]] = {
     "apple": apple, "yandex": yandex, "shazam": shazam, "lastfm": lastfm,
 }

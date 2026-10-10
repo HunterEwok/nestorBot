@@ -3,7 +3,7 @@
     .venv/bin/python -m nestor.trends --check              # every chart: answered or not, size, top 3
     .venv/bin/python -m nestor.trends --check -v yandex_ru # every entry with its move and marks
 
-Reads LASTFM_API_KEY and NEWS_CONTACT_EMAIL from .env; without the key the Last.fm chart is skipped.
+Reads LASTFM_API_KEY, MUSIC_YANDEX_PROXY and NEWS_CONTACT_EMAIL from .env; without the key the Last.fm chart is skipped.
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 from ..news.http import Http, HttpError
-from .sources import ADAPTERS, CHARTS, Entry, artist_key
+from .sources import ADAPTERS, CHARTS, Entry, Options, artist_key
 
 
 def _line(e: Entry) -> str:
@@ -26,6 +26,7 @@ def _line(e: Entry) -> str:
 
 async def check(keys: list[str], verbose: bool = False) -> int:
     key = os.environ.get("LASTFM_API_KEY", "").strip()
+    opts = Options(key, os.environ.get("MUSIC_YANDEX_PROXY", "").strip())
     charts = [c for c in CHARTS if not keys or c.key in keys]
     unknown = set(keys) - {c.key for c in charts}
     if unknown:
@@ -40,9 +41,11 @@ async def check(keys: list[str], verbose: bool = False) -> int:
                 print(f"– {chart.key}: пропущен, нет LASTFM_API_KEY")
                 continue
             try:
-                entries = await asyncio.wait_for(ADAPTERS[chart.kind](http, now, key), 120)
+                entries = await asyncio.wait_for(ADAPTERS[chart.kind](http, now, opts), 120)
             except HttpError as e:
-                print(f"✗ {chart.key}: HTTP {e.status}")
+                why = {451: " (сервис не отдаёт чарт из этой страны; поможет MUSIC_YANDEX_PROXY с российским адресом)",
+                       403: " (сервис отказал)"}.get(e.status, "")
+                print(f"✗ {chart.key}: HTTP {e.status}{why}")
                 failed += 1
                 continue
             except Exception as e:  # noqa: BLE001 - report and go on with the next chart

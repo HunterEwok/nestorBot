@@ -25,7 +25,8 @@ NAMES = ("ALLOWED_CHAT_IDS", "MODEL_ROUTES", "MUSIC_DAILY_LIMIT", "MUSIC_PLAYER_
          "RETENTION_TIME", "ALERT_CHAT_ID", "ALERT_DAILY_AT", "ALERT_QUIET", "ALERT_DISK_MIN_GB", "ALERT_MAX_MEMBERS",
          "BACKUP_STATUS_FILE", "ADDRESS_WINDOW_MIN", "ADDRESS_CONTEXT", "ADDRESS_DAILY_CHECKS", "CHIME_HOURS",
          "CHIME_MIN_MESSAGES", "CHIME_WINDOW", "CHIME_DAILY", "OWNER_IDS", "NEWS_MIN_SCORE",
-         "MUSIC_CHAT_IDS", "MUSIC_DAY", "MUSIC_TIME", "MUSIC_MAX_LISTENERS", "LASTFM_API_KEY")
+         "MUSIC_CHAT_IDS", "MUSIC_DAY", "MUSIC_TIME", "MUSIC_MAX_LISTENERS", "LASTFM_API_KEY",
+         "MUSIC_YANDEX_PROXY")
 
 
 @pytest.fixture
@@ -87,6 +88,13 @@ def test_music(env):
     env.setenv("MUSIC_DAY", "пятница")
     with pytest.raises(SystemExit, match="MUSIC_DAY must be one of mon, tue"):
         config.load_settings()
+    env.setenv("MUSIC_DAY", "fri")
+    env.setenv("MUSIC_YANDEX_PROXY", "http://user:secret@ru.example:3128")
+    assert config.load_settings().music_yandex_proxy == "http://user:secret@ru.example:3128"
+    env.setenv("MUSIC_YANDEX_PROXY", "socks5://user:secret@ru.example:1080")
+    with pytest.raises(SystemExit) as e:
+        config.load_settings()
+    assert "secret" not in str(e.value)
 
 
 def test_digest_every_days(env):

@@ -29,6 +29,8 @@ READ_TIMEOUT_S = 120
 HISTORY_DAYS = 28
 LISTENERS_AGE = timedelta(days=30)
 LISTENER_LOOKUPS = 15               # Last.fm artist.getInfo calls per recommendation
+REFUSED = frozenset({"http_401", "http_403", "http_451"})
+REFUSED_BACKOFF = timedelta(hours=24)
 TO_WRITE = 6                        # candidates the write-up model sees
 
 
@@ -55,10 +57,12 @@ def _post(row) -> Post:
 class TrendsService:
     def __init__(self, pool: asyncpg.Pool, *, is_wanted: Callable[[], Awaitable[bool]], tz: ZoneInfo,
                  daily_token_limit: int, lastfm_key: str = "", max_listeners: int = 0, contact: str = "",
+                 yandex_proxy: str = "",
                  http_factory: Callable[[str], Http] = Http, adapters=sources.ADAPTERS,
                  charts: tuple[sources.Chart, ...] = sources.CHARTS, tick_s: float = 900):
         self.pool, self.is_wanted, self.tz, self.daily_token_limit = pool, is_wanted, tz, daily_token_limit
         self.lastfm_key, self.max_listeners, self.contact = lastfm_key, max_listeners, contact
+        self.opts = sources.Options(lastfm_key, yandex_proxy)
         self.http_factory, self.adapters, self.tick_s = http_factory, adapters, tick_s
         self.charts = tuple(c for c in charts if not c.needs_key or lastfm_key)
         self._lock = asyncio.Lock()         # one read of the charts at a time
@@ -107,7 +111,7 @@ class TrendsService:
 
     async def _read(self, http, chart: sources.Chart, failures: int, now: datetime) -> str:
         try:
-            entries = await asyncio.wait_for(self.adapters[chart.kind](http, now, self.lastfm_key), READ_TIMEOUT_S)
+            entries = await asyncio.wait_for(self.adapters[chart.kind](http, now, self.opts), READ_TIMEOUT_S)
             status = "ok" if entries else "empty"
         except HttpError as e:
             entries, status = [], f"http_{e.status}"
@@ -123,6 +127,8 @@ class TrendsService:
                 await store.save_run(conn, chart.key, now, status=status, day=self._today(now), size=len(entries))
             else:
                 backoff = min(timedelta(minutes=15 * 2 ** min(failures, 5)), timedelta(hours=6))
+                if status in REFUSED:      # the service will not serve us (Yandex outside Russia: 451)
+                    backoff = REFUSED_BACKOFF
                 await store.save_run(conn, chart.key, now, status=status, next_run_at=now + backoff)
         log.log(logging.INFO if entries else logging.WARNING, "music chart read",
                 extra={"source": chart.key, "status": status, "entries": len(entries)})
