@@ -120,10 +120,11 @@ class TrendsService:
                 retry = False       # however often /music now is asked, a refusing source sees it once an hour
             async with self.pool.acquire() as conn:
                 states = await store.states(conn)
-            if retry:
-                self._forced_at = time.monotonic()
+            forced = retry
             retry, self._retried = retry or not self._retried, True   # only once the states are known
             todo = [c for c in self.charts if self.due(states.get(c.key), now, retry)]
+            if forced and any(not self.due(states.get(c.key), now) for c in todo):
+                self._forced_at = time.monotonic()      # only when it read a chart that was waiting out a pause
             if not todo:
                 return {}
             async with self.http_factory(self.contact) as http:

@@ -293,6 +293,11 @@ async def test_a_restart_and_music_now_retry_a_refused_chart(pool, conn):
                                                                                "shazam_msk": "empty"}
     # Asked again soon, from this or another group: the pauses hold.
     assert await restarted.collect(NOW + timedelta(minutes=11), retry=True) == {}
+    # A forced read with nothing waiting does not use up the hour: the next one still may retry.
+    every = rising_yandex()
+    fresh = make_trends(pool, Charts(yandex=every, apple=every, shazam=every, shazam_msk=every))
+    await fresh.collect(NOW + timedelta(minutes=12))
+    assert await fresh.collect(NOW + timedelta(minutes=12), retry=True) == {} and fresh._forced_at is None
 
 
 async def test_the_song_of_the_day_is_written_kept_and_not_repeated(pool, conn):

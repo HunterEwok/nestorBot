@@ -12,6 +12,7 @@ any other request.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import hashlib
 import html
@@ -1620,30 +1621,30 @@ class Answerer:
             return
         asked.append(now)
         await self._say(msg, prompts.MUSIC_TRENDS_SEARCHING)
-        self._enqueue(_posts(chat_id), functools.partial(self._music_now_run, msg))
+        self._enqueue(_posts(chat_id), functools.partial(self._music_now_run, msg, now))
 
-    def _forget_music_ask(self, chat_id: int) -> None:
+    def _forget_music_ask(self, chat_id: int, asked_at: float) -> None:
         """A search that found nothing for a reason of ours does not count towards the hour's limit."""
-        if self._music_asked.get(chat_id):
-            self._music_asked[chat_id].pop()
+        with contextlib.suppress(KeyError, ValueError):
+            self._music_asked[chat_id].remove(asked_at)
 
-    async def _music_now_run(self, msg: dict) -> None:
+    async def _music_now_run(self, msg: dict, asked_at: float) -> None:
         from ..trends.service import NotEnoughMusic
 
         chat_id = msg["chat"]["id"]
         try:
             post = await self._recommend(datetime.now(UTC).astimezone(self.cfg.tz).date(), force=True)
         except NotEnoughMusic:
-            self._forget_music_ask(chat_id)
+            self._forget_music_ask(chat_id, asked_at)
             await self._say(msg, prompts.MUSIC_TRENDS_WAIT)
             return
         except Exception as e:  # noqa: BLE001 - Hermes down or timed out: say so, the next try may work
             log.warning("music search failed", extra={"chat_id": chat_id, "error": type(e).__name__})
-            self._forget_music_ask(chat_id)
+            self._forget_music_ask(chat_id, asked_at)
             await self._say(msg, prompts.ERROR)
             return
         if post is None:
-            self._forget_music_ask(chat_id)
+            self._forget_music_ask(chat_id, asked_at)
             await self._say(msg, prompts.MUSIC_TRENDS_LIMIT)
         elif not post.html:
             await self._say(msg, prompts.MUSIC_TRENDS_NONE)
