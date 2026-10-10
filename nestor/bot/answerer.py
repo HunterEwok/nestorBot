@@ -45,7 +45,7 @@ log = logging.getLogger("nestor.answerer")
 ANONYMOUS_ADMIN_ID = 1087968824  # GroupAnonymousBot: an admin posting as the group (one of forget.SHARED_IDS)
 STATUS_STALE_AFTER = timedelta(minutes=15)     # the watchdog runs every 5 minutes
 _OFF = ("off", "выкл", "0", "нет", "no")
-MUSIC_NOW_EVERY_S = 3600        # /music now: once an hour per group
+MUSIC_NOW_PER_HOUR = 10         # /music now: this many searches per group in any hour
 _ORDER = itertools.count()      # orders requests and /forget_me commands (Answerer._overtaken)
 _ON = ("on", "вкл", "да", "yes")
 _DIGEST_DAYS = re.compile(r"(\d+)(?:\s*(?:д|дн|день|дня|дней))?")       # /digest 30, /digest 7 дней
@@ -183,7 +183,7 @@ class Answerer:
                                       "news": news_llm}, routes)
         self.news = news                # nestor.news.service.NewsService, None without the news digest
         self.trends = None              # nestor.trends.service.TrendsService, None without /music
-        self._music_asked: dict[int, float] = {}    # chat_id -> monotonic time of its last /music now
+        self._music_asked: dict[int, list[float]] = {}  # chat_id -> monotonic times of its /music now, last hour
         self.checker = checker or music.HttpChecker()
         self.save_outgoing = save_outgoing
         self.reactor = reactions.Reactor(bot, pool, lambda: self.router.llm("react"), wanted=self._reactions_wanted,
@@ -1609,19 +1609,26 @@ class Answerer:
             timeout_s=self._timeout("music_trends"), force=force)
 
     async def _music_now(self, msg: dict) -> None:
-        """/music now: a search right away, at most once an hour per group, in the group's queue of posts."""
+        """/music now: a search right away, MUSIC_NOW_PER_HOUR an hour per group, in the group's queue of posts."""
         chat_id = msg["chat"]["id"]
         if self.trends is None or self.router.llm("music_trends") is None:
             await self._say(msg, prompts.MUSIC_TRENDS_OFF)
             return
-        last = self._music_asked.get(chat_id)
-        wait = MUSIC_NOW_EVERY_S - (time.monotonic() - last) if last is not None else 0
-        if wait > 0:
-            await self._say(msg, prompts.MUSIC_TRENDS_TOO_SOON.format(minutes=max(1, round(wait / 60))))
+        now = time.monotonic()
+        asked = self._music_asked[chat_id] = [t for t in self._music_asked.get(chat_id, []) if now - t < 3600]
+        if len(asked) >= MUSIC_NOW_PER_HOUR:
+            wait = 3600 - (now - asked[0])
+            await self._say(msg, prompts.MUSIC_TRENDS_TOO_SOON.format(
+                times=MUSIC_NOW_PER_HOUR, minutes=max(1, round(wait / 60))))
             return
-        self._music_asked[chat_id] = time.monotonic()
+        asked.append(now)
         await self._say(msg, prompts.MUSIC_TRENDS_SEARCHING)
         self._enqueue(_posts(chat_id), functools.partial(self._music_now_run, msg))
+
+    def _forget_music_ask(self, chat_id: int) -> None:
+        """A search that found nothing for a reason of ours does not count towards the hour's limit."""
+        if self._music_asked.get(chat_id):
+            self._music_asked[chat_id].pop()
 
     async def _music_now_run(self, msg: dict) -> None:
         from ..trends.service import NotEnoughMusic
@@ -1630,16 +1637,16 @@ class Answerer:
         try:
             post = await self._recommend(datetime.now(UTC).astimezone(self.cfg.tz).date(), force=True)
         except NotEnoughMusic:
-            self._music_asked.pop(chat_id, None)
+            self._forget_music_ask(chat_id)
             await self._say(msg, prompts.MUSIC_TRENDS_WAIT)
             return
         except Exception as e:  # noqa: BLE001 - Hermes down or timed out: say so, the next try may work
             log.warning("music search failed", extra={"chat_id": chat_id, "error": type(e).__name__})
-            self._music_asked.pop(chat_id, None)
+            self._forget_music_ask(chat_id)
             await self._say(msg, prompts.ERROR)
             return
         if post is None:
-            self._music_asked.pop(chat_id, None)
+            self._forget_music_ask(chat_id)
             await self._say(msg, prompts.MUSIC_TRENDS_LIMIT)
         elif not post.html:
             await self._say(msg, prompts.MUSIC_TRENDS_NONE)
