@@ -57,7 +57,7 @@ async def pool(database):
     async with pool.acquire() as conn:
         await conn.execute("TRUNCATE chats, users, messages, message_edits, bot_requests, reminders, daily_posts, "
                            "request_tickets, news_sources, news_items, news_digests, music_sources, music_snapshots, "
-                           "music_artists, music_posts, maintenance_runs, "
+                           "music_artists, music_posts, music_picks, maintenance_runs, "
                            "retention_marks, ops_state CASCADE")
     yield pool
     await pool.close()

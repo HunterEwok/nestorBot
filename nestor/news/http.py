@@ -29,6 +29,7 @@ HOST_PAUSE_S = {
     "www.ebi.ac.uk": 1.0,
     "arctic-shift.photon-reddit.com": 1.5,
     "t.me": 2.0,
+    "web.archive.org": 1.5,     # the Wayback Machine asks for gentle crawling
 }
 
 

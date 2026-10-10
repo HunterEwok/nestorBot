@@ -230,7 +230,7 @@ async def make_answerer(settings: Settings, bot: Bot, pool: asyncpg.Pool, collec
                        wisdom_time=settings.wisdom_time, news_chat_ids=settings.news_chat_ids,
                        news_time=settings.news_time, news_max_topics=settings.news_max_topics,
                        news_min_score=settings.news_min_score, music_chat_ids=settings.music_chat_ids,
-                       music_day=settings.music_day, music_time=settings.music_time,
+                       music_time=settings.music_time,
                        reaction_chat_ids=settings.reaction_chat_ids, alert_chat_id=alert_chat_id,
                        owner_ids=settings.owner_ids,
                        address=AddressConfig(window_min=settings.address_window_min,
@@ -256,7 +256,7 @@ async def make_answerer(settings: Settings, bot: Bot, pool: asyncpg.Pool, collec
     answerer = Answerer(bot, pool, llm, identity, lambda msg: collector.store(msg, is_edit=False), cfg, web_llm=web,
                         smart_llm=smart, checker=HttpChecker(), deep_llm=deep, news_llm=news_llm,
                         routes=settings.model_routes)
-    for task in ("theses", "news_triage", "news", "music_check", "music_trends", "react", "address", "chime"):
+    for task in ("theses", "news_triage", "news", "music_trends", "react", "address", "chime"):
         log.info("model route", extra={"task": task, "profile": answerer.router.profile(task)})
     from ..news.service import NewsService
     from ..news.sources import all_sources
@@ -269,7 +269,7 @@ async def make_answerer(settings: Settings, bot: Bot, pool: asyncpg.Pool, collec
 
     answerer.trends = TrendsService(pool, is_wanted=answerer.music_wanted, tz=cfg.tz,
                                     daily_token_limit=cfg.daily_token_limit, lastfm_key=settings.lastfm_api_key,
-                                    max_listeners=settings.music_max_listeners, contact=settings.news_contact_email,
+                                    contact=settings.news_contact_email,
                                     yandex_proxy=settings.music_yandex_proxy)
     return answerer
 

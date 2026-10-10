@@ -110,7 +110,6 @@ class AnswerConfig:
     news_max_topics: int = 2
     news_min_score: int = 7             # significance 1-10 a story needs to make the digest
     music_chat_ids: frozenset[int] = frozenset()     # rising artists on by default; /music on|off overrides
-    music_day: int = 4                  # weekday of the rising artists post, 0 Monday
     music_time: dtime = dtime(19, 0)
     reaction_chat_ids: frozenset[int] = frozenset()  # reactions on by default; /reactions on|off overrides
     reactions: reactions.ReactionConfig = reactions.ReactionConfig()
@@ -412,8 +411,7 @@ class Answerer:
         elif key == "music":
             on = self._music_on(chat_id, settings)
             lastfm = ", Last.fm" if self.trends is not None and self.trends.lastfm_key else ""
-            text = prompts.MUSIC_TRENDS_STATE.format(state="включены" if on else "выключены",
-                                                     when=prompts.MUSIC_DAYS[self.cfg.music_day],
+            text = prompts.MUSIC_TRENDS_STATE.format(state="включена" if on else "выключена",
                                                      time=self.cfg.music_time.strftime("%H:%M"), lastfm=lastfm)
         elif key == "reactions":
             on = self._reactions_on(chat_id, settings)
@@ -1288,8 +1286,7 @@ class Answerer:
                 "SELECT chat_id, settings FROM chats WHERE enabled AND migrated_to_chat_id IS NULL "
                 "AND (chat_id = ANY($1::bigint[]) OR migrated_from_chat_id = ANY($1::bigint[]))", list(self.cfg.allowed_chat_ids))
             posts = [("digest", self.cfg.digest_time), ("wisdom", self.cfg.wisdom_time), ("news", self.cfg.news_time)]
-            if local.weekday() == self.cfg.music_day:
-                posts.append(("music", self.cfg.music_time))
+            posts.append(("music", self.cfg.music_time))
             for chat in chats:
                 chat_id, settings = chat["chat_id"], chat["settings"] or {}
                 for kind, when in posts:
@@ -1604,7 +1601,7 @@ class Answerer:
 
     async def _recommend(self, day: date, *, force: bool):
         return await self.trends.recommend(
-            day, check_llm=self.router.llm("music_check"), write_llm=self.router.llm("music_trends"),
+            day, write_llm=self.router.llm("music_trends"),
             checker=self.checker, player=music.player_link(self.me.username, self.cfg.music_player_app),
             timeout_s=self._timeout("music_trends"), force=force)
 
@@ -1655,7 +1652,7 @@ class Answerer:
                              keyboard=post.keyboard, plain=post.plain)
 
     async def _music_post(self, chat_id: int, day: date) -> tuple[str, dict]:
-        """The weekly post: made once a day from the charts (nestor.trends), the same for every group."""
+        """The viral song of the day: made once a day from the charts (nestor.trends), the same for every group."""
         if self.trends is None or self.router.llm("music_trends") is None or not await self._bot_is_member(chat_id):
             return "skipped", {}
         from ..trends.service import NotEnoughMusic
@@ -1664,7 +1661,7 @@ class Answerer:
             post = await self._recommend(day, force=False)
         except NotEnoughMusic:      # no chart read yet: a later tick tries again
             return "waiting", {}
-        if post is None or not post.html:     # the token limit, or nobody new this week
+        if post is None or not post.html:     # the token limit, or no song went viral today
             return "skipped", {}
         sent = await self._send(chat_id, post.html, html=True, preview_url=post.preview_url, keyboard=post.keyboard,
                                 plain=post.plain)
@@ -1673,7 +1670,7 @@ class Answerer:
         return "posted", {"message_id": sent.message_id}
 
     async def music_wanted(self) -> bool:
-        """Whether any group gets the weekly post: until then no chart is read."""
+        """Whether any group gets the song of the day: until then no chart is read."""
         async with self.pool.acquire() as conn:
             chats = await conn.fetch(
                 "SELECT chat_id, settings FROM chats WHERE enabled AND migrated_to_chat_id IS NULL "

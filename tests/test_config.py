@@ -25,7 +25,7 @@ NAMES = ("ALLOWED_CHAT_IDS", "MODEL_ROUTES", "MUSIC_DAILY_LIMIT", "MUSIC_PLAYER_
          "RETENTION_TIME", "ALERT_CHAT_ID", "ALERT_DAILY_AT", "ALERT_QUIET", "ALERT_DISK_MIN_GB", "ALERT_MAX_MEMBERS",
          "BACKUP_STATUS_FILE", "ADDRESS_WINDOW_MIN", "ADDRESS_CONTEXT", "ADDRESS_DAILY_CHECKS", "CHIME_HOURS",
          "CHIME_MIN_MESSAGES", "CHIME_WINDOW", "CHIME_DAILY", "OWNER_IDS", "NEWS_MIN_SCORE",
-         "MUSIC_CHAT_IDS", "MUSIC_DAY", "MUSIC_TIME", "MUSIC_MAX_LISTENERS", "LASTFM_API_KEY",
+         "MUSIC_CHAT_IDS", "MUSIC_TIME", "LASTFM_API_KEY",
          "MUSIC_YANDEX_PROXY")
 
 
@@ -80,15 +80,10 @@ def test_owner_ids(env):
 
 def test_music(env):
     s = config.load_settings()
-    assert (s.music_chat_ids, s.music_day, s.music_time.hour, s.music_max_listeners, s.lastfm_api_key) == (
-        frozenset(), 4, 19, 300_000, "")
-    env.setenv("MUSIC_DAY", "Monday")
+    assert (s.music_chat_ids, s.music_time.hour, s.lastfm_api_key) == (frozenset(), 19, "")
     env.setenv("MUSIC_CHAT_IDS", "-100123")
-    assert (config.load_settings().music_day, config.load_settings().music_chat_ids) == (0, frozenset({-100123}))
-    env.setenv("MUSIC_DAY", "пятница")
-    with pytest.raises(SystemExit, match="MUSIC_DAY must be one of mon, tue"):
-        config.load_settings()
-    env.setenv("MUSIC_DAY", "fri")
+    env.setenv("MUSIC_DAY", "пятница")         # the weekly post's day: gone, an old .env still loads
+    assert config.load_settings().music_chat_ids == frozenset({-100123})
     env.setenv("MUSIC_YANDEX_PROXY", "http://user:secret@ru.example:3128")
     assert config.load_settings().music_yandex_proxy == "http://user:secret@ru.example:3128"
     for bad in ("socks5://user:secret@ru.example:1080", "http://user:secret@ru.example:not-a-port",

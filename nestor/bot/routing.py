@@ -42,8 +42,8 @@ TASKS: dict[str, tuple[tuple[str, ...], str]] = {
     "wisdom": (WEB, "smart"),
     "news_triage": (PUBLIC, "news"),     # one line per news item
     "news": (PUBLIC, "smart"),           # the evening news digest
-    "music_check": (PUBLIC, "news"),     # which of the charts' risers are Russian and not stars yet
-    "music_trends": (WEB, "smart"),      # the rising Russian artists and the best song (/music)
+    "music_check": (PUBLIC, "news"),     # unused since the viral song of the day; kept so old MODEL_ROUTES still load
+    "music_trends": (WEB, "smart"),      # the viral song of the day: why it spread, where to listen (/music)
     "react": (NO_WEB, "news"),           # reactions to emotional messages; no `news` profile: the code decides
     "address": (NO_WEB, "news"),         # is a doubtful message addressed to the bot; no `news` profile: not asked
     "chime": (NO_WEB, "news"),           # the bot's own remarks (/chime on); no `news` profile: none
