@@ -269,7 +269,8 @@ async def make_answerer(settings: Settings, bot: Bot, pool: asyncpg.Pool, collec
 
     answerer.trends = TrendsService(pool, is_wanted=answerer.music_wanted, tz=cfg.tz,
                                     daily_token_limit=cfg.daily_token_limit, lastfm_key=settings.lastfm_api_key,
-                                    max_listeners=settings.music_max_listeners, contact=settings.news_contact_email)
+                                    max_listeners=settings.music_max_listeners, contact=settings.news_contact_email,
+                                    yandex_proxy=settings.music_yandex_proxy)
     return answerer
 
 

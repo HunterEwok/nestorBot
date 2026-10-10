@@ -86,9 +86,11 @@ class Http:
             await self._session.close()
 
     async def get(self, url: str, *, params: Mapping[str, Any] | None = None,
-                  headers: Mapping[str, str] | None = None, curl_fallback: bool = False) -> Response:
+                  headers: Mapping[str, str] | None = None, curl_fallback: bool = False,
+                  proxy: str | None = None) -> Response:
+        """proxy: an http(s):// proxy for this request only (the Yandex chart from outside Russia)."""
         try:
-            return await self._request("GET", url, params=params, headers=headers)
+            return await self._request("GET", url, params=params, headers=headers, proxy=proxy or None)
         except HttpError as e:
             if not (curl_fallback and e.status == 403):
                 raise

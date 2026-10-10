@@ -28,7 +28,7 @@ async def test_apple_feed_marks_fresh_releases_and_keeps_only_its_own_links():
     body = {"feed": {"results": [
         {"artistName": "Новый Артист", "name": "Песня", "releaseDate": "2026-10-01",
          "url": "https://music.apple.com/ru/album/x/1?i=2"},
-        {"artistName": "Старый & Друг", "name": "Хит", "releaseDate": "2019-05-01", "url": "https://evil.example/x"},
+        {"artistName": "Старый &amp; Друг", "name": "Хит", "releaseDate": "2019-05-01", "url": "https://evil.example/x"},
         {"artistName": "", "name": "Без артиста"},
     ]}}
     http = FakeHttp([("GET", "marketingtools", json.dumps(body).encode())])
@@ -49,12 +49,17 @@ async def test_yandex_chart_gives_the_move_and_new_entries():
     assert [(e.position, e.artist, e.shift, e.is_new) for e in entries] == [
         (1, "Звезда", 0, False), (2, "Новичок, Гость", 40, False), (3, "Кто-то", -2, False), (4, "Дебют", None, True)]
     assert entries[1].url == "https://music.yandex.ru/track/99"
+    http = FakeHttp([("GET", "landing3", json.dumps(body).encode())])
+    await sources.yandex(http, NOW, sources.Options(yandex_proxy="http://u:p@ru.example:3128"))
+    assert http.calls[0]["proxy"] == "http://u:p@ru.example:3128"
 
 
 async def test_shazam_csv_skips_the_lines_before_the_table():
-    body = "Shazam Top 200 Russia\nDate,2026-10-09\n\nRank,Artist,Title\n1,Артист,Песня\n2,\"A, B\",Track\n"
+    body = "Shazam Top 200 Russia\nDate,2026-10-09\n\nRank,Artist,Title\n1,Артист,Песня\n2,\"A, B\",Track\n" \
+           "3,урал гайсин &amp; снялцепи,ты в моих мыслях\n"
     entries = await sources.shazam(FakeHttp([("GET", "csv/top-200/russia", body.encode())]), NOW)
-    assert [(e.position, e.artist, e.title) for e in entries] == [(1, "Артист", "Песня"), (2, "A, B", "Track")]
+    assert [(e.position, e.artist, e.title) for e in entries] == [
+        (1, "Артист", "Песня"), (2, "A, B", "Track"), (3, "урал гайсин & снялцепи", "ты в моих мыслях")]
 
 
 async def test_a_changed_format_is_an_error_of_that_chart():
@@ -71,10 +76,10 @@ async def test_lastfm_needs_its_key_and_reads_listeners():
     body = {"tracks": {"track": [{"name": "Песня", "artist": {"name": "Артист"}, "url": "https://www.last.fm/music/x"}]}}
     http = FakeHttp([("GET", "geo.gettoptracks", json.dumps(body).encode()),
                      ("GET", "artist.getinfo", b'{"artist": {"stats": {"listeners": "12345"}}}')])
-    assert [e.title for e in await sources.lastfm(http, NOW, "KEY")] == ["Песня"]
+    assert [e.title for e in await sources.lastfm(http, NOW, sources.Options(lastfm_key="KEY"))] == ["Песня"]
     assert await sources.lastfm_listeners(http, "KEY", "Артист") == 12345
     try:
-        await sources.lastfm(http, NOW, "")
+        await sources.lastfm(http, NOW)
     except ValueError:
         pass
     else:
@@ -222,7 +227,7 @@ class Charts:
 
     def adapters(self):
         def make(kind):
-            async def read(http, now, key=""):
+            async def read(http, now, opts=None):
                 self.calls.append(kind)
                 result = self.charts.get(kind, [])
                 if isinstance(result, Exception):
@@ -269,6 +274,12 @@ async def test_charts_are_read_once_a_day_and_a_failure_backs_off(pool, conn):
     assert set(await service.collect(NOW + timedelta(minutes=20))) == {"apple_ru", "shazam_ru"}
     states = await store.states(conn)
     assert states["apple_ru"]["failures"] == 2 and states["yandex_ru"]["last_ok_day"] == TODAY
+    # A chart that refuses us (Yandex outside Russia) is asked again only the next day.
+    charts.charts["shazam"] = HttpError(451, "x")
+    later = NOW + timedelta(hours=1)
+    assert (await service.collect(later))["shazam_ru"] == "http_451"
+    assert "shazam_ru" not in await service.collect(later + timedelta(hours=23))
+    assert (await store.states(conn))["shazam_ru"]["next_run_at"] == later + timedelta(hours=24)
     assert "lastfm" not in charts.calls       # no key, not read at all
 
 
@@ -450,3 +461,15 @@ async def test_weekly_post_reaches_a_group_that_moved_to_a_supergroup(make_env, 
     await feed.answerer.run_daily_posts(local(DAY, 19, 1))
     await feed.answerer.drain()
     assert bot.sent[-1]["chat_id"] == new_id and bot.sent[-1]["text"].startswith("🎧 <b>Восходящие")
+
+
+async def test_check_stops_on_a_bad_proxy_without_showing_it(monkeypatch, capsys):
+    from nestor.trends.__main__ import check
+    monkeypatch.setenv("MUSIC_YANDEX_PROXY", "http://user:s3cret@host:not-a-port")
+    try:
+        await check(["yandex_ru"])
+    except SystemExit as e:
+        assert "s3cret" not in str(e)
+    else:
+        raise AssertionError("a bad MUSIC_YANDEX_PROXY must stop --check")
+    assert "s3cret" not in capsys.readouterr().out

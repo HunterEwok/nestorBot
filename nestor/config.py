@@ -4,6 +4,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import time
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
@@ -57,6 +58,7 @@ class Settings:
     music_time: time = time(19, 0)
     music_max_listeners: int = 300_000   # Last.fm listeners above which an artist counts as known; 0: no limit
     lastfm_api_key: str = ""             # optional: the Last.fm chart and listener counts
+    music_yandex_proxy: str = ""         # optional: an http(s) proxy in Russia, for the Yandex chart only
     # Groups where the bot puts reactions on emotional messages; group admins switch it with /reactions on|off.
     reaction_chat_ids: frozenset[int] = frozenset()
     # Addressing in one's own words (/address on, nestor.bot.addressing): for this many minutes after
@@ -222,6 +224,22 @@ def _digest_every_days() -> int:
     return _int_in("DIGEST_EVERY_DAYS", 30, 1, DIGEST_MAX_DAYS, "days")
 
 
+def _proxy(name: str) -> str:
+    """An http:// or https:// proxy URL, or empty. Never echoed: it may carry a password."""
+    value = _env(name)
+    if not value:
+        return value
+    try:
+        url = urlsplit(value)
+        ok = (url.scheme in ("http", "https") and bool(url.hostname) and url.port is not None
+              and url.path in ("", "/") and not url.query and not url.fragment and not re.search(r"\s", value))
+    except ValueError:      # a port that is not a number
+        ok = False
+    if not ok:
+        raise SystemExit(f"{name} must look like http://user:password@host:port")
+    return value
+
+
 _WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
 
@@ -277,6 +295,7 @@ def load_settings() -> Settings:
             music_time=_parse_time("MUSIC_TIME", "19:00"),
             music_max_listeners=_int_in("MUSIC_MAX_LISTENERS", 300_000, 0, 1_000_000_000, "listeners"),
             lastfm_api_key=_env("LASTFM_API_KEY"),
+            music_yandex_proxy=_proxy("MUSIC_YANDEX_PROXY"),
             reaction_chat_ids=_parse_ids(_env("REACTION_CHAT_IDS")),
             address_window_min=_int_in("ADDRESS_WINDOW_MIN", 5, 1, 60, "minutes"),
             address_context=_int_in("ADDRESS_CONTEXT", 4, 0, 20, "messages"),

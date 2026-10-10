@@ -36,10 +36,11 @@ class FakeHttp:
         return None
 
     async def get(self, url: str, *, params: Mapping[str, Any] | None = None,
-                  headers: Mapping[str, str] | None = None, curl_fallback: bool = False) -> Response:
+                  headers: Mapping[str, str] | None = None, curl_fallback: bool = False,
+                  proxy: str | None = None) -> Response:
         full = url + (("&" if "?" in url else "?") + urlencode(params, doseq=True) if params else "")
         return self._answer({"method": "GET", "url": full, "params": dict(params or {}), "headers": headers,
-                             "curl_fallback": curl_fallback})
+                             "curl_fallback": curl_fallback, "proxy": proxy})
 
     async def post(self, url: str, *, data: Mapping[str, Any]) -> Response:
         return self._answer({"method": "POST", "url": url, "data": dict(data), "params": {}})
