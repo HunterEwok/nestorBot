@@ -37,7 +37,7 @@ ADMIN = (
     ("reactions", "реакции: on или off"),
     ("address", "обращения своими словами: on или off"),
     ("chime", "мои реплики: on или off"),
-    ("music", "восходящие артисты: on, off, now или status"),
+    ("music", "вирусная песня дня: on, off, now или status"),
 )
 PRIVATE = (
     ("export", "мои сообщения из архива файлом"),

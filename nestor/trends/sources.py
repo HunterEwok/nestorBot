@@ -48,6 +48,7 @@ CHARTS = (
     Chart("yandex_ru", "Яндекс Музыка, чарт России", "yandex"),
     Chart("apple_ru", "Apple Music, топ России", "apple"),
     Chart("shazam_ru", "Shazam, топ России", "shazam"),
+    Chart("shazam_msk", "Shazam, топ Москвы", "shazam_msk"),
     Chart("lastfm_ru", "Last.fm, топ России", "lastfm", needs_key=True),
 )
 
@@ -62,6 +63,18 @@ def main_artist(artist: str) -> str:
 def artist_key(artist: str) -> str:
     text = unicodedata.normalize("NFKC", main_artist(artist)).casefold().replace("ё", "е")
     return re.sub(r"[^\w]+", " ", text).strip()
+
+
+_BRACKETS = re.compile(r"\s*[(\[][^)\]]*[)\]]")
+_FEAT_TAIL = re.compile(r"\s+(?:feat\.?|ft\.?|featuring|prod\.?)\s.*$", re.I)
+
+
+def song_key(artist: str, title: str) -> str:
+    """One song across the charts: the main artist and the title without brackets, «feat.» and case.
+    «Песня (feat. Б)» in one chart and «Песня» in another are the same song."""
+    name = _FEAT_TAIL.sub("", _BRACKETS.sub("", title)).strip() or title
+    text = unicodedata.normalize("NFKC", name).casefold().replace("ё", "е")
+    return artist_key(artist) + "|" + re.sub(r"[^\w]+", " ", text).strip()
 
 
 def _text(value: Any, limit: int = 200) -> str:
@@ -84,13 +97,21 @@ def _entry(position: Any, artist: Any, title: Any, **kw) -> Entry | None:
     return Entry(position, artist, title, **kw)
 
 
+APPLE_URL = "https://rss.marketingtools.apple.com/api/v2/ru/music/most-played/100/songs.json"
+SHAZAM_URL = "https://www.shazam.com/services/charts/csv/top-200/russia"
+SHAZAM_MSK_URL = "https://www.shazam.com/services/charts/csv/top-50/russia/moscow"
+
+
 async def apple(http: Http, now: datetime, opts: Options = Options()) -> list[Entry]:
     """Apple's marketing feed of the most played songs in the Russian storefront: no shifts, release dates."""
-    data = (await http.get("https://rss.marketingtools.apple.com/api/v2/ru/music/most-played/100/songs.json")).json()
-    results = (data.get("feed") or {}).get("results")
+    return parse_apple((await http.get(APPLE_URL)).json(), now.date())
+
+
+def parse_apple(data: Any, today: date) -> list[Entry]:
+    results = ((data if isinstance(data, dict) else {}).get("feed") or {}).get("results")
     if not isinstance(results, list):
         raise ValueError("no feed.results")
-    out = [_entry(i, r.get("artistName"), r.get("name"), is_new=_fresh(r.get("releaseDate"), now.date()),
+    out = [_entry(i, r.get("artistName"), r.get("name"), is_new=_fresh(r.get("releaseDate"), today),
                   url=r.get("url") if str(r.get("url", "")).startswith("https://music.apple.com/") else None)
            for i, r in enumerate(results, 1) if isinstance(r, dict)]
     return [e for e in out if e]
@@ -123,7 +144,15 @@ async def yandex(http: Http, now: datetime, opts: Options = Options()) -> list[E
 async def shazam(http: Http, now: datetime, opts: Options = Options()) -> list[Entry]:
     """Shazam's top 200 of Russia as the CSV its chart page offers for download: rank, artist, title.
     A few lines of title come before the table."""
-    text = (await http.get("https://www.shazam.com/services/charts/csv/top-200/russia")).text()
+    return parse_shazam((await http.get(SHAZAM_URL)).text())
+
+
+async def shazam_msk(http: Http, now: datetime, opts: Options = Options()) -> list[Entry]:
+    """Shazam's top 50 of Moscow: a song often climbs in the city before it climbs in the country."""
+    return parse_shazam((await http.get(SHAZAM_MSK_URL)).text())
+
+
+def parse_shazam(text: str) -> list[Entry]:
     out = []
     for row in csv.reader(io.StringIO(text)):
         if len(row) >= 3 and row[0].strip().isdigit():
@@ -166,5 +195,5 @@ async def lastfm_listeners(http: Http, key: str, artist: str) -> int | None:
 
 
 ADAPTERS: dict[str, Callable[[Http, datetime, Options], Awaitable[list[Entry]]]] = {
-    "apple": apple, "yandex": yandex, "shazam": shazam, "lastfm": lastfm,
+    "apple": apple, "yandex": yandex, "shazam": shazam, "shazam_msk": shazam_msk, "lastfm": lastfm,
 }

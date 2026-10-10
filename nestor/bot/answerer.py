@@ -12,6 +12,7 @@ any other request.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import hashlib
 import html
@@ -45,7 +46,7 @@ log = logging.getLogger("nestor.answerer")
 ANONYMOUS_ADMIN_ID = 1087968824  # GroupAnonymousBot: an admin posting as the group (one of forget.SHARED_IDS)
 STATUS_STALE_AFTER = timedelta(minutes=15)     # the watchdog runs every 5 minutes
 _OFF = ("off", "выкл", "0", "нет", "no")
-MUSIC_NOW_EVERY_S = 3600        # /music now: once an hour per group
+MUSIC_NOW_PER_HOUR = 10         # /music now: this many searches per group in any hour
 _ORDER = itertools.count()      # orders requests and /forget_me commands (Answerer._overtaken)
 _ON = ("on", "вкл", "да", "yes")
 _DIGEST_DAYS = re.compile(r"(\d+)(?:\s*(?:д|дн|день|дня|дней))?")       # /digest 30, /digest 7 дней
@@ -110,7 +111,6 @@ class AnswerConfig:
     news_max_topics: int = 2
     news_min_score: int = 7             # significance 1-10 a story needs to make the digest
     music_chat_ids: frozenset[int] = frozenset()     # rising artists on by default; /music on|off overrides
-    music_day: int = 4                  # weekday of the rising artists post, 0 Monday
     music_time: dtime = dtime(19, 0)
     reaction_chat_ids: frozenset[int] = frozenset()  # reactions on by default; /reactions on|off overrides
     reactions: reactions.ReactionConfig = reactions.ReactionConfig()
@@ -183,7 +183,7 @@ class Answerer:
                                       "news": news_llm}, routes)
         self.news = news                # nestor.news.service.NewsService, None without the news digest
         self.trends = None              # nestor.trends.service.TrendsService, None without /music
-        self._music_asked: dict[int, float] = {}    # chat_id -> monotonic time of its last /music now
+        self._music_asked: dict[int, list[float]] = {}  # chat_id -> monotonic times of its /music now, last hour
         self.checker = checker or music.HttpChecker()
         self.save_outgoing = save_outgoing
         self.reactor = reactions.Reactor(bot, pool, lambda: self.router.llm("react"), wanted=self._reactions_wanted,
@@ -412,8 +412,7 @@ class Answerer:
         elif key == "music":
             on = self._music_on(chat_id, settings)
             lastfm = ", Last.fm" if self.trends is not None and self.trends.lastfm_key else ""
-            text = prompts.MUSIC_TRENDS_STATE.format(state="включены" if on else "выключены",
-                                                     when=prompts.MUSIC_DAYS[self.cfg.music_day],
+            text = prompts.MUSIC_TRENDS_STATE.format(state="включена" if on else "выключена",
                                                      time=self.cfg.music_time.strftime("%H:%M"), lastfm=lastfm)
         elif key == "reactions":
             on = self._reactions_on(chat_id, settings)
@@ -1288,8 +1287,7 @@ class Answerer:
                 "SELECT chat_id, settings FROM chats WHERE enabled AND migrated_to_chat_id IS NULL "
                 "AND (chat_id = ANY($1::bigint[]) OR migrated_from_chat_id = ANY($1::bigint[]))", list(self.cfg.allowed_chat_ids))
             posts = [("digest", self.cfg.digest_time), ("wisdom", self.cfg.wisdom_time), ("news", self.cfg.news_time)]
-            if local.weekday() == self.cfg.music_day:
-                posts.append(("music", self.cfg.music_time))
+            posts.append(("music", self.cfg.music_time))
             for chat in chats:
                 chat_id, settings = chat["chat_id"], chat["settings"] or {}
                 for kind, when in posts:
@@ -1604,42 +1602,49 @@ class Answerer:
 
     async def _recommend(self, day: date, *, force: bool):
         return await self.trends.recommend(
-            day, check_llm=self.router.llm("music_check"), write_llm=self.router.llm("music_trends"),
+            day, write_llm=self.router.llm("music_trends"),
             checker=self.checker, player=music.player_link(self.me.username, self.cfg.music_player_app),
             timeout_s=self._timeout("music_trends"), force=force)
 
     async def _music_now(self, msg: dict) -> None:
-        """/music now: a search right away, at most once an hour per group, in the group's queue of posts."""
+        """/music now: a search right away, MUSIC_NOW_PER_HOUR an hour per group, in the group's queue of posts."""
         chat_id = msg["chat"]["id"]
         if self.trends is None or self.router.llm("music_trends") is None:
             await self._say(msg, prompts.MUSIC_TRENDS_OFF)
             return
-        last = self._music_asked.get(chat_id)
-        wait = MUSIC_NOW_EVERY_S - (time.monotonic() - last) if last is not None else 0
-        if wait > 0:
-            await self._say(msg, prompts.MUSIC_TRENDS_TOO_SOON.format(minutes=max(1, round(wait / 60))))
+        now = time.monotonic()
+        asked = self._music_asked[chat_id] = [t for t in self._music_asked.get(chat_id, []) if now - t < 3600]
+        if len(asked) >= MUSIC_NOW_PER_HOUR:
+            wait = 3600 - (now - asked[0])
+            await self._say(msg, prompts.MUSIC_TRENDS_TOO_SOON.format(
+                times=MUSIC_NOW_PER_HOUR, minutes=max(1, round(wait / 60))))
             return
-        self._music_asked[chat_id] = time.monotonic()
+        asked.append(now)
         await self._say(msg, prompts.MUSIC_TRENDS_SEARCHING)
-        self._enqueue(_posts(chat_id), functools.partial(self._music_now_run, msg))
+        self._enqueue(_posts(chat_id), functools.partial(self._music_now_run, msg, now))
 
-    async def _music_now_run(self, msg: dict) -> None:
+    def _forget_music_ask(self, chat_id: int, asked_at: float) -> None:
+        """A search that found nothing for a reason of ours does not count towards the hour's limit."""
+        with contextlib.suppress(KeyError, ValueError):
+            self._music_asked[chat_id].remove(asked_at)
+
+    async def _music_now_run(self, msg: dict, asked_at: float) -> None:
         from ..trends.service import NotEnoughMusic
 
         chat_id = msg["chat"]["id"]
         try:
             post = await self._recommend(datetime.now(UTC).astimezone(self.cfg.tz).date(), force=True)
         except NotEnoughMusic:
-            self._music_asked.pop(chat_id, None)
+            self._forget_music_ask(chat_id, asked_at)
             await self._say(msg, prompts.MUSIC_TRENDS_WAIT)
             return
         except Exception as e:  # noqa: BLE001 - Hermes down or timed out: say so, the next try may work
             log.warning("music search failed", extra={"chat_id": chat_id, "error": type(e).__name__})
-            self._music_asked.pop(chat_id, None)
+            self._forget_music_ask(chat_id, asked_at)
             await self._say(msg, prompts.ERROR)
             return
         if post is None:
-            self._music_asked.pop(chat_id, None)
+            self._forget_music_ask(chat_id, asked_at)
             await self._say(msg, prompts.MUSIC_TRENDS_LIMIT)
         elif not post.html:
             await self._say(msg, prompts.MUSIC_TRENDS_NONE)
@@ -1648,7 +1653,7 @@ class Answerer:
                              keyboard=post.keyboard, plain=post.plain)
 
     async def _music_post(self, chat_id: int, day: date) -> tuple[str, dict]:
-        """The weekly post: made once a day from the charts (nestor.trends), the same for every group."""
+        """The viral song of the day: made once a day from the charts (nestor.trends), the same for every group."""
         if self.trends is None or self.router.llm("music_trends") is None or not await self._bot_is_member(chat_id):
             return "skipped", {}
         from ..trends.service import NotEnoughMusic
@@ -1657,7 +1662,7 @@ class Answerer:
             post = await self._recommend(day, force=False)
         except NotEnoughMusic:      # no chart read yet: a later tick tries again
             return "waiting", {}
-        if post is None or not post.html:     # the token limit, or nobody new this week
+        if post is None or not post.html:     # the token limit, or no song went viral today
             return "skipped", {}
         sent = await self._send(chat_id, post.html, html=True, preview_url=post.preview_url, keyboard=post.keyboard,
                                 plain=post.plain)
@@ -1666,7 +1671,7 @@ class Answerer:
         return "posted", {"message_id": sent.message_id}
 
     async def music_wanted(self) -> bool:
-        """Whether any group gets the weekly post: until then no chart is read."""
+        """Whether any group gets the song of the day: until then no chart is read."""
         async with self.pool.acquire() as conn:
             chats = await conn.fetch(
                 "SELECT chat_id, settings FROM chats WHERE enabled AND migrated_to_chat_id IS NULL "
