@@ -31,6 +31,7 @@ LISTENERS_AGE = timedelta(days=30)
 LISTENER_LOOKUPS = 15               # Last.fm artist.getInfo calls per recommendation
 REFUSED = frozenset({"http_401", "http_403", "http_451"})
 REFUSED_BACKOFF = timedelta(hours=24)
+RETRY_EVERY_S = 3600                # /music now asks failed charts again at most this often, from any group
 TO_WRITE = 6                        # candidates the write-up model sees
 
 
@@ -69,6 +70,7 @@ class TrendsService:
         self._pick_lock = asyncio.Lock()    # one recommendation at a time
         self._cleaned: date | None = None
         self._retried = False               # the first read after a start ignores the pauses (see collect)
+        self._forced_at: float | None = None    # monotonic time of the last /music now that ignored them
 
     async def run(self) -> None:
         from ..collector.app import _TRANSIENT
@@ -102,9 +104,13 @@ class TrendsService:
         retry (/music now), and the first read after a start: the failed charts too, before their pause is over.
         A restart is how a setting changes (MUSIC_YANDEX_PROXY after a 451), so it should not wait a day."""
         async with self._lock:
-            retry, self._retried = retry or not self._retried, True
+            if retry and self._forced_at is not None and time.monotonic() - self._forced_at < RETRY_EVERY_S:
+                retry = False       # however often /music now is asked, a refusing source sees it once an hour
             async with self.pool.acquire() as conn:
                 states = await store.states(conn)
+            if retry:
+                self._forced_at = time.monotonic()
+            retry, self._retried = retry or not self._retried, True   # only once the states are known
             todo = [c for c in self.charts if self.due(states.get(c.key), now, retry)]
             if not todo:
                 return {}

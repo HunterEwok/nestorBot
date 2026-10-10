@@ -294,6 +294,8 @@ async def test_a_restart_and_music_now_retry_a_refused_chart(pool, conn):
     # Later reads of the same process keep the pauses; /music now does not wait for them.
     assert await restarted.collect(NOW + timedelta(minutes=10)) == {}
     assert await restarted.collect(NOW + timedelta(minutes=10), retry=True) == {"shazam_ru": "empty"}
+    # Asked again soon, from this or another group: the pauses hold.
+    assert await restarted.collect(NOW + timedelta(minutes=11), retry=True) == {}
 
 
 async def test_recommendation_checks_writes_and_builds_the_card(pool, conn):
