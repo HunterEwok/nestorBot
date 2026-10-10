@@ -46,7 +46,8 @@ class Settings:
     # Groups with the evening news digest; group admins can switch it with /news on|off.
     news_chat_ids: frozenset[int] = frozenset()
     news_time: time = time(20, 0)
-    news_max_topics: int = 10
+    news_max_topics: int = 2
+    news_min_score: int = 7              # significance 1-10 a story needs to make the digest
     news_contact_email: str = ""        # for NCBI's email= and the User-Agent of the news fetcher
     news_telegram_channels: tuple[str, ...] = ("psychedelicsocietyvienna",)
     # Groups where the bot puts reactions on emotional messages; group admins switch it with /reactions on|off.
@@ -249,7 +250,8 @@ def load_settings() -> Settings:
             digest_every_days=_digest_every_days(),
             news_chat_ids=_parse_ids(_env("NEWS_CHAT_IDS")),
             news_time=_parse_time("NEWS_TIME", "20:00"),
-            news_max_topics=_int("NEWS_MAX_TOPICS", 10),
+            news_max_topics=_int_in("NEWS_MAX_TOPICS", 2, 1, 10, "topics"),
+            news_min_score=_int_in("NEWS_MIN_SCORE", 7, 1, 10, "points"),
             news_contact_email=_env("NEWS_CONTACT_EMAIL"),
             news_telegram_channels=_channels(),
             reaction_chat_ids=_parse_ids(_env("REACTION_CHAT_IDS")),

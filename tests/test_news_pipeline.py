@@ -382,37 +382,42 @@ def test_digest_parse_and_render():
     cands, by_key = candidates()
     n = {c.story_id: c.n for c in cands}
     answer = json.dumps({"items": [
-        {"ids": [n[1]], "section": "main", "text": "Сенат <b>одобрил</b> закон. Подробнее https://evil.example"},
-        {"ids": [n[3], 999], "section": "research", "text": "РКИ псилоцибина: 25 мг помогли при депрессии."},
-        {"ids": [n[1]], "section": "policy", "text": "повтор той же темы не проходит"},
-        {"ids": [n[4]], "section": "community", "text": "Встреча сообщества в Вене."},
-        {"ids": [n[5]], "section": "nonsense", "text": "раздел выдуман моделью"},
-        {"ids": [n[5]], "section": "policy", "text": "коротко"},
-    ], "comment": "Спокойный день."}, ensure_ascii=False)
-    plan = digest.parse(answer, cands, max_topics=10)
-    assert [(t.ids, t.section) for t in plan.topics] == [((n[1],), "main"), ((n[3],), "research"),
-                                                         ((n[4],), "community")]
+        {"ids": [n[4]], "score": 7, "text": "Встреча сообщества в Вене, заметная для сцены."},
+        {"ids": [n[1]], "score": 9, "text": "Сенат <b>одобрил</b> закон. Подробнее https://evil.example"},
+        {"ids": [n[3], 999], "score": 8, "text": "РКИ псилоцибина: 25 мг помогли при депрессии."},
+        {"ids": [n[1]], "score": 10, "text": "повтор той же темы не проходит"},
+        {"ids": [n[5]], "score": 4},                                       # rated, below the bar: no text needed
+        {"ids": [n[5]], "score": 11, "text": "оценка вне шкалы не проходит"},
+    ]}, ensure_ascii=False)
+    plan = digest.parse(answer, cands, max_topics=2, min_score=7)
+    assert [(t.ids, t.score) for t in plan.topics] == [((n[1],), 9), ((n[3],), 8)]   # strongest two, by score
     text, topics = digest.render(plan, cands, by_key, date(2026, 10, 4))
     assert topics == list(plan.topics)
-    assert text.startswith("🗞 <b>Новости дня, 4 октября</b>\n\n<b>Главное за день</b>\n• Сенат &lt;b&gt;одобрил")
-    assert "evil.example" not in text and "25 мг" not in text
+    assert text.startswith("🗞 <b>Новости дня, 4 октября</b>\n\n• Сенат &lt;b&gt;одобрил")
+    assert "<b>Главное за день</b>" not in text and "<b>Исследования</b>" not in text
+    assert "evil.example" not in text and "25 мг" not in text and "Вене" not in text
     assert '<a href="https://mm.example/a?x=1&amp;y=&lt;2&gt;">Marijuana Moment</a>, ' \
            '<a href="https://norml.example/2">NORML</a>' in text
-    assert "<b>Исследования</b>\n• РКИ псилоцибина: помогли при депрессии. — " \
-           '<a href="https://pubmed.example/3">PubMed</a>' in text
-    assert "Telegram @x</a> · пост сообщества" in text
-    assert text.endswith("💬 <i>Спокойный день.</i>")
-    assert digest.used_item_ids(topics, cands) == [1, 2, 3, 4]
-    assert digest.parse('{"items": [{"ids": [1], "section": "main", "text": "x"}]}', cands, 10) is None
+    assert text.endswith("• РКИ псилоцибина: помогли при депрессии. — " '<a href="https://pubmed.example/3">PubMed</a>')
+    assert digest.used_item_ids(topics, cands) == [1, 2, 3]
+    # A higher bar keeps only the strongest; nothing at the bar is an empty plan, not an error.
+    assert [t.score for t in digest.parse(answer, cands, max_topics=2, min_score=9).topics] == [9]
+    assert digest.parse(answer, cands, max_topics=2, min_score=10).topics == ()
+    assert digest.parse('{"items": []}', cands, 2, 7).topics == ()
+    # No usable rating at all is a broken answer.
+    assert digest.parse('{"items": [{"ids": [1], "section": "main", "text": "без оценки"}]}', cands, 2, 7) is None
+    assert digest.parse("не знаю", cands, 2, 7) is None
 
 
 def test_digest_marks_single_outlets_and_paid_items_and_fits_one_message():
     cands, by_key = candidates()
     n = {c.story_id: c.n for c in cands}
-    plan = digest.Plan((digest.Topic((n[5],), "policy", "Платная аналитика рынка психоделиков."),), None)
+    plan = digest.Plan((digest.Topic((n[5],), 8, "Платная аналитика рынка психоделиков."),))
     text, _ = digest.render(plan, cands, by_key, date(2026, 10, 4))
     assert "javascript" not in text and text.endswith("Платная аналитика рынка психоделиков. · один источник · платно")
-    long = digest.Plan(tuple(digest.Topic((c.n,), c.section, "Очень длинный текст темы. " * 50) for c in cands), None)
+    plan = digest.Plan((digest.Topic((n[4],), 8, "Встреча сообщества в Вене."),))
+    assert digest.render(plan, cands, by_key, date(2026, 10, 4))[0].endswith(" · пост сообщества")
+    long = digest.Plan(tuple(digest.Topic((c.n,), 8, "Очень длинный текст темы. " * 50) for c in cands))
     text, topics = digest.render(long, cands, by_key, date(2026, 10, 4))
     assert digest.visible_len(text) <= digest.VISIBLE_LIMIT and 1 <= len(topics) < len(cands)
 
@@ -449,14 +454,15 @@ async def test_digest_is_written_once_a_day(digest_ready, conn):
         user = messages[-1]["content"]
         assert "senate approves cannabis rescheduling" in user.lower()
         assert re.search(r"Источники: (Marijuana Moment, NORML|NORML, Marijuana Moment)\.", user)
-        return json.dumps({"items": [{"ids": [1], "section": "main", "text": "Сенат одобрил перенос каннабиса."},
-                                     {"ids": [2, 3], "section": "research", "text": "Две темы вместе."}],
-                           "comment": "День законов."}, ensure_ascii=False)
+        assert "от 1 до 10" in messages[0]["content"] and "оценкой 7 и выше" in messages[0]["content"]
+        return json.dumps({"items": [{"ids": [1], "score": 9, "text": "Сенат одобрил перенос каннабиса."},
+                                     {"ids": [2, 3], "score": 8, "text": "Две темы вместе, обе заметные."}]},
+                          ensure_ascii=False)
     smart = ScriptedLLM(plan, profile="smart")
     day = date(2026, 10, 4)
-    text = await service.digest(day, smart, max_topics=10, timeout_s=5)
+    text = await service.digest(day, smart, max_topics=2, min_score=7, timeout_s=5)
     assert text.startswith("🗞 <b>Новости дня, 4 октября</b>") and "Сенат одобрил перенос каннабиса." in text
-    assert await service.digest(day, smart, max_topics=10, timeout_s=5) == text
+    assert await service.digest(day, smart, max_topics=2, min_score=7, timeout_s=5) == text
     assert len(smart.calls) == 1
     used = {r["ext_id"] for r in await conn.fetch("SELECT ext_id FROM news_items WHERE status = 'used'")}
     assert used == {"a", "z", "b", "1"} and set(ids) >= used
@@ -465,7 +471,7 @@ async def test_digest_is_written_once_a_day(digest_ready, conn):
     assert logged == [(None, "news_triage", "news"), (None, "news", "smart")]
     # The next day nothing from these stories comes back.
     with pytest.raises(NotEnoughNews):
-        await service.digest(date(2026, 10, 5), smart, max_topics=10, timeout_s=5)
+        await service.digest(date(2026, 10, 5), smart, max_topics=2, min_score=7, timeout_s=5)
 
 
 async def test_digest_bad_answer_is_an_error_and_too_little_news_waits(digest_ready, conn):
@@ -473,12 +479,12 @@ async def test_digest_bad_answer_is_an_error_and_too_little_news_waits(digest_re
     from nestor.bot.llm import LLMError
 
     with pytest.raises(LLMError):
-        await service.digest(date(2026, 10, 4), ScriptedLLM("не знаю"), max_topics=10, timeout_s=5)
+        await service.digest(date(2026, 10, 4), ScriptedLLM("не знаю"), max_topics=2, min_score=7, timeout_s=5)
     assert await conn.fetchval("SELECT count(*) FROM news_digests") == 0
     assert await conn.fetchval("SELECT count(*) FROM news_items WHERE status = 'used'") == 0
     await conn.execute("UPDATE news_items SET status = 'rejected' WHERE ext_id <> 'a'")
     with pytest.raises(NotEnoughNews):
-        await service.digest(date(2026, 10, 4), ScriptedLLM("{}"), max_topics=10, timeout_s=5)
+        await service.digest(date(2026, 10, 4), ScriptedLLM("{}"), max_topics=2, min_score=7, timeout_s=5)
 
 
 async def test_cleanup_keeps_only_identifiers(pool, conn):
@@ -494,3 +500,13 @@ async def test_cleanup_keeps_only_identifiers(pool, conn):
     service._cleaned = None
     await service.cleanup(datetime.now(timezone.utc))
     assert await conn.fetchval("SELECT count(*) FROM news_items") == 0
+
+
+async def test_a_day_without_significant_news_posts_nothing_and_asks_once(digest_ready, conn):
+    service = digest_ready
+    smart = ScriptedLLM(json.dumps({"items": [{"ids": [1], "score": 5}, {"ids": [2], "score": 3}]}), profile="smart")
+    day = date(2026, 10, 4)
+    assert await service.digest(day, smart, max_topics=2, min_score=7, timeout_s=5) == ""
+    assert await service.digest(day, smart, max_topics=2, min_score=7, timeout_s=5) == ""
+    assert len(smart.calls) == 1                                  # the quiet day is remembered
+    assert await conn.fetchval("SELECT count(*) FROM news_items WHERE status = 'used'") == 0

@@ -44,9 +44,10 @@ async def test_model_text_the_database_refuses_is_cleaned(pool, conn):
     await service.collect(datetime.now(timezone.utc))
     assert await service.triage(NOW, force=True) == 3
     assert {r["gist"] for r in await conn.fetch("SELECT gist FROM news_items")} == {"суть �1", "суть �2", "суть �3"}
-    plan = ('{"items": [{"ids": [1], "section": "main", "text": "Сенат \\ud83d\\u0000одобрил перенос каннабиса."},'
-            ' {"ids": [2, 3], "section": "research", "text": "Две темы вместе."}]}')
-    text = await service.digest(date(2026, 10, 4), ScriptedLLM(plan, profile="smart"), max_topics=10, timeout_s=5)
+    plan = ('{"items": [{"ids": [1], "score": 9, "text": "Сенат \\ud83d\\u0000одобрил перенос каннабиса."},'
+            ' {"ids": [2, 3], "score": 8, "text": "Две темы вместе, обе заметные."}]}')
+    text = await service.digest(date(2026, 10, 4), ScriptedLLM(plan, profile="smart"), max_topics=2, min_score=7,
+                                timeout_s=5)
     assert "Сенат �одобрил перенос каннабиса." in text and "\x00" not in text
     # the triage answer is logged too, so its tokens count toward the daily limit
     logged = [tuple(r) for r in await conn.fetch("SELECT scenario, status FROM bot_requests ORDER BY id")]

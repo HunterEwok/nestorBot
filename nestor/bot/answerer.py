@@ -106,7 +106,8 @@ class AnswerConfig:
     wisdom_time: dtime = dtime(21, 0)
     news_chat_ids: frozenset[int] = frozenset()      # news digest on by default; /news on|off overrides
     news_time: dtime = dtime(20, 0)
-    news_max_topics: int = 10
+    news_max_topics: int = 2
+    news_min_score: int = 7             # significance 1-10 a story needs to make the digest
     reaction_chat_ids: frozenset[int] = frozenset()  # reactions on by default; /reactions on|off overrides
     reactions: reactions.ReactionConfig = reactions.ReactionConfig()
     address: addressing.AddressConfig = field(default_factory=addressing.AddressConfig)   # /address, off by default
@@ -1503,11 +1504,11 @@ class Answerer:
 
         try:
             text = await self.news.digest(day, llm, max_topics=self.cfg.news_max_topics,
-                                          timeout_s=self._timeout("news"))
+                                          min_score=self.cfg.news_min_score, timeout_s=self._timeout("news"))
         except NotEnoughNews:
             # Sources not read yet (first start, or /news on after NEWS_TIME): a later tick tries again.
             return "waiting", {}
-        if text is None:
+        if not text:        # the token limit, or nothing significant enough today
             return "skipped", {}
         sent = await self._send(chat_id, text, html=True)
         if sent is None:
@@ -1534,6 +1535,7 @@ class Answerer:
             states = await news_store.states(conn)
             counts = await news_store.counts_since(conn, now - timedelta(days=7))
             stale = set(await self.news.stale(conn, now))
+            quiet = await news_store.digest_of(conn, now.astimezone(self.cfg.tz).date()) == ""
         lines = [prompts.NEWS_STATUS_HEADER]
         for s in self.news.sources:
             st, c = states.get(s.key), counts.get(s.key, {})
@@ -1546,6 +1548,8 @@ class Answerer:
             if s.key in stale:
                 line += f" — {prompts.NEWS_STATUS_STALE}"
             lines.append(line)
+        if quiet:
+            lines.append(prompts.NEWS_STATUS_QUIET)
         return "\n".join(lines[:1] + [html.escape(line) for line in lines[1:]])
 
     # ---- the bot's own remarks (nestor.bot.chime) ----

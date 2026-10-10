@@ -218,8 +218,9 @@ class NewsService:
 
     # ---- the digest ----
 
-    async def digest(self, day: date, llm: LLM, *, max_topics: int, timeout_s: float) -> str | None:
+    async def digest(self, day: date, llm: LLM, *, max_topics: int, min_score: int, timeout_s: float) -> str | None:
         """The day's digest as Telegram HTML, written at most once a day and shared by every group.
+        "": nothing was significant enough today (remembered, so the day is not asked again).
         None: the token limit is reached. NotEnoughNews: too few stories so far."""
         async with self._digest_lock:
             async with self.pool.acquire() as conn:
@@ -238,13 +239,19 @@ class NewsService:
                 raise NotEnoughNews(len(candidates))
             started = time.monotonic()
             completion = await asyncio.wait_for(
-                llm.complete(digest.build_prompt(candidates, self.by_key, day, max_topics)), timeout_s)
-            plan = digest.parse(completion.text, candidates, max_topics)
+                llm.complete(digest.build_prompt(candidates, self.by_key, day, max_topics, min_score)), timeout_s)
+            plan = digest.parse(completion.text, candidates, max_topics, min_score)
             async with self.pool.acquire() as conn:
                 await store.log_llm(conn, "news", completion, int((time.monotonic() - started) * 1000),
                                     "ok" if plan else "error")
             if plan is None:
                 raise LLMError("the digest model returned no usable topics")
+            if not plan.topics:
+                # Nothing reached the threshold: no post today. The stories stay candidates for tomorrow.
+                log.info("news digest skipped: nothing significant", extra={"candidates": len(candidates)})
+                async with self.pool.acquire() as conn:
+                    await store.save_digest(conn, day, "", [])
+                return ""
             text, topics = digest.render(plan, candidates, self.by_key, day)
             async with self.pool.acquire() as conn:
                 await store.save_digest(conn, day, text, digest.used_item_ids(topics, candidates))

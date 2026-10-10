@@ -24,7 +24,7 @@ NAMES = ("ALLOWED_CHAT_IDS", "MODEL_ROUTES", "MUSIC_DAILY_LIMIT", "MUSIC_PLAYER_
          "DIGEST_EVERY_DAYS", "TIMEZONE",
          "RETENTION_TIME", "ALERT_CHAT_ID", "ALERT_DAILY_AT", "ALERT_QUIET", "ALERT_DISK_MIN_GB", "ALERT_MAX_MEMBERS",
          "BACKUP_STATUS_FILE", "ADDRESS_WINDOW_MIN", "ADDRESS_CONTEXT", "ADDRESS_DAILY_CHECKS", "CHIME_HOURS",
-         "CHIME_MIN_MESSAGES", "CHIME_WINDOW", "CHIME_DAILY", "OWNER_IDS")
+         "CHIME_MIN_MESSAGES", "CHIME_WINDOW", "CHIME_DAILY", "OWNER_IDS", "NEWS_MIN_SCORE")
 
 
 @pytest.fixture
@@ -54,12 +54,17 @@ def test_trailing_comments_are_not_part_of_the_value(env):
 
 def test_defaults_and_bad_values(env):
     s = config.load_settings()
-    assert (s.news_time, s.news_max_topics, s.music_player_app, s.timezone) == (time(20, 0), 10, "",
+    assert (s.news_time, s.news_max_topics, s.music_player_app, s.timezone) == (time(20, 0), 2, "",
                                                                                "Europe/Moscow")
     env.setenv("NEWS_MAX_TOPICS", "десять")
     with pytest.raises(SystemExit, match="NEWS_MAX_TOPICS must be a whole number"):
         config.load_settings()
     env.setenv("NEWS_MAX_TOPICS", "10")
+    assert config.load_settings().news_min_score == 7
+    env.setenv("NEWS_MIN_SCORE", "11")
+    with pytest.raises(SystemExit, match="NEWS_MIN_SCORE must be a number of points from 1 to 10"):
+        config.load_settings()
+    env.setenv("NEWS_MIN_SCORE", "7")
     env.setenv("MODEL_ROUTES", "theses:web")
     with pytest.raises(SystemExit, match="MODEL_ROUTES"):
         config.load_settings()

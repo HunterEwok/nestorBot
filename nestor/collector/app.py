@@ -229,6 +229,7 @@ async def make_answerer(settings: Settings, bot: Bot, pool: asyncpg.Pool, collec
                        digest_every_days=settings.digest_every_days,
                        wisdom_time=settings.wisdom_time, news_chat_ids=settings.news_chat_ids,
                        news_time=settings.news_time, news_max_topics=settings.news_max_topics,
+                       news_min_score=settings.news_min_score,
                        reaction_chat_ids=settings.reaction_chat_ids, alert_chat_id=alert_chat_id,
                        owner_ids=settings.owner_ids,
                        address=AddressConfig(window_min=settings.address_window_min,

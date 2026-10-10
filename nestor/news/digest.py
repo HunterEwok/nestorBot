@@ -1,5 +1,7 @@
 """The digest: what the smart model gets, what it may answer, and the message the code builds
-from it. The model refers to candidates by number; every link comes from stored URLs."""
+from it. The model rates the candidates' significance and writes the strongest one or two;
+the code keeps those at or above the owner's threshold. The model refers to candidates by
+number; every link comes from stored URLs."""
 from __future__ import annotations
 
 import html
@@ -12,26 +14,25 @@ from ..bot import prompts
 from ..bot.daily import day_name, is_public_url
 from ..bot.llm import extract_json
 from .filters import clean_text
-from .model import SECTION_TITLES, SECTIONS, Source
+from .model import SECTION_TITLES, Source
 from .rank import Candidate
 
 VISIBLE_LIMIT = 4000        # Telegram counts 4096 characters after parsing the HTML
-MAX_MAIN = 3
 MAX_LINKS = 3
+MAX_TEXT = 600
 _CHECKED = ("research", "trials")   # primary sources: a paper or a registry entry needs no second outlet
 
 
 @dataclass(frozen=True)
 class Topic:
     ids: tuple[int, ...]       # candidate numbers
-    section: str               # "main" or one of SECTIONS
+    score: int                 # significance, 1-10, as the model rated it
     text: str
 
 
 @dataclass(frozen=True)
 class Plan:
-    topics: tuple[Topic, ...]
-    comment: str | None
+    topics: tuple[Topic, ...]  # the strongest first; empty: nothing significant enough today
 
 
 def _markers(c: Candidate) -> list[str]:
@@ -51,7 +52,7 @@ def _markers(c: Candidate) -> list[str]:
 
 
 def build_prompt(candidates: list[Candidate], sources: Mapping[str, Source], day: date,
-                 max_topics: int) -> list[dict]:
+                 max_topics: int, min_score: int) -> list[dict]:
     blocks = []
     for c in candidates:
         names = _names(c, sources)
@@ -71,7 +72,7 @@ def build_prompt(candidates: list[Candidate], sources: Mapping[str, Source], day
                 lines.append(f"Ещё источник: {other['gist']}")
         blocks.append("\n".join(lines))
     user = f"Сводка за {day_name(day)} {day.year}. Кандидаты:\n\n" + "\n\n".join(blocks)
-    return [{"role": "system", "content": prompts.NEWS_SYSTEM.format(max_topics=max_topics)},
+    return [{"role": "system", "content": prompts.NEWS_SYSTEM.format(max_topics=max_topics, min_score=min_score)},
             {"role": "user", "content": user}]
 
 
@@ -87,31 +88,35 @@ def _ids(value: Any, known: set[int]) -> tuple[int, ...]:
     return tuple(out)
 
 
-def parse(answer: str, candidates: list[Candidate], max_topics: int) -> Plan | None:
+def parse(answer: str, candidates: list[Candidate], max_topics: int, min_score: int) -> Plan | None:
+    """The topics at or above min_score, strongest first, at most max_topics. None: no usable answer;
+    an empty Plan: the model answered, and nothing was significant enough."""
     data = extract_json(answer)
     if not isinstance(data, dict) or not isinstance(data.get("items"), list):
         return None
     known = {c.n for c in candidates}
     used: set[int] = set()
     topics: list[Topic] = []
+    rated = False
     for entry in data["items"]:
-        if not isinstance(entry, dict) or len(topics) >= max_topics:
+        if not isinstance(entry, dict):
             continue
         ids = tuple(i for i in _ids(entry.get("ids"), known) if i not in used)
         text = clean_text(entry.get("text")) if isinstance(entry.get("text"), str) else ""
-        section = entry.get("section")
-        if not ids or len(text) < 15 or section not in ("main", *SECTIONS):
+        score = entry.get("score")
+        if not ids or not isinstance(score, int) or isinstance(score, bool) or not 1 <= score <= 10:
             continue
-        if section == "main" and sum(t.section == "main" for t in topics) >= MAX_MAIN:
-            section = next(c.section for c in candidates if c.n == ids[0])
-        if len(text) > 500:
-            text = text[:500].rsplit(" ", 1)[0] + "…"
-        used.update(ids)
-        topics.append(Topic(ids, section, text))
-    if not topics:
+        rated = True
+        used.update(ids)            # a candidate's first rating holds, a repeat cannot raise it
+        if score < min_score or len(text) < 15:
+            continue
+        if len(text) > MAX_TEXT:
+            text = text[:MAX_TEXT].rsplit(" ", 1)[0] + "…"
+        topics.append(Topic(ids, score, text))
+    if not rated and data["items"]:
         return None
-    comment = clean_text(data.get("comment")) if isinstance(data.get("comment"), str) else ""
-    return Plan(tuple(topics), comment[:400] or None)
+    topics.sort(key=lambda t: t.score, reverse=True)       # stable: the model's order among equals
+    return Plan(tuple(topics[:max_topics]))
 
 
 def _names(c: Candidate, sources: Mapping[str, Source]) -> list[str]:
@@ -166,12 +171,7 @@ def render(plan: Plan, candidates: list[Candidate], sources: Mapping[str, Source
     topics = list(plan.topics)
     while True:
         parts = [prompts.NEWS_HEADER.format(date=day_name(day))]
-        for section in ("main", *SECTIONS):
-            lines = [_line(t, by_n, sources) for t in topics if t.section == section]
-            if lines:
-                parts.append(f"<b>{SECTION_TITLES[section]}</b>\n" + "\n".join(lines))
-        if plan.comment:
-            parts.append(f"💬 <i>{html.escape(plan.comment)}</i>")
+        parts += [_line(t, by_n, sources) for t in topics]
         text = "\n\n".join(parts)
         if visible_len(text) <= VISIBLE_LIMIT or len(topics) <= 1:
             return text, topics
