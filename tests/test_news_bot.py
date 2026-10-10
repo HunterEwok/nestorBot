@@ -209,7 +209,7 @@ async def test_archive_ticket_outlives_the_bigger_models_timeout(make_env, pool)
 
 
 async def test_a_quiet_day_posts_nothing_and_status_says_so(make_env, pool, conn):
-    smart = ScriptedLLM(json.dumps({"items": [{"ids": [1], "score": 4}]}), profile="smart")
+    smart = ScriptedLLM(json.dumps({"items": [{"ids": [1], "score": 4}, {"ids": [2, 3], "score": 2}]}), profile="smart")
     bot, llm, feed = await with_news(make_env, pool, smart=smart, news_chat_ids=frozenset({CHAT_ID}),
                                      news_time=dtime(0, 0))
     answerer = feed.answerer

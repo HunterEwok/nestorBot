@@ -61,3 +61,14 @@ async def publish(bot: Bot, chat_ids: Iterable[int], owner_ids: Iterable[int]) -
             await bot.set_my_commands(commands, scope=scope)
         except TelegramAPIError as e:
             log.warning("command menu not set", extra={"scope": scope.type, "error": type(e).__name__})
+
+
+async def clear(bot: Bot) -> None:
+    """Archive only (no HERMES_URL): Telegram keeps a published menu until it is deleted, and the bot answers
+    no command now. An owner's menu in a group is left; it is replaced as soon as answering is back."""
+    for scope in (BotCommandScopeAllGroupChats(), BotCommandScopeAllChatAdministrators(),
+                  BotCommandScopeAllPrivateChats()):
+        try:
+            await bot.delete_my_commands(scope=scope)
+        except TelegramAPIError as e:
+            log.warning("command menu not cleared", extra={"scope": scope.type, "error": type(e).__name__})

@@ -38,3 +38,18 @@ async def test_a_refused_scope_does_not_stop_the_rest():
     bot = MenuBot(refuse={"chat_member"})
     await commands.publish(bot, [-100], [7])
     assert {s.type for s, _ in bot.menus} == {"all_group_chats", "all_chat_administrators", "all_private_chats"}
+
+
+async def test_archive_only_clears_the_menus():
+    class ClearBot:
+        def __init__(self):
+            self.cleared = []
+
+        async def delete_my_commands(self, scope=None, **kw):
+            if scope.type == "all_private_chats":
+                raise TelegramBadRequest(SetMyCommands(commands=[]), "Bad Request")
+            self.cleared.append(scope.type)
+            return True
+    bot = ClearBot()
+    await commands.clear(bot)
+    assert bot.cleared == ["all_group_chats", "all_chat_administrators"]

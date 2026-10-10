@@ -294,6 +294,9 @@ async def run(settings: Settings) -> None:
             collector.answerer = await make_answerer(settings, bot, pool, collector, alert_chat_id=alerts_to)
         else:
             log.warning("HERMES_URL is not set: archiving only, the bot will not answer")
+            from ..bot import commands
+
+            await commands.clear(bot)
         dp.include_router(collector.router())
         if collector.answerer is not None:
             from ..bot import commands

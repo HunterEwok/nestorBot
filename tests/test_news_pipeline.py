@@ -403,7 +403,9 @@ def test_digest_parse_and_render():
     # A higher bar keeps only the strongest; nothing at the bar is an empty plan, not an error.
     assert [t.score for t in digest.parse(answer, cands, max_topics=2, min_score=9).topics] == [9]
     assert digest.parse(answer, cands, max_topics=2, min_score=10).topics == ()
-    assert digest.parse('{"items": []}', cands, 2, 7).topics == ()
+    # A quiet day needs a rating of every candidate: an empty or cut-off answer is asked again.
+    assert digest.parse('{"items": []}', cands, 2, 7) is None
+    assert digest.parse(json.dumps({"items": [{"ids": [n[5]], "score": 4}]}), cands, 2, 7) is None
     # No usable rating at all is a broken answer.
     assert digest.parse('{"items": [{"ids": [1], "section": "main", "text": "без оценки"}]}', cands, 2, 7) is None
     assert digest.parse("не знаю", cands, 2, 7) is None
@@ -504,7 +506,8 @@ async def test_cleanup_keeps_only_identifiers(pool, conn):
 
 async def test_a_day_without_significant_news_posts_nothing_and_asks_once(digest_ready, conn):
     service = digest_ready
-    smart = ScriptedLLM(json.dumps({"items": [{"ids": [1], "score": 5}, {"ids": [2], "score": 3}]}), profile="smart")
+    smart = ScriptedLLM(json.dumps({"items": [{"ids": [1], "score": 5}, {"ids": [2, 3], "score": 3}]}),
+                        profile="smart")
     day = date(2026, 10, 4)
     assert await service.digest(day, smart, max_topics=2, min_score=7, timeout_s=5) == ""
     assert await service.digest(day, smart, max_topics=2, min_score=7, timeout_s=5) == ""

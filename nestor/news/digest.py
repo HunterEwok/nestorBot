@@ -90,14 +90,13 @@ def _ids(value: Any, known: set[int]) -> tuple[int, ...]:
 
 def parse(answer: str, candidates: list[Candidate], max_topics: int, min_score: int) -> Plan | None:
     """The topics at or above min_score, strongest first, at most max_topics. None: no usable answer;
-    an empty Plan: the model answered, and nothing was significant enough."""
+    an empty Plan: the model rated every candidate, and nothing was significant enough."""
     data = extract_json(answer)
     if not isinstance(data, dict) or not isinstance(data.get("items"), list):
         return None
     known = {c.n for c in candidates}
     used: set[int] = set()
     topics: list[Topic] = []
-    rated = False
     for entry in data["items"]:
         if not isinstance(entry, dict):
             continue
@@ -106,14 +105,14 @@ def parse(answer: str, candidates: list[Candidate], max_topics: int, min_score: 
         score = entry.get("score")
         if not ids or not isinstance(score, int) or isinstance(score, bool) or not 1 <= score <= 10:
             continue
-        rated = True
         used.update(ids)            # a candidate's first rating holds, a repeat cannot raise it
         if score < min_score or len(text) < 15:
             continue
         if len(text) > MAX_TEXT:
             text = text[:MAX_TEXT].rsplit(" ", 1)[0] + "…"
         topics.append(Topic(ids, score, text))
-    if not rated and data["items"]:
+    if not topics and used != known:
+        # A quiet day only when every candidate was rated: an empty or cut-off answer is asked again.
         return None
     topics.sort(key=lambda t: t.score, reverse=True)       # stable: the model's order among equals
     return Plan(tuple(topics[:max_topics]))
