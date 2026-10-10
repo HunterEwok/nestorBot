@@ -363,11 +363,13 @@ def test_texts():
 class Checker(FakeLLM):
     """The profile without tools: the address check answers `address`, anything else (reactions) `other`."""
 
-    def __init__(self, address=YES, other='{"reactions": []}', **kw):
+    def __init__(self, address=YES, other='{"reactions": []}', gate: asyncio.Event | None = None, **kw):
         super().__init__(**kw)
-        self.address, self.other = address, other
+        self.address, self.other, self.gate = address, other, gate
 
     async def complete(self, messages):
+        if self.gate is not None:       # held until the test lets it go, however slow the machine
+            await self.gate.wait()
         self.answer = self.address if messages[0]["content"] == prompts.ADDRESS_SYSTEM else self.other
         return await super().complete(messages)
 
@@ -1024,7 +1026,8 @@ async def test_only_a_delivered_answer_opens_the_window(make_env, conn):
 # ---- running beside the chat's answers ----
 
 async def test_one_check_per_person_at_a_time_and_the_newest_waits(make_env, conn):
-    checker = Checker(NO, delay=0.2)
+    gate = asyncio.Event()      # the first checks wait until every message is in, not for a fixed 0.2 s
+    checker = Checker(NO, delay=0.2, gate=gate)
     picker = FakeLLM(json.dumps({"reactions": [{"n": 1, "emoji": "😁"}]}))      # reactions, on the archive profile
     bot, _, feed = make_env(picker, news_llm=checker, routes={"react": "group"},
                             reaction_chat_ids=frozenset({CHAT_ID}), reactions=ReactionConfig(delay_s=0))
@@ -1035,6 +1038,7 @@ async def test_one_check_per_person_at_a_time_and_the_newest_waits(make_env, con
         msg = message(i, text, uid=uid, date=now())
         await answerer.save_outgoing(msg)
         await answerer.on_message(msg, paused=False)      # returns at once: the check runs aside
+    gate.set()
     await answerer.drain()
     shown = [c[1]["content"].split("\n\n")[0].rsplit(": ", 1)[1] for c in checker.checks]
     assert sorted(shown) == ["слушай, Нестор, а ты?", "слушай, Нестор, раз?", "слушай, Нестор, три?"]
