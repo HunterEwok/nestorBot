@@ -24,11 +24,10 @@ def local(hour: int, minute: int = 0) -> datetime:
 
 
 def plan_all(messages):
-    """The digest model: every candidate a topic of its own, the first one in «Главное»."""
+    """The digest model: every candidate a topic of its own, the first one the most significant."""
     numbers = [int(n) for n in re.findall(r"^\[(\d+)\]", messages[-1]["content"], re.M)]
-    return json.dumps({"items": [{"ids": [n], "section": "main" if i == 0 else "policy",
-                                  "text": f"Тема номер {n}, пересказ."} for i, n in enumerate(numbers)],
-                       "comment": "Итог дня."}, ensure_ascii=False)
+    return json.dumps({"items": [{"ids": [n], "score": 9 - i, "text": f"Тема номер {n}, пересказ."}
+                                 for i, n in enumerate(numbers)]}, ensure_ascii=False)
 
 
 async def with_news(make_env, pool, *, smart, **cfg):
@@ -68,7 +67,7 @@ async def test_news_digest_is_posted_once_to_groups_that_have_it(make_env, pool,
     await answerer.drain()
     post = bot.sent[-1]
     assert post["parse_mode"] == "HTML" and post["reply_to"] is None
-    assert post["text"].startswith("🗞 <b>Новости дня, ") and "<b>Главное за день</b>" in post["text"]
+    assert post["text"].startswith("🗞 <b>Новости дня, ") and post["text"].count("\n• ") == 2   # the two strongest
     assert '<a href="https://example.org/a">Marijuana Moment</a>' in post["text"]
     assert post["link_preview_options"].is_disabled
     row = await conn.fetchrow("SELECT status, message_id FROM daily_posts WHERE kind = 'news'")
@@ -207,3 +206,16 @@ async def test_archive_ticket_outlives_the_bigger_models_timeout(make_env, pool)
     await feed(update("message", message(2, "нестор, кто прав?", date=ago(minutes=2))))
     await feed(update("message", message(3, "нестор, о чём говорили?", date=ago(minutes=1))))
     assert deep.left > 240 and 120 < group.left <= 150      # deep: 240 s + 30; group: 120 s + 30
+
+
+async def test_a_quiet_day_posts_nothing_and_status_says_so(make_env, pool, conn):
+    smart = ScriptedLLM(json.dumps({"items": [{"ids": [1], "score": 4}, {"ids": [2, 3], "score": 2}]}), profile="smart")
+    bot, llm, feed = await with_news(make_env, pool, smart=smart, news_chat_ids=frozenset({CHAT_ID}),
+                                     news_time=dtime(0, 0))
+    answerer = feed.answerer
+    await answerer.run_daily_posts(datetime.now(TZ))
+    await answerer.drain()
+    assert not [s for s in bot.sent if s["text"].startswith("🗞 <b>Новости дня")]
+    assert await conn.fetchval("SELECT status FROM daily_posts WHERE kind = 'news'") == "skipped"
+    await feed(update("message", message(2, "/news status", date=ago())))
+    assert bot.sent[-1]["text"].endswith(prompts.NEWS_STATUS_QUIET)

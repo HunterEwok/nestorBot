@@ -13,6 +13,7 @@ def test_defaults_and_fallbacks():
     assert [full.profile(t) for t in ("web", "think_web", "factcheck", "music", "wisdom", "news_triage", "news")] == [
         "web", "smart", "web", "smart", "smart", "news", "smart"]
     assert full.is_big("theses") and not full.is_big("answer")
+    assert (full.profile("music_check"), full.profile("music_trends")) == ("news", "smart")
 
     basic = Router({"group": "G", "web": "W", "smart": None})
     assert basic.llm("theses") == "G" and basic.llm("think") == "G"
@@ -24,7 +25,7 @@ def test_defaults_and_fallbacks():
     assert archive_only.llm("theses") == "G"
 
     smart_only = Router({"group": "G", "smart": "S"})
-    assert smart_only.llm("news_triage") == "S"
+    assert smart_only.llm("news_triage") == "S" and smart_only.llm("music_check") == "S"
     assert smart_only.llm("web") is None      # plain web questions do not silently go to the expensive model
 
 

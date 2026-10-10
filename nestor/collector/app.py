@@ -229,7 +229,10 @@ async def make_answerer(settings: Settings, bot: Bot, pool: asyncpg.Pool, collec
                        digest_every_days=settings.digest_every_days,
                        wisdom_time=settings.wisdom_time, news_chat_ids=settings.news_chat_ids,
                        news_time=settings.news_time, news_max_topics=settings.news_max_topics,
+                       news_min_score=settings.news_min_score, music_chat_ids=settings.music_chat_ids,
+                       music_day=settings.music_day, music_time=settings.music_time,
                        reaction_chat_ids=settings.reaction_chat_ids, alert_chat_id=alert_chat_id,
+                       owner_ids=settings.owner_ids,
                        address=AddressConfig(window_min=settings.address_window_min,
                                              context=settings.address_context,
                                              daily_checks=settings.address_daily_checks),
@@ -253,7 +256,7 @@ async def make_answerer(settings: Settings, bot: Bot, pool: asyncpg.Pool, collec
     answerer = Answerer(bot, pool, llm, identity, lambda msg: collector.store(msg, is_edit=False), cfg, web_llm=web,
                         smart_llm=smart, checker=HttpChecker(), deep_llm=deep, news_llm=news_llm,
                         routes=settings.model_routes)
-    for task in ("theses", "news_triage", "news", "react", "address", "chime"):
+    for task in ("theses", "news_triage", "news", "music_check", "music_trends", "react", "address", "chime"):
         log.info("model route", extra={"task": task, "profile": answerer.router.profile(task)})
     from ..news.service import NewsService
     from ..news.sources import all_sources
@@ -262,6 +265,11 @@ async def make_answerer(settings: Settings, bot: Bot, pool: asyncpg.Pool, collec
                                 triage_llm=answerer.router.llm("news_triage"), is_wanted=answerer.news_wanted,
                                 tz=cfg.tz, daily_token_limit=cfg.daily_token_limit,
                                 contact=settings.news_contact_email, timeout_s=cfg.smart_timeout_s)
+    from ..trends.service import TrendsService
+
+    answerer.trends = TrendsService(pool, is_wanted=answerer.music_wanted, tz=cfg.tz,
+                                    daily_token_limit=cfg.daily_token_limit, lastfm_key=settings.lastfm_api_key,
+                                    max_listeners=settings.music_max_listeners, contact=settings.news_contact_email)
     return answerer
 
 
@@ -286,13 +294,23 @@ async def run(settings: Settings) -> None:
             collector.answerer = await make_answerer(settings, bot, pool, collector, alert_chat_id=alerts_to)
         else:
             log.warning("HERMES_URL is not set: archiving only, the bot will not answer")
+            from ..bot import commands
+
+            await commands.clear(bot)
         dp.include_router(collector.router())
         if collector.answerer is not None:
+            from ..bot import commands
             from ..bot.scheduler import Scheduler
 
+            # A migrated group is allowed under its new id (Collector.is_allowed); the owner's menu needs that id.
+            async with pool.acquire() as conn:
+                chats = set(settings.allowed_chat_ids) | await store.migrated_allowed(conn, settings.allowed_chat_ids)
+            await commands.publish(bot, sorted(chats), settings.owner_ids)
             background.append(asyncio.create_task(Scheduler(collector.answerer).run()))
             if collector.answerer.news is not None:
                 background.append(asyncio.create_task(collector.answerer.news.run()))
+            if collector.answerer.trends is not None:
+                background.append(asyncio.create_task(collector.answerer.trends.run()))
         await dp.start_polling(bot, handle_as_tasks=False, allowed_updates=ALLOWED_UPDATES)
     finally:
         for task in background:

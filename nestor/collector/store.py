@@ -208,6 +208,12 @@ async def _without_forgotten_words(conn: asyncpg.Connection, msg: MessageRow) ->
     return msg if raw is msg.raw else dataclasses.replace(msg, raw=raw)
 
 
+async def migrated_allowed(conn: asyncpg.Connection, allowed: frozenset[int]) -> set[int]:
+    """Supergroups made by migrating an allowed group: allowed too, under their new id."""
+    rows = await conn.fetch("SELECT chat_id FROM chats WHERE migrated_from_chat_id = ANY($1::bigint[])", list(allowed))
+    return {r["chat_id"] for r in rows}
+
+
 async def allowed_by_migration(conn: asyncpg.Connection, chat_id: int, allowed: frozenset[int]) -> bool:
     """A supergroup created by migrating an allowed group is allowed too."""
     origin = await conn.fetchval("SELECT migrated_from_chat_id FROM chats WHERE chat_id = $1", chat_id)

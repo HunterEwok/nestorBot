@@ -24,7 +24,8 @@ NAMES = ("ALLOWED_CHAT_IDS", "MODEL_ROUTES", "MUSIC_DAILY_LIMIT", "MUSIC_PLAYER_
          "DIGEST_EVERY_DAYS", "TIMEZONE",
          "RETENTION_TIME", "ALERT_CHAT_ID", "ALERT_DAILY_AT", "ALERT_QUIET", "ALERT_DISK_MIN_GB", "ALERT_MAX_MEMBERS",
          "BACKUP_STATUS_FILE", "ADDRESS_WINDOW_MIN", "ADDRESS_CONTEXT", "ADDRESS_DAILY_CHECKS", "CHIME_HOURS",
-         "CHIME_MIN_MESSAGES", "CHIME_WINDOW", "CHIME_DAILY")
+         "CHIME_MIN_MESSAGES", "CHIME_WINDOW", "CHIME_DAILY", "OWNER_IDS", "NEWS_MIN_SCORE",
+         "MUSIC_CHAT_IDS", "MUSIC_DAY", "MUSIC_TIME", "MUSIC_MAX_LISTENERS", "LASTFM_API_KEY")
 
 
 @pytest.fixture
@@ -54,14 +55,37 @@ def test_trailing_comments_are_not_part_of_the_value(env):
 
 def test_defaults_and_bad_values(env):
     s = config.load_settings()
-    assert (s.news_time, s.news_max_topics, s.music_player_app, s.timezone) == (time(20, 0), 10, "",
+    assert (s.news_time, s.news_max_topics, s.music_player_app, s.timezone) == (time(20, 0), 2, "",
                                                                                "Europe/Moscow")
     env.setenv("NEWS_MAX_TOPICS", "десять")
     with pytest.raises(SystemExit, match="NEWS_MAX_TOPICS must be a whole number"):
         config.load_settings()
     env.setenv("NEWS_MAX_TOPICS", "10")
+    assert config.load_settings().news_min_score == 7
+    env.setenv("NEWS_MIN_SCORE", "11")
+    with pytest.raises(SystemExit, match="NEWS_MIN_SCORE must be a number of points from 1 to 10"):
+        config.load_settings()
+    env.setenv("NEWS_MIN_SCORE", "7")
     env.setenv("MODEL_ROUTES", "theses:web")
     with pytest.raises(SystemExit, match="MODEL_ROUTES"):
+        config.load_settings()
+
+
+def test_owner_ids(env):
+    assert config.load_settings().owner_ids == frozenset()
+    env.setenv("OWNER_IDS", "288040123, 7  # владелец")
+    assert config.load_settings().owner_ids == frozenset({288040123, 7})
+
+
+def test_music(env):
+    s = config.load_settings()
+    assert (s.music_chat_ids, s.music_day, s.music_time.hour, s.music_max_listeners, s.lastfm_api_key) == (
+        frozenset(), 4, 19, 300_000, "")
+    env.setenv("MUSIC_DAY", "Monday")
+    env.setenv("MUSIC_CHAT_IDS", "-100123")
+    assert (config.load_settings().music_day, config.load_settings().music_chat_ids) == (0, frozenset({-100123}))
+    env.setenv("MUSIC_DAY", "пятница")
+    with pytest.raises(SystemExit, match="MUSIC_DAY must be one of mon, tue"):
         config.load_settings()
 
 
