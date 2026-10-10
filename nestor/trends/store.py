@@ -65,10 +65,11 @@ async def set_listeners(conn, key: str, listeners: int | None, now: datetime) ->
 
 
 async def set_verdict(conn, key: str, *, known: bool, russian: bool, now: datetime) -> None:
-    """The check model's verdict; an artist marked known by /music known stays known."""
+    """The check model's verdict, replacing its earlier one; an artist marked known by /music known stays known."""
     await conn.execute(
         """UPDATE music_artists SET russian = $3, checked_at = $4,
-                  known = known OR $2, known_reason = CASE WHEN known THEN known_reason WHEN $2 THEN 'model' END
+                  known = CASE WHEN known_reason = 'command' THEN TRUE ELSE $2 END,
+                  known_reason = CASE WHEN known_reason = 'command' THEN 'command' WHEN $2 THEN 'model' END
            WHERE artist_key = $1""", key, known, russian, now)
 
 
@@ -87,5 +88,17 @@ async def mark_recommended(conn, keys: list[str], now: datetime) -> None:
     await conn.execute("UPDATE music_artists SET recommended_at = $2 WHERE artist_key = ANY($1::text[])", keys, now)
 
 
+async def post_of(conn, day: date) -> asyncpg.Record | None:
+    return await conn.fetchrow("SELECT html, plain, preview_url, keyboard FROM music_posts WHERE day = $1", day)
+
+
+async def save_post(conn, day: date, html: str, plain: str, preview_url: str | None, keyboard: dict | None) -> None:
+    await conn.execute(
+        """INSERT INTO music_posts (day, html, plain, preview_url, keyboard) VALUES ($1, $2, $3, $4, $5)
+           ON CONFLICT (day) DO NOTHING""", day, html, plain, preview_url, keyboard)
+
+
 async def cleanup(conn, today: date) -> None:
-    await conn.execute("DELETE FROM music_snapshots WHERE day < $1", today.fromordinal(today.toordinal() - KEEP_DAYS))
+    before = today.fromordinal(today.toordinal() - KEEP_DAYS)
+    await conn.execute("DELETE FROM music_snapshots WHERE day < $1", before)
+    await conn.execute("DELETE FROM music_posts WHERE day < $1", before)

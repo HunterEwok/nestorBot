@@ -1286,7 +1286,7 @@ class Answerer:
         async with self.pool.acquire() as conn:
             chats = await conn.fetch(
                 "SELECT chat_id, settings FROM chats WHERE enabled AND migrated_to_chat_id IS NULL "
-                "AND chat_id = ANY($1::bigint[])", list(self.cfg.allowed_chat_ids))
+                "AND (chat_id = ANY($1::bigint[]) OR migrated_from_chat_id = ANY($1::bigint[]))", list(self.cfg.allowed_chat_ids))
             posts = [("digest", self.cfg.digest_time), ("wisdom", self.cfg.wisdom_time), ("news", self.cfg.news_time)]
             if local.weekday() == self.cfg.music_day:
                 posts.append(("music", self.cfg.music_time))
@@ -1544,7 +1544,7 @@ class Answerer:
         async with self.pool.acquire() as conn:
             chats = await conn.fetch(
                 "SELECT chat_id, settings FROM chats WHERE enabled AND migrated_to_chat_id IS NULL "
-                "AND chat_id = ANY($1::bigint[])", list(self.cfg.allowed_chat_ids))
+                "AND (chat_id = ANY($1::bigint[]) OR migrated_from_chat_id = ANY($1::bigint[]))", list(self.cfg.allowed_chat_ids))
         return any(self._news_on(c["chat_id"], c["settings"] or {}) for c in chats)
 
     async def _news_status(self) -> str:
@@ -1670,7 +1670,7 @@ class Answerer:
         async with self.pool.acquire() as conn:
             chats = await conn.fetch(
                 "SELECT chat_id, settings FROM chats WHERE enabled AND migrated_to_chat_id IS NULL "
-                "AND chat_id = ANY($1::bigint[])", list(self.cfg.allowed_chat_ids))
+                "AND (chat_id = ANY($1::bigint[]) OR migrated_from_chat_id = ANY($1::bigint[]))", list(self.cfg.allowed_chat_ids))
         return any(self._music_on(c["chat_id"], c["settings"] or {}) for c in chats)
 
     async def _music_status(self) -> str:
@@ -1701,7 +1701,7 @@ class Answerer:
         async with self.pool.acquire() as conn:
             chats = await conn.fetch(
                 "SELECT chat_id, settings FROM chats WHERE enabled AND migrated_to_chat_id IS NULL "
-                "AND chat_id = ANY($1::bigint[])", list(self.cfg.allowed_chat_ids))
+                "AND (chat_id = ANY($1::bigint[]) OR migrated_from_chat_id = ANY($1::bigint[]))", list(self.cfg.allowed_chat_ids))
             for chat in chats:
                 chat_id = chat["chat_id"]
                 if not self._chime_on(chat["settings"] or {}) or (chat_id, "chime") in self._posting:

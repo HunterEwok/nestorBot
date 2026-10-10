@@ -1090,7 +1090,7 @@ async def test_restore_into_a_fresh_database_replays_optouts_and_purges(
         pipe.stdout.close()
         pipe.wait()
     assert done == {"messages": 3, "users": 4, "chats": 1, "bot_requests": 1, "forgotten": 1, "purged": 1,
-                    "last_migration": "0008_retention_and_ops"}
+                    "last_migration": "0009_music_trends"}
 
     db = await _restored(database)
     try:
@@ -1132,7 +1132,7 @@ async def test_restore_leaves_the_purge_to_the_night_when_the_clocks_disagree(
     try:
         assert await db.fetchval("SELECT message_id FROM messages") == 100                     # still here, for the night
         assert await db.fetchval("SELECT opted_out FROM users WHERE user_id = 111") is True     # the rest was done
-        assert await db.fetchval("SELECT max(version) FROM schema_migrations") == "0008_retention_and_ops"
+        assert await db.fetchval("SELECT max(version) FROM schema_migrations") == "0009_music_trends"
     finally:
         await db.close()
 
@@ -1322,7 +1322,7 @@ async def test_main_restores_and_prints_counts_only(conn, cfg, fresh, restore_en
     assert await asyncio.to_thread(bk.main, ["restore", "--database", fresh]) == 0
     out = capfd.readouterr().out
     assert out.startswith("restore done ") and json.loads(out.removeprefix("restore done ")) == {
-        "messages": 7, "users": 1, "chats": 1, "bot_requests": 0, "last_migration": "0008_retention_and_ops",
+        "messages": 7, "users": 1, "chats": 1, "bot_requests": 0, "last_migration": "0009_music_trends",
         "forgotten": 0, "purged": 0}
     monkeypatch.setattr(sys, "stdin", SimpleNamespace(buffer=dump.open("rb")))
     assert await asyncio.to_thread(bk.main, ["restore", "--database", fresh]) == 1       # now it is not empty

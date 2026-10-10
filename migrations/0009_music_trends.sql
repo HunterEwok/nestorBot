@@ -43,5 +43,16 @@ CREATE TABLE music_artists (
   recommended_at  TIMESTAMPTZ
 );
 
+-- The weekly post as made once for every group that has it on, so a retry after a restart sends the same.
+-- html "": nobody new that day.
+CREATE TABLE music_posts (
+  day           DATE PRIMARY KEY,
+  html          TEXT NOT NULL,
+  plain         TEXT NOT NULL DEFAULT '',
+  preview_url   TEXT,
+  keyboard      JSONB,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 ALTER TABLE daily_posts DROP CONSTRAINT daily_posts_kind_check;
 ALTER TABLE daily_posts ADD CONSTRAINT daily_posts_kind_check CHECK (kind IN ('digest', 'wisdom', 'news', 'music'));

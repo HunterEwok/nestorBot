@@ -24,6 +24,7 @@ ESTABLISHED_DAYS = 21       # in a chart this many of the days we have: an old h
 ESTABLISHED_FACTOR = 0.3
 MIN_SCORE = 8
 COOLDOWN = timedelta(days=90)   # an artist recommended once is not suggested again for this long
+RECHECK = timedelta(days=60)    # the check model's verdict holds this long, then it is asked again
 NAMES = {c.key: c.name for c in CHARTS}
 
 
@@ -54,6 +55,17 @@ def _base_day(days: list[date], last: date) -> date | None:
         return None
     target = last - timedelta(days=WEEK)
     return min(earlier, key=lambda d: (abs((d - target).days), -d.toordinal()))
+
+
+def _left_out(a, now: datetime, max_listeners: int) -> bool:
+    """Known by /music known for good; by the check model only while its verdict is fresh."""
+    if a is None:
+        return False
+    fresh = a["checked_at"] is not None and a["checked_at"] > now - RECHECK
+    return bool((a["known"] and (a["known_reason"] != "model" or fresh))
+                or (a["russian"] is False and fresh)
+                or (a["recommended_at"] is not None and a["recommended_at"] > now - COOLDOWN)
+                or (max_listeners and a["listeners"] is not None and a["listeners"] > max_listeners))
 
 
 def rising(rows, today: date, artists: dict, now: datetime, *, max_listeners: int = 0,
@@ -106,14 +118,6 @@ def rising(rows, today: date, artists: dict, now: datetime, *, max_listeners: in
             c.score += points + (EXTRA_CHART_BONUS if c.charts else 0)
             c.facts.append(fact)
             c.charts.append(source)
-    out = []
-    for c in found.values():
-        a = artists.get(c.key)
-        if a is not None and (a["known"] or (a["recommended_at"] is not None and a["recommended_at"] > now - COOLDOWN)
-                              or (max_listeners and a["listeners"] is not None and a["listeners"] > max_listeners)
-                              or a["russian"] is False):
-            continue
-        if c.score >= MIN_SCORE:
-            out.append(c)
+    out = [c for c in found.values() if c.score >= MIN_SCORE and not _left_out(artists.get(c.key), now, max_listeners)]
     out.sort(key=lambda c: (-c.score, c.key))
     return out[:limit]

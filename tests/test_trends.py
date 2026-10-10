@@ -143,11 +143,18 @@ def test_known_recommended_big_and_foreign_artists_are_left_out():
                  **{n: {"shift": 50} for n in ["Звезда", "Был", "Большой", "Чужой", "Свежий"]})
 
     def artist(**kw):
-        return {"known": False, "recommended_at": None, "listeners": None, "russian": None} | kw
-    artists = {"звезда": artist(known=True), "был": artist(recommended_at=NOW - timedelta(days=10)),
+        return {"known": False, "known_reason": None, "recommended_at": None, "listeners": None, "russian": None,
+                "checked_at": NOW - timedelta(days=1)} | kw
+    artists = {"звезда": artist(known=True, known_reason="model"), "был": artist(recommended_at=NOW - timedelta(days=10)),
                "большой": artist(listeners=5_000_000), "чужой": artist(russian=False),
                "свежий": artist(recommended_at=NOW - timedelta(days=120), listeners=1000)}
     assert [c.key for c in score.rising(rows, TODAY, artists, NOW, max_listeners=300_000)] == ["свежий"]
+    # The model's verdicts expire and are asked again; /music known holds for good.
+    old = NOW - score.RECHECK - timedelta(days=1)
+    artists |= {"звезда": artist(known=True, known_reason="model", checked_at=old),
+                "чужой": artist(russian=False, checked_at=old),
+                "свежий": artist(known=True, known_reason="command", checked_at=old)}
+    assert [c.key for c in score.rising(rows, TODAY, artists, NOW, max_listeners=300_000)] == ["звезда", "чужой"]
 
 
 def test_a_chart_not_read_lately_is_left_out():
@@ -286,9 +293,11 @@ async def test_recommendation_checks_writes_and_builds_the_card(pool, conn):
     assert scenarios == ["music_check", "music_trends"]
 
     # The day's post is shared; a forced search makes a new one, without the artist just recommended.
+    # The same after a restart: the day's post is kept in the database.
+    service = make_trends(pool, charts)
     again = await service.recommend(TODAY, check_llm=check, write_llm=write, checker=checker, player=None,
                                     timeout_s=5)
-    assert again is post and len(write.calls) == 1
+    assert again == post and len(write.calls) == 1
     forced = await service.recommend(TODAY, check_llm=check, write_llm=write, checker=checker, player=None,
                                      timeout_s=5, force=True)
     assert forced.html == "" or "Новичок" not in forced.html
@@ -308,7 +317,7 @@ async def test_nothing_read_yet_and_nobody_rising(pool, conn):
     service = make_trends(pool, Charts(apple=[Entry(1, "Стоячий", "Вечный")]))
     write = ScriptedLLM("{}")
     assert await service.recommend(TODAY, check_llm=None, write_llm=write, checker=FakeChecker(), player=None,
-                                   timeout_s=5) is NOTHING
+                                   timeout_s=5) == NOTHING
     assert write.calls == []
 
 
@@ -338,11 +347,16 @@ async def test_lastfm_listeners_rule_out_big_artists(pool, conn):
     assert (await store.artists(conn, ["новичок"]))["новичок"]["listeners"] == 5_000_000
 
 
-async def test_known_by_command_stays_known(conn):
+async def test_known_by_command_stays_known_and_the_model_can_change_its_mind(conn):
     assert await store.mark_known(conn, "Новичок feat. Гость") == "Новичок"
     await store.set_verdict(conn, "новичок", known=False, russian=True, now=NOW)
     row = (await store.artists(conn, ["новичок"]))["новичок"]
     assert row["known"] and row["known_reason"] == "command"
+    await conn.execute("INSERT INTO music_artists (artist_key, name) VALUES ('другой', 'Другой')")
+    await store.set_verdict(conn, "другой", known=True, russian=True, now=NOW)
+    await store.set_verdict(conn, "другой", known=False, russian=True, now=NOW)
+    row = (await store.artists(conn, ["другой"]))["другой"]
+    assert not row["known"] and row["known_reason"] is None
     assert await store.mark_known(conn, " ,") is None
 
 
@@ -424,3 +438,15 @@ async def test_weekly_post_waits_until_a_chart_is_read(make_env, pool, conn):
     await feed.answerer.drain()
     assert await conn.fetchval("SELECT status FROM daily_posts WHERE kind = 'music'") == "waiting"
     assert not bot.sent
+
+
+async def test_weekly_post_reaches_a_group_that_moved_to_a_supergroup(make_env, pool, conn):
+    # ALLOWED_CHAT_IDS still names the old basic group; the bot lives in the supergroup it became.
+    new_id = CHAT_ID - 1
+    bot, smart, feed = with_trends(make_env, pool, music_day=DAY.weekday())
+    await conn.execute("INSERT INTO chats (chat_id, title, type, migrated_from_chat_id, settings) "
+                       "VALUES ($1, 'Группа', 'supergroup', $2, '{\"music\": true}')", new_id, CHAT_ID)
+    assert await feed.answerer.music_wanted()
+    await feed.answerer.run_daily_posts(local(DAY, 19, 1))
+    await feed.answerer.drain()
+    assert bot.sent[-1]["chat_id"] == new_id and bot.sent[-1]["text"].startswith("🎧 <b>Восходящие")

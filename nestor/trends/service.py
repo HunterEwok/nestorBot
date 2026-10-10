@@ -27,7 +27,6 @@ log = logging.getLogger("nestor.trends")
 
 READ_TIMEOUT_S = 120
 HISTORY_DAYS = 28
-RECHECK = timedelta(days=60)        # the check model's verdict on an artist holds this long
 LISTENERS_AGE = timedelta(days=30)
 LISTENER_LOOKUPS = 15               # Last.fm artist.getInfo calls per recommendation
 TO_WRITE = 6                        # candidates the write-up model sees
@@ -48,6 +47,11 @@ class Post:
 NOTHING = Post("")
 
 
+def _post(row) -> Post:
+    keyboard = InlineKeyboardMarkup.model_validate(row["keyboard"]) if row["keyboard"] else None
+    return Post(row["html"], row["plain"], row["preview_url"], keyboard)
+
+
 class TrendsService:
     def __init__(self, pool: asyncpg.Pool, *, is_wanted: Callable[[], Awaitable[bool]], tz: ZoneInfo,
                  daily_token_limit: int, lastfm_key: str = "", max_listeners: int = 0, contact: str = "",
@@ -59,7 +63,6 @@ class TrendsService:
         self.charts = tuple(c for c in charts if not c.needs_key or lastfm_key)
         self._lock = asyncio.Lock()         # one read of the charts at a time
         self._pick_lock = asyncio.Lock()    # one recommendation at a time
-        self._made: dict[date, Post] = {}   # the weekly post of a day, shared by the groups
         self._cleaned: date | None = None
 
     async def run(self) -> None:
@@ -143,8 +146,11 @@ class TrendsService:
         """The post of `day`: NOTHING when nobody new is rising, None at the token limit.
         force (/music now): made afresh, not the day's shared post. NotEnoughMusic: no chart read yet."""
         async with self._pick_lock:
-            if not force and day in self._made:
-                return self._made[day]
+            if not force:
+                async with self.pool.acquire() as conn:
+                    made = await store.post_of(conn, day)
+                if made is not None:
+                    return _post(made)
             now = datetime.now(timezone.utc)
             await self.collect(now)
             async with self.pool.acquire() as conn:
@@ -157,7 +163,11 @@ class TrendsService:
             candidates = await self._check(candidates, check_llm, now, timeout_s)
             post = await self._write(candidates[:TO_WRITE], day, now, write_llm, checker, player, timeout_s)
             if not force:
-                self._made = {day: post}
+                async with self.pool.acquire() as conn:
+                    await store.save_post(conn, day, post.html, post.plain, post.preview_url,
+                                          post.keyboard.model_dump(mode="json", exclude_none=True)
+                                          if post.keyboard else None)
+                    return _post(await store.post_of(conn, day))
             return post
 
     async def _candidates(self, rows, day: date, now: datetime) -> list[score.Candidate]:
@@ -193,7 +203,7 @@ class TrendsService:
         async with self.pool.acquire() as conn:
             artists = await store.artists(conn, [c.key for c in candidates])
         todo = [c for c in candidates if artists.get(c.key) is None or artists[c.key]["checked_at"] is None
-                or artists[c.key]["checked_at"] < now - RECHECK]
+                or artists[c.key]["checked_at"] < now - score.RECHECK]
         if not todo:
             return candidates
         started = time.monotonic()
