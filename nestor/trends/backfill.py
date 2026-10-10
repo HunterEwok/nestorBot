@@ -47,9 +47,10 @@ async def _conn(db):
 
 async def backfill(db, http: Http, today: date, days: int = DAYS, progress=None) -> dict[str, int]:
     """Saves the archived editions of the last `days` days. db: a pool or a connection.
-    Returns chart key -> days added. progress(key, added, total): after each snapshot, for the command line."""
+    Returns chart key -> days added, None when the archive's index could not be read (worth another try).
+    progress(key, added, total): after each snapshot, for the command line."""
     since = today - timedelta(days=days)
-    added: dict[str, int] = {}
+    added: dict[str, int | None] = {}
     for key, (url, parse) in ARCHIVED.items():
         async with _conn(db) as conn:
             have = await store.days(conn, key, since)
@@ -57,7 +58,7 @@ async def backfill(db, http: Http, today: date, days: int = DAYS, progress=None)
             stamps = await snapshots(http, url, since, today - timedelta(days=1))
         except (HttpError, ValueError) as e:
             log.warning("wayback index failed", extra={"source": key, "error": type(e).__name__})
-            added[key] = 0
+            added[key] = None
             continue
         todo = [ts for ts in stamps if date(int(ts[:4]), int(ts[4:6]), int(ts[6:8])) not in have]
         added[key] = 0

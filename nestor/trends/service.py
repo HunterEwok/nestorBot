@@ -86,7 +86,8 @@ class TrendsService:
             await asyncio.sleep(self.tick_s)
 
     async def backfill(self, now: datetime) -> None:
-        """Once: the charts' history from the Wayback Machine. Marked done in music_sources as 'wayback'."""
+        """Once: the charts' history from the Wayback Machine. Marked done in music_sources as 'wayback' only when
+        every chart's index was read; otherwise a later tick tries again, skipping the days already copied."""
         async with self.pool.acquire() as conn:
             if (await store.states(conn)).get("wayback") is not None:
                 return
@@ -94,10 +95,12 @@ class TrendsService:
 
         async with self.http_factory(self.contact) as http:
             added = await backfill(self.pool, http, self._today(now))
+        log.info("music history from the wayback machine", extra={k: v for k, v in added.items()})
+        if None in added.values():
+            return
         async with self.pool.acquire() as conn:
             await store.save_run(conn, "wayback", now, status=f"ok: {sum(added.values())}", day=self._today(now),
                                  size=sum(added.values()))
-        log.info("music history from the wayback machine", extra=added)
 
     def _today(self, now: datetime) -> date:
         return now.astimezone(self.tz).date()

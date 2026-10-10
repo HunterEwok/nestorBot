@@ -231,7 +231,8 @@ def viral(rows, today: date, *, picks: list[Pick] = (), banned: frozenset[str] =
         top = by_chart[gain_chart]
         if top.gain < MIN_GAIN:
             continue
-        confirming = [c for c, m in by_chart.items() if m.z >= Z_CONFIRM]
+        # A chart confirms only a real rise there: a high z alone may be a smaller fall than the others'.
+        confirming = [c for c, m in by_chart.items() if m.z >= Z_CONFIRM and m.gain > 0]
         two_days = (top.g1 or 0) > 0 and (top.before or 0) > 0
         # Not a one-day blip: another chart sees it too, or it rose two days running. Before there is a day
         # before (the first run), a chart's own mark of the move stands alone only when it stands out a lot.
@@ -257,7 +258,7 @@ def viral(rows, today: date, *, picks: list[Pick] = (), banned: frozenset[str] =
             continue
         c = Candidate(key, akey, artist, title, url, round(s, 2), best, charts=sorted(confirming or [gain_chart]))
         c.facts = [_fact(charts[src], key, charts[src].edition(today)) for src in sorted(by_chart)
-                   if (by_chart[src].g1 or 0) > 0 or by_chart[src].z >= Z_CONFIRM]
+                   if (by_chart[src].g1 or 0) > 0 or src in confirming]
         out.append(c)
     out.sort(key=lambda c: (-c.score, c.key))
     return out[:limit]

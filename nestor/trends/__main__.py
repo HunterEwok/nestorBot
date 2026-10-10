@@ -91,7 +91,7 @@ async def run_backfill(days: int) -> int:
             added = await backfill(conn, http, _today(), days, progress)
         print()
         for key, n in added.items():
-            print(f"{key}: добавлено дней {n}")
+            print(f"{key}: добавлено дней {n}" if n is not None else f"{key}: архив не ответил, повтори позже")
         return 0
     finally:
         await conn.close()
@@ -113,9 +113,11 @@ async def backtest(days: int, threshold: float, top: int) -> int:
     found_days = 0
     for n in range(days, -1, -1):
         day = today - timedelta(days=n)
-        if day not in have:
+        if not have or day < have[0]:
             continue
-        found = viral.viral(rows, day, picks=picks, banned=banned, threshold=threshold, limit=top)
+        since = day - timedelta(days=viral.HISTORY_DAYS)    # what the bot itself would read on that day
+        window = [r for r in rows if since <= r["day"] <= day]
+        found = viral.viral(window, day, picks=picks, banned=banned, threshold=threshold, limit=top)
         if not found:
             print(f"{day:%d.%m.%Y}  —  вирусной песни нет")
             continue
