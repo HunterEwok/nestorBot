@@ -461,3 +461,15 @@ async def test_weekly_post_reaches_a_group_that_moved_to_a_supergroup(make_env, 
     await feed.answerer.run_daily_posts(local(DAY, 19, 1))
     await feed.answerer.drain()
     assert bot.sent[-1]["chat_id"] == new_id and bot.sent[-1]["text"].startswith("🎧 <b>Восходящие")
+
+
+async def test_check_stops_on_a_bad_proxy_without_showing_it(monkeypatch, capsys):
+    from nestor.trends.__main__ import check
+    monkeypatch.setenv("MUSIC_YANDEX_PROXY", "http://user:s3cret@host:not-a-port")
+    try:
+        await check(["yandex_ru"])
+    except SystemExit as e:
+        assert "s3cret" not in str(e)
+    else:
+        raise AssertionError("a bad MUSIC_YANDEX_PROXY must stop --check")
+    assert "s3cret" not in capsys.readouterr().out

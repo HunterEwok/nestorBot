@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 
+from ..config import _proxy
 from ..news.http import Http, HttpError
 from .sources import ADAPTERS, CHARTS, Entry, Options, artist_key
 
@@ -26,7 +27,7 @@ def _line(e: Entry) -> str:
 
 async def check(keys: list[str], verbose: bool = False) -> int:
     key = os.environ.get("LASTFM_API_KEY", "").strip()
-    opts = Options(key, os.environ.get("MUSIC_YANDEX_PROXY", "").strip())
+    opts = Options(key, _proxy("MUSIC_YANDEX_PROXY"))    # the bot's own check: a bad value stops here, unechoed
     charts = [c for c in CHARTS if not keys or c.key in keys]
     unknown = set(keys) - {c.key for c in charts}
     if unknown:
@@ -49,7 +50,8 @@ async def check(keys: list[str], verbose: bool = False) -> int:
                 failed += 1
                 continue
             except Exception as e:  # noqa: BLE001 - report and go on with the next chart
-                print(f"✗ {chart.key}: {type(e).__name__}: {str(e)[:120]}")
+                text = str(e).replace(opts.yandex_proxy, "<MUSIC_YANDEX_PROXY>") if opts.yandex_proxy else str(e)
+                print(f"✗ {chart.key}: {type(e).__name__}: {text[:120]}")
                 failed += 1
                 continue
             moved = sum(1 for e in entries if e.shift)
