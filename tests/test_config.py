@@ -91,10 +91,12 @@ def test_music(env):
     env.setenv("MUSIC_DAY", "fri")
     env.setenv("MUSIC_YANDEX_PROXY", "http://user:secret@ru.example:3128")
     assert config.load_settings().music_yandex_proxy == "http://user:secret@ru.example:3128"
-    env.setenv("MUSIC_YANDEX_PROXY", "socks5://user:secret@ru.example:1080")
-    with pytest.raises(SystemExit) as e:
-        config.load_settings()
-    assert "secret" not in str(e.value)
+    for bad in ("socks5://user:secret@ru.example:1080", "http://user:secret@ru.example:not-a-port",
+                "http://user:secret@ru.example", "http://:3128", "http://user:secret@ru.example:3128/x#y"):
+        env.setenv("MUSIC_YANDEX_PROXY", bad)
+        with pytest.raises(SystemExit) as e:
+            config.load_settings()
+        assert "secret" not in str(e.value), bad
 
 
 def test_digest_every_days(env):

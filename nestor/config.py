@@ -4,6 +4,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import time
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
@@ -226,7 +227,15 @@ def _digest_every_days() -> int:
 def _proxy(name: str) -> str:
     """An http:// or https:// proxy URL, or empty. Never echoed: it may carry a password."""
     value = _env(name)
-    if value and not re.fullmatch(r"https?://[^\s/]+(?::\d+)?/?", value):
+    if not value:
+        return value
+    try:
+        url = urlsplit(value)
+        ok = (url.scheme in ("http", "https") and bool(url.hostname) and url.port is not None
+              and url.path in ("", "/") and not url.query and not url.fragment and not re.search(r"\s", value))
+    except ValueError:      # a port that is not a number
+        ok = False
+    if not ok:
         raise SystemExit(f"{name} must look like http://user:password@host:port")
     return value
 
