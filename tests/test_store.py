@@ -206,3 +206,12 @@ async def test_forget_takes_the_quotes_telegram_attributes_to_them_and_their_que
     assert "quote" not in raws[1] and raws[2]["quote"]["text"] == "тайна"
     questions = {r["user_id"]: r["question"] for r in await conn.fetch("SELECT user_id, question FROM bot_requests")}
     assert questions == {222: None, 333: "что спросил 333?"}
+
+
+async def test_migrated_allowed_finds_supergroups_of_allowed_groups(conn):
+    old, new, other = -398822003, -1003917891018, -1001000000009
+    await conn.execute("INSERT INTO chats (chat_id, type, migrated_from_chat_id) VALUES ($1, 'supergroup', $2)",
+                       new, old)
+    await conn.execute("INSERT INTO chats (chat_id, type, migrated_from_chat_id) VALUES ($1, 'supergroup', $2)",
+                       other, -1)
+    assert await store.migrated_allowed(conn, frozenset({old, CHAT_ID})) == {new}

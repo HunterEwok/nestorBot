@@ -292,8 +292,10 @@ async def run(settings: Settings) -> None:
             from ..bot import commands
             from ..bot.scheduler import Scheduler
 
-            await commands.publish(bot, settings.allowed_chat_ids, settings.owner_ids)
-
+            # A migrated group is allowed under its new id (Collector.is_allowed); the owner's menu needs that id.
+            async with pool.acquire() as conn:
+                chats = set(settings.allowed_chat_ids) | await store.migrated_allowed(conn, settings.allowed_chat_ids)
+            await commands.publish(bot, sorted(chats), settings.owner_ids)
             background.append(asyncio.create_task(Scheduler(collector.answerer).run()))
             if collector.answerer.news is not None:
                 background.append(asyncio.create_task(collector.answerer.news.run()))
