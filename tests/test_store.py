@@ -209,7 +209,7 @@ async def test_forget_takes_the_quotes_telegram_attributes_to_them_and_their_que
 
 
 async def test_migrated_allowed_finds_supergroups_of_allowed_groups(conn):
-    old, new, other = -398822003, -1003917891018, -1001000000009
+    old, new, other = -400000001, -1001000000444, -1001000000009
     await conn.execute("INSERT INTO chats (chat_id, type, migrated_from_chat_id) VALUES ($1, 'supergroup', $2)",
                        new, old)
     await conn.execute("INSERT INTO chats (chat_id, type, migrated_from_chat_id) VALUES ($1, 'supergroup', $2)",

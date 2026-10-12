@@ -30,7 +30,7 @@ from .factories import CHAT_ID
 from .test_backup import NIGHT, Tools, cfg_in, old_dumps
 
 MSK = ZoneInfo("Europe/Moscow")
-ALERT_CHAT = -1004446259317
+ALERT_CHAT = -1001000000555
 GIB = 1024 ** 3
 Usage = namedtuple("Usage", "total used free")
 BY_NAME = {c.name: c for c in CHECKS}
