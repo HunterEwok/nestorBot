@@ -45,11 +45,11 @@ def test_trailing_comments_are_not_part_of_the_value(env):
     env.setenv("NEWS_MAX_TOPICS", "8   # тем в сводке")
     env.setenv("NEWS_TELEGRAM_CHANNELS", "psychedelicsocietyvienna   # публичные каналы через запятую")
     env.setenv("MODEL_ROUTES", "# перенос задач между профилями, см. ниже")
-    env.setenv("NEWS_CHAT_IDS", "-1004446259317 # Nestor test")
+    env.setenv("NEWS_CHAT_IDS", "-1001000000555 # Nestor test")
     s = config.load_settings()
     assert (s.news_time, s.news_max_topics, s.news_telegram_channels) == (time(20, 0), 8,
                                                                          ("psychedelicsocietyvienna",))
-    assert s.model_routes == {} and s.news_chat_ids == frozenset({-1004446259317})
+    assert s.model_routes == {} and s.news_chat_ids == frozenset({-1001000000555})
     # Secrets are taken as they are: a «#» inside them is not a comment.
     assert s.bot_token == "42:TEST#not-a-comment" and s.database_url == "postgresql://nestor:p#w@db/nestor"
 
@@ -74,8 +74,8 @@ def test_defaults_and_bad_values(env):
 
 def test_owner_ids(env):
     assert config.load_settings().owner_ids == frozenset()
-    env.setenv("OWNER_IDS", "288040123, 7  # владелец")
-    assert config.load_settings().owner_ids == frozenset({288040123, 7})
+    env.setenv("OWNER_IDS", "111111111, 7  # владелец")
+    assert config.load_settings().owner_ids == frozenset({111111111, 7})
 
 
 def test_music(env):
@@ -190,7 +190,7 @@ def test_alert_settings_parse_off_and_garbage(env):
     s = config.load_settings()
     assert (s.alert_chat_id, s.alert_daily_at, s.alert_quiet, s.alert_disk_min_gb, s.alert_max_members,
             s.backup_status_file) == (None, time(9, 30), (time(23), time(8)), 5, 2, "")
-    env.setenv("ALERT_CHAT_ID", "-1004446259317   # Nestor alerts")
+    env.setenv("ALERT_CHAT_ID", "-1001000000555   # Nestor alerts")
     env.setenv("ALERT_DAILY_AT", "08:45 # сводка")
     env.setenv("ALERT_QUIET", "22:30 - 07:15")
     env.setenv("ALERT_DISK_MIN_GB", "8")
@@ -198,7 +198,7 @@ def test_alert_settings_parse_off_and_garbage(env):
     env.setenv("BACKUP_STATUS_FILE", "/var/lib/nestor-backup/status.json   # nestor.backup")
     s = config.load_settings()
     assert (s.alert_chat_id, s.alert_daily_at, s.alert_quiet, s.alert_disk_min_gb, s.alert_max_members,
-            s.backup_status_file) == (-1004446259317, time(8, 45), (time(22, 30), time(7, 15)), 8, 3,
+            s.backup_status_file) == (-1001000000555, time(8, 45), (time(22, 30), time(7, 15)), 8, 3,
                                       "/var/lib/nestor-backup/status.json")
     for off in ("off", "OFF", "выкл", "0", "нет"):
         env.setenv("ALERT_DAILY_AT", off)
