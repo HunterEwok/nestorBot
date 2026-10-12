@@ -1,8 +1,15 @@
+[build-system]
+# 77+ understands the SPDX `license` string below.
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "nestor"
 version = "0.1.0"
 description = "Telegram group archive bot with Hermes Agent integration"
 requires-python = ">=3.11"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
 dependencies = [
     "aiogram>=3.13,<4",
     "pydantic>=2.11",  # model_dump(fallback=...) in collector.app.dump
