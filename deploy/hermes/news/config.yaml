@@ -13,7 +13,7 @@
 
 model:
   provider: anthropic            # ANTHROPIC_API_KEY in ~/.hermes/profiles/news/.env (may be the same key)
-  default: claude-haiku-4-5      # cheap: dozens of items a day
+  default: claude-haiku-5-5      # cheap: dozens of items a day
 
 platform_toolsets:
   api_server: []                 # no tools at all
