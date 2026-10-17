@@ -8,7 +8,7 @@
 
 model:
   provider: anthropic            # ANTHROPIC_API_KEY in ~/.hermes/profiles/web/.env (may be the same key as group)
-  default: claude-haiku-5-5      # short lookups: the cheapest model is enough
+  default: claude-sonnet-5-5     # answers to people: Haiku 5.5 is 20 times cheaper and is enough for plain lookups
 
 platform_toolsets:
   api_server: [web]              # web_search + web_extract only

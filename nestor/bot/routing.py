@@ -1,11 +1,11 @@
 """Which Hermes profile does which task.
 
 A profile is fixed by what it can reach and by its model (set in its config.yaml):
-- group: the archive of the asking chat, a cheap model (Haiku);
-- deep:  the same archive tools, a bigger model (Sonnet or Opus); optional;
-- web:   internet search, no archive, a cheap model;
-- smart: internet search, no archive, a bigger model; optional;
-- news:  no tools at all, a cheap model, for sorting public news items, for picking
+- group: the archive of the asking chat, the main model (Sonnet);
+- deep:  the same archive tools, a bigger model (Opus); optional;
+- web:   internet search, no archive, the main model (Sonnet);
+- smart: internet search, no archive, a bigger model (Opus); optional;
+- news:  no tools at all, the main model (Sonnet), for sorting public news items, for picking
          reactions to chat messages, for telling whether a message is addressed to the bot
          and for the bot's own rare remarks (nothing to search with, nothing to read); optional.
 

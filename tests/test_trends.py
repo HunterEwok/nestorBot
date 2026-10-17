@@ -5,7 +5,7 @@ import re
 from datetime import date, datetime, time as dtime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from nestor.bot import music, prompts
+from nestor.bot import answerer, music, prompts
 from nestor.news.http import HttpError
 from nestor.trends import pick, sources, store, viral
 from nestor.trends.service import NOTHING, NotEnoughMusic, TrendsService
@@ -413,7 +413,7 @@ def with_trends(make_env, pool, charts=None, **cfg):
     return bot, smart, feed
 
 
-async def test_music_now_posts_the_card_ten_times_an_hour(make_env, pool, conn):
+async def test_music_now_posts_the_card_a_limited_number_of_times_an_hour(make_env, pool, conn):
     bot, smart, feed = with_trends(make_env, pool)
     await feed(update("message", message(1, "/music now", uid=111, date=ago(minutes=1))))
     assert bot.sent[0]["text"] == prompts.MUSIC_TRENDS_SEARCHING
@@ -421,12 +421,14 @@ async def test_music_now_posts_the_card_ten_times_an_hour(make_env, pool, conn):
     assert card["reply_to"] == 1 and card["parse_mode"] == "HTML" and "Новичок" in card["text"]
     assert card["link_preview_options"].url == f"https://www.youtube.com/watch?v={VIDEO}"
     assert card["reply_markup"].inline_keyboard
-    for n in range(2, 11):
+    per_hour = answerer.MUSIC_NOW_PER_HOUR
+    for n in range(2, per_hour + 1):
         await feed(update("message", message(n, "/music now", uid=111, date=ago(minutes=1))))
-    assert sum(m["text"] == prompts.MUSIC_TRENDS_SEARCHING for m in bot.sent) == 10 and len(smart.calls) == 10
-    await feed(update("message", message(11, "/music now", uid=111, date=ago(minutes=1))))
-    assert bot.sent[-1]["text"] == prompts.MUSIC_TRENDS_TOO_SOON.format(times=10, minutes=60)
-    assert len(smart.calls) == 10
+    assert sum(m["text"] == prompts.MUSIC_TRENDS_SEARCHING for m in bot.sent) == per_hour
+    assert len(smart.calls) == per_hour
+    await feed(update("message", message(per_hour + 1, "/music now", uid=111, date=ago(minutes=1))))
+    assert bot.sent[-1]["text"] == prompts.MUSIC_TRENDS_TOO_SOON.format(times=per_hour, minutes=60)
+    assert len(smart.calls) == per_hour
 
 
 async def test_music_needs_an_admin_and_knows_its_words(make_env, pool, conn):
