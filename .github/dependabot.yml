@@ -1,4 +1,5 @@
-# Dependabot: weekly check of Python dependencies from pyproject.toml.
+# Dependabot: weekly check of Python dependencies from pyproject.toml and of the pinned
+# actions in .github/workflows.
 # Docs: https://docs.github.com/code-security/dependabot/working-with-dependabot/dependabot-options-reference
 #
 # Not covered on purpose:
@@ -21,3 +22,16 @@ updates:
     commit-message:
       prefix: "deps"
 
+  # The pinned actions of .github/workflows (claude-review.yml); the SHA and the version comment move together.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Europe/Moscow"
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps"
