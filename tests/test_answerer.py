@@ -293,6 +293,22 @@ async def test_rate_limit_per_user(make_env, conn):
     assert await conn.fetchval("SELECT count(*) FROM bot_requests WHERE status = 'rate_limited'") == 1
 
 
+async def test_owner_has_no_rate_limit(make_env, conn):
+    bot, llm, feed = make_env(rate_limit=2, owner_ids=frozenset({333}))
+    for i in range(1, 5):
+        await feed(update("message", message(i, "бот, привет", uid=333)))
+    assert len(llm.calls) == 4
+    assert not any(m["text"].startswith("⏳") for m in bot.sent)
+    assert await conn.fetchval("SELECT count(*) FROM bot_requests WHERE status = 'rate_limited'") == 0
+
+
+async def test_owner_still_stops_at_the_daily_token_limit(make_env):
+    bot, llm, feed = make_env(daily_token_limit=1200, owner_ids=frozenset({333}))
+    await feed(update("message", message(1, "бот, раз", uid=333)))
+    await feed(update("message", message(2, "бот, два", uid=333)))
+    assert len(llm.calls) == 1 and bot.sent[-1]["text"] == prompts.RATE_LIMITED_DAY
+
+
 async def test_daily_token_limit(make_env):
     bot, llm, feed = make_env(daily_token_limit=1200)
     await feed(update("message", message(1, "бот, раз")))

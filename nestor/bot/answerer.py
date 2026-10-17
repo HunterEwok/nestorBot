@@ -46,7 +46,7 @@ log = logging.getLogger("nestor.answerer")
 ANONYMOUS_ADMIN_ID = 1087968824  # GroupAnonymousBot: an admin posting as the group (one of forget.SHARED_IDS)
 STATUS_STALE_AFTER = timedelta(minutes=15)     # the watchdog runs every 5 minutes
 _OFF = ("off", "выкл", "0", "нет", "no")
-MUSIC_NOW_PER_HOUR = 10         # /music now: this many searches per group in any hour
+MUSIC_NOW_PER_HOUR = 50         # /music now: this many searches per group in any hour
 _ORDER = itertools.count()      # orders requests and /forget_me commands (Answerer._overtaken)
 _ON = ("on", "вкл", "да", "yes")
 _DIGEST_DAYS = re.compile(r"(\d+)(?:\s*(?:д|дн|день|дня|дней))?")       # /digest 30, /digest 7 дней
@@ -734,11 +734,11 @@ class Answerer:
     # ---- answering ----
 
     async def _limit_reason(self, conn, user_id: int) -> str | None:
-        recent = await conn.fetchval(
-            """SELECT count(*) FROM bot_requests
-               WHERE user_id = $1 AND status <> 'rate_limited' AND created_at > now() - make_interval(mins => $2)""",
-            user_id, self.cfg.rate_window_min)
-        if recent >= self.cfg.rate_limit:
+        """The owner (OWNER_IDS) has no per-user rate limit, only the daily token limit."""
+        if user_id not in self.cfg.owner_ids and await conn.fetchval(
+                """SELECT count(*) FROM bot_requests
+                   WHERE user_id = $1 AND status <> 'rate_limited' AND created_at > now() - make_interval(mins => $2)""",
+                user_id, self.cfg.rate_window_min) >= self.cfg.rate_limit:
             return prompts.RATE_LIMITED_USER.format(limit=self.cfg.rate_limit, window=self.cfg.rate_window_min)
         if await self._tokens_today(conn) >= self.cfg.daily_token_limit:
             return prompts.RATE_LIMITED_DAY

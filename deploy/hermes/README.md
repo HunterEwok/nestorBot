@@ -24,7 +24,7 @@
 2. Скопировать `config.yaml` и `SOUL.md` из этой папки в профиль. В `config.yaml` вписать пароль `hermes_reader` и адрес базы в `READER_DATABASE_URL`. `TIMEZONE` там же должен совпадать с `TIMEZONE` в `/opt/nestor/.env` (по умолчанию `Europe/Moscow`), иначе время в результатах инструментов разойдётся с контекстом бота.
 3. В `~/.hermes/profiles/group/.env`:
    ```
-   ANTHROPIC_API_KEY=...        # ключ, лимит $20/мес выставить в консоли Anthropic
+   ANTHROPIC_API_KEY=...        # ключ, лимит $200/мес выставить в консоли Anthropic
    API_SERVER_KEY=...           # любая длинная случайная строка: openssl rand -hex 32
    ```
    `chmod 600` на этот файл.
