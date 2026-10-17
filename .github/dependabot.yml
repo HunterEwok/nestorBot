@@ -21,3 +21,17 @@ updates:
     commit-message:
       prefix: "deps"
 
+
+  # The pinned actions of .github/workflows (claude-review.yml); the SHA and the version comment move together.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Europe/Moscow"
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps"
