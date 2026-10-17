@@ -33,6 +33,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
+      # A PR from a fork's default branch is fetched into a local branch of the same name, which
+      # git refuses while that branch exists here; the base stays as origin/<default branch>.
+      - name: free the default branch name
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: git checkout --detach && git branch -D "$DEFAULT_BRANCH"
       - uses: anthropics/claude-code-action@f27be6b65a4652f08a2ba3cff79114829b588967  # v1.0.252
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
